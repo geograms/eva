@@ -6,6 +6,7 @@ import 'package:flutter/services.dart' show rootBundle;
 import 'package:http/http.dart' as http;
 import 'package:path_provider/path_provider.dart';
 
+import 'app_prefs.dart';
 import 'model_catalog.dart';
 
 /// Files `cactus_init` requires in a model directory. The transpiled graph lives
@@ -30,9 +31,40 @@ const List<String> _requiredEmbedderFiles = [
 typedef ProgressCallback = void Function(String phase, double? progress);
 
 class ModelManager {
-  Future<Directory> _modelDir(String id) async {
+  /// Root folder holding `models/<id>/` — the user-chosen location (e.g. an SD
+  /// card, so downloads survive a reinstall) when set and usable, otherwise the
+  /// app's private storage.
+  static Future<Directory> modelsRoot() async {
+    final custom = await loadModelsLocation();
+    if (custom.isNotEmpty) {
+      try {
+        final dir = Directory('$custom/models');
+        if (!await dir.exists()) await dir.create(recursive: true);
+        return dir;
+      } catch (_) {/* fall back to app storage (e.g. card removed) */}
+    }
     final docs = await getApplicationDocumentsDirectory();
-    return Directory('${docs.path}/models/$id');
+    return Directory('${docs.path}/models');
+  }
+
+  Future<Directory> _modelDir(String id) async {
+    final root = await modelsRoot();
+    return Directory('${root.path}/$id');
+  }
+
+  /// Ids of catalog models already present under [folder]/models (used by the
+  /// intro screen to tell the user what a chosen folder already contains).
+  Future<int> countModelsAt(String folder) async {
+    final root = Directory('$folder/models');
+    if (!await root.exists()) return 0;
+    var n = 0;
+    for (final e in root.listSync()) {
+      if (e is Directory &&
+          (await _isValid(e) || await _isValid(e, embedder: true))) {
+        n++;
+      }
+    }
+    return n;
   }
 
   Future<bool> _isValid(Directory dir, {bool embedder = false}) async {

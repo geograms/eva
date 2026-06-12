@@ -20,6 +20,7 @@ import 'background_indexer.dart';
 import 'chat_store.dart';
 import 'document_service.dart';
 import 'inference_isolate.dart';
+import 'intro_screen.dart';
 import 'model_catalog.dart';
 import 'model_manager.dart';
 import 'rag_index.dart';
@@ -63,7 +64,7 @@ class EvaApp extends StatelessWidget {
   }
 }
 
-enum AppPhase { preparing, downloading, loadingModel, ready, error }
+enum AppPhase { intro, preparing, downloading, loadingModel, ready, error }
 
 class ChatMessage {
   ChatMessage(this.role, this.text, {this.imagePath, this.sources});
@@ -139,7 +140,17 @@ class _ChatScreenState extends State<ChatScreen> {
   void initState() {
     super.initState();
     _setupAssistant();
-    _bootstrap();
+    _start();
+  }
+
+  /// First run shows the intro (permissions + downloads explainer, optional
+  /// reusable models folder) before anything starts downloading.
+  Future<void> _start() async {
+    if (!await loadIntroSeen()) {
+      setState(() => _phase = AppPhase.intro);
+      return;
+    }
+    await _bootstrap();
   }
 
   @override
@@ -1062,6 +1073,12 @@ class _ChatScreenState extends State<ChatScreen> {
 
   @override
   Widget build(BuildContext context) {
+    if (_phase == AppPhase.intro) {
+      return IntroScreen(onDone: () {
+        setState(() => _phase = AppPhase.preparing);
+        _bootstrap();
+      });
+    }
     return Scaffold(
       drawer: _phase == AppPhase.ready ? _buildDrawer() : null,
       appBar: AppBar(

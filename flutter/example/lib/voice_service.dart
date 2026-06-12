@@ -8,6 +8,8 @@ import 'package:path_provider/path_provider.dart';
 import 'package:record/record.dart';
 import 'package:sherpa_onnx/sherpa_onnx.dart' as sherpa;
 
+import 'app_prefs.dart';
+
 /// Reports voice-model setup progress. [progress] is 0..1 while downloading,
 /// null during the indeterminate unpack phase.
 typedef VoiceProgress = void Function(String phase, double? progress);
@@ -42,9 +44,24 @@ class VoiceService {
   bool get isLoaded => _recognizer != null;
   bool get isListening => _listening;
 
-  Future<Directory> _modelDir() async {
+  /// ASR root, honoring the user-chosen models location (so the ~57 MB voice
+  /// model also survives a reinstall when stored on e.g. an SD card).
+  Future<Directory> _asrRoot() async {
+    final custom = await loadModelsLocation();
+    if (custom.isNotEmpty) {
+      try {
+        final dir = Directory('$custom/asr');
+        if (!await dir.exists()) await dir.create(recursive: true);
+        return dir;
+      } catch (_) {/* fall back to app storage */}
+    }
     final docs = await getApplicationDocumentsDirectory();
-    return Directory('${docs.path}/asr/$_dirName');
+    return Directory('${docs.path}/asr');
+  }
+
+  Future<Directory> _modelDir() async {
+    final root = await _asrRoot();
+    return Directory('${root.path}/$_dirName');
   }
 
   /// Whether the speech model is already downloaded and unpacked.
@@ -59,8 +76,7 @@ class VoiceService {
   /// Downloads + unpacks the speech model if it is not already present.
   Future<void> ensureModel(VoiceProgress onProgress) async {
     if (await isModelInstalled()) return;
-    final docs = await getApplicationDocumentsDirectory();
-    final asrRoot = Directory('${docs.path}/asr');
+    final asrRoot = await _asrRoot();
     await asrRoot.create(recursive: true);
     final zipPath = '${asrRoot.path}/asr-model.zip';
 

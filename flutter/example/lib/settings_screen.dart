@@ -49,6 +49,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
   List<stt.LocaleName> _locales = const [];
   bool _localesLoading = false;
   int _maxTokens = kDefaultMaxTokens;
+  String _modelsLocation = '';
   String? _error;
 
   @override
@@ -72,6 +73,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
     _voiceEngine = await loadVoiceEngine();
     _voiceLocale = await loadVoiceLocale();
     _maxTokens = await loadMaxTokens();
+    _modelsLocation = await loadModelsLocation();
     _documents = await _docs.list();
     _corpusLocation = await _docs.locationLabel();
     await _refreshInstalled();
@@ -89,6 +91,28 @@ class _SettingsScreenState extends State<SettingsScreen> {
       ScaffoldMessenger.of(context)
           .showSnackBar(SnackBar(content: Text(msg)));
     }
+  }
+
+  /// Lets the user choose where model downloads are stored (e.g. SD card) so
+  /// they survive a reinstall; an existing folder with models is reused.
+  Future<void> _chooseModelsLocation() async {
+    var status = await Permission.manageExternalStorage.status;
+    if (!status.isGranted) {
+      status = await Permission.manageExternalStorage.request();
+    }
+    if (!status.isGranted) {
+      await _toast('Storage permission is required to use a custom folder.');
+      return;
+    }
+    final dir = await FilePicker.platform.getDirectoryPath();
+    if (dir == null) return;
+    await saveModelsLocation(dir);
+    final found = await widget.manager.countModelsAt(dir);
+    setState(() => _modelsLocation = dir);
+    await _toast(found > 0
+        ? 'Found $found model${found == 1 ? '' : 's'} there — they will be '
+            'reused. New downloads go there too.'
+        : 'New model downloads will be stored there.');
   }
 
   /// Lets the user choose a folder (e.g. SD card) for the corpus, reusing an
@@ -384,6 +408,17 @@ class _SettingsScreenState extends State<SettingsScreen> {
           ),
           const Divider(),
           _sectionHeader('Models'),
+          ListTile(
+            leading: const Icon(Icons.sd_storage_outlined),
+            title: const Text('Models storage'),
+            subtitle: Text(_modelsLocation.isEmpty
+                ? 'App storage (cleared on uninstall)'
+                : _modelsLocation),
+            trailing: TextButton(
+              onPressed: _chooseModelsLocation,
+              child: const Text('Change'),
+            ),
+          ),
           if (_error != null)
             Padding(
               padding: const EdgeInsets.fromLTRB(16, 0, 16, 8),

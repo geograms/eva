@@ -104,6 +104,38 @@ Future<void> saveMaxTokens(int value) async {
   await prefs.setInt(_kMaxTokensKey, value);
 }
 
+// ── Intro / onboarding ───────────────────────────────────────────────────────
+
+const String _kIntroSeenKey = 'intro_seen';
+
+/// Whether the first-run intro (permissions + downloads explainer) was shown.
+Future<bool> loadIntroSeen() async {
+  final prefs = await SharedPreferences.getInstance();
+  return prefs.getBool(_kIntroSeenKey) ?? false;
+}
+
+Future<void> saveIntroSeen() async {
+  final prefs = await SharedPreferences.getInstance();
+  await prefs.setBool(_kIntroSeenKey, true);
+}
+
+// ── Models storage location ──────────────────────────────────────────────────
+
+const String _kModelsLocationKey = 'models_location';
+
+/// Absolute path of the folder where model bundles are stored. Empty means the
+/// app's private storage. Pointing this at an SD card / shared folder lets the
+/// (large) model downloads survive a reinstall and be reused — no re-download.
+Future<String> loadModelsLocation() async {
+  final prefs = await SharedPreferences.getInstance();
+  return prefs.getString(_kModelsLocationKey) ?? '';
+}
+
+Future<void> saveModelsLocation(String path) async {
+  final prefs = await SharedPreferences.getInstance();
+  await prefs.setString(_kModelsLocationKey, path);
+}
+
 // ── Document corpus location ─────────────────────────────────────────────────
 
 const String _kCorpusLocationKey = 'corpus_location';
