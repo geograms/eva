@@ -96,6 +96,7 @@ flutter:
   # small), so no model bundle is shipped inside the APK — only Eva's avatar.
   assets:
     - assets/eva.png
+    - assets/eva_avatar.png
 
   # An image asset can refer to one or more resolution-specific "variants", see
   # https://flutter.dev/to/resolution-aware-images

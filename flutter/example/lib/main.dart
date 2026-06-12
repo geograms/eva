@@ -1378,8 +1378,8 @@ class _ChatScreenState extends State<ChatScreen> {
         const Padding(
           padding: EdgeInsets.only(top: 4, right: 8),
           child: CircleAvatar(
-            radius: 18,
-            backgroundImage: AssetImage('assets/eva.png'),
+            radius: 22,
+            backgroundImage: AssetImage('assets/eva_avatar.png'),
           ),
         ),
         Flexible(

@@ -112,7 +112,7 @@ class _IntroScreenState extends State<IntroScreen> {
                   const Center(
                     child: CircleAvatar(
                       radius: 44,
-                      backgroundImage: AssetImage('assets/eva.png'),
+                      backgroundImage: AssetImage('assets/eva_avatar.png'),
                     ),
                   ),
                   const SizedBox(height: 12),
