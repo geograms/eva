@@ -68,6 +68,8 @@ dependencies:
   gpt_markdown: ^1.1.7
   url_launcher: ^6.3.2
   syncfusion_flutter_pdfviewer: ^27.2.5
+  exif: ^3.3.0
+  flutter_image_compress: ^2.4.0
 
 dev_dependencies:
   flutter_test:

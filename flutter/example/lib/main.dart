@@ -24,6 +24,9 @@ import 'intro_screen.dart';
 import 'model_catalog.dart';
 import 'model_manager.dart';
 import 'pdf_viewer_screen.dart';
+import 'photo_service.dart';
+import 'photo_store.dart';
+import 'photos_screen.dart';
 import 'rag_index.dart';
 import 'settings_screen.dart';
 import 'system_voice.dart';
@@ -68,13 +71,15 @@ class EvaApp extends StatelessWidget {
 enum AppPhase { intro, preparing, downloading, loadingModel, ready, error }
 
 class ChatMessage {
-  ChatMessage(this.role, this.text, {this.imagePath, this.sources});
+  ChatMessage(this.role, this.text, {this.imagePath, this.sources, this.photos});
   final String role; // 'user' or 'assistant'
   String text;
   // Absolute path of an image the user attached to this message (vision chat).
   final String? imagePath;
   // Document sources cited for this answer (RAG), shown under the bubble.
   List<Citation>? sources;
+  // Photo-gallery results to show as a thumbnail grid (not persisted).
+  List<PhotoInfo>? photos;
 }
 
 class ChatScreen extends StatefulWidget {
@@ -99,6 +104,7 @@ class _ChatScreenState extends State<ChatScreen> {
   final VoiceService _voice = VoiceService();
   final SystemVoiceService _systemVoice = SystemVoiceService();
   final DocumentService _docs = DocumentService();
+  late final PhotoService _photos = PhotoService(_docs);
   bool _listening = false;
   VoiceEngine _voiceEngine = VoiceEngine.fast;
   String _voiceLocale = '';
@@ -657,6 +663,18 @@ class _ChatScreenState extends State<ChatScreen> {
     });
     _persistMessage(user);
     _scrollToBottom();
+
+    // Photo-gallery requests ("show my screenshots", "photos from last week")
+    // are answered directly with a thumbnail grid instead of the language model.
+    if (imagePath == null) {
+      final pq = _parsePhotoQuery(text);
+      if (pq != null && await _answerWithPhotos(pq, assistant)) {
+        setState(() => _generating = false);
+        _persistMessage(assistant);
+        _scrollToBottom();
+        return;
+      }
+    }
 
     // When documents are loaded, retrieve relevant passages and ground the
     // answer on them (RAG). The retrieved excerpts augment the system prompt.
@@ -1382,6 +1400,132 @@ class _ChatScreenState extends State<ChatScreen> {
     );
   }
 
+  // ── Photo-gallery chat queries ──────────────────────────────────────────────
+
+  /// Detects a request for photos and returns the time range / type to show, or
+  /// null if the message isn't about photos.
+  ({DateTime? from, DateTime? to, PhotoType? type, String label})?
+      _parsePhotoQuery(String text) {
+    final t = text.toLowerCase();
+    const photoWords = [
+      'photo', 'photos', 'picture', 'pictures', 'pic', 'pics', 'image',
+      'images', 'screenshot', 'screenshots', 'meme', 'memes',
+      'foto', 'fotos', 'imagem', 'imagens', 'captura', 'capturas'
+    ];
+    if (!photoWords.any((w) => RegExp('\\b$w\\b').hasMatch(t))) return null;
+
+    PhotoType? type;
+    if (RegExp(r'\bscreenshots?\b|\bcapturas?\b').hasMatch(t)) {
+      type = PhotoType.screenshot;
+    } else if (RegExp(r'\bmemes?\b').hasMatch(t)) {
+      type = PhotoType.meme;
+    }
+
+    final now = DateTime.now();
+    DateTime startOfDay(DateTime d) => DateTime(d.year, d.month, d.day);
+    DateTime? from;
+    DateTime? to;
+    var label = '';
+    if (RegExp(r'\btoday\b|\bhoje\b').hasMatch(t)) {
+      from = startOfDay(now);
+      label = ' from today';
+    } else if (RegExp(r'\byesterday\b|\bontem\b').hasMatch(t)) {
+      from = startOfDay(now.subtract(const Duration(days: 1)));
+      to = startOfDay(now);
+      label = ' from yesterday';
+    } else if (RegExp(r'last week|past week|semana passada').hasMatch(t)) {
+      from = startOfDay(now.subtract(Duration(days: now.weekday + 6)));
+      to = startOfDay(now.subtract(Duration(days: now.weekday - 1)));
+      label = ' from last week';
+    } else if (RegExp(r'this week|esta semana').hasMatch(t)) {
+      from = startOfDay(now.subtract(Duration(days: now.weekday - 1)));
+      label = ' from this week';
+    } else if (RegExp(r'last month|past month|mês passado|mes passado')
+        .hasMatch(t)) {
+      from = DateTime(now.year, now.month - 1, 1);
+      to = DateTime(now.year, now.month, 1);
+      label = ' from last month';
+    } else if (RegExp(r'this month|este mês|este mes').hasMatch(t)) {
+      from = DateTime(now.year, now.month, 1);
+      label = ' from this month';
+    } else if (RegExp(r'this year|este ano').hasMatch(t)) {
+      from = DateTime(now.year, 1, 1);
+      label = ' from this year';
+    } else {
+      final m = RegExp(r'last (\d+) days').firstMatch(t);
+      if (m != null) {
+        final n = int.parse(m.group(1)!);
+        from = startOfDay(now.subtract(Duration(days: n)));
+        label = ' from the last $n days';
+      }
+    }
+    return (from: from, to: to, type: type, label: label);
+  }
+
+  /// Fills [assistant] with a thumbnail grid of matching photos. Returns false
+  /// (so the normal model answer runs) when no photos are indexed at all.
+  Future<bool> _answerWithPhotos(
+      ({DateTime? from, DateTime? to, PhotoType? type, String label}) q,
+      ChatMessage assistant) async {
+    PhotoStore? store;
+    try {
+      store = await _photos.openStore();
+      if (store.count == 0) return false; // let the model reply normally
+      final results = store.query(
+          from: q.from, to: q.to, type: q.type, limit: 24);
+      final kind = q.type == PhotoType.screenshot
+          ? 'screenshots'
+          : q.type == PhotoType.meme
+              ? 'memes'
+              : 'photos';
+      setState(() {
+        if (results.isEmpty) {
+          assistant.text = 'No $kind found${q.label}.';
+        } else {
+          assistant.text = 'Here ${results.length == 1 ? 'is' : 'are'} '
+              '${results.length} $kind${q.label}:';
+          assistant.photos = results;
+        }
+      });
+      return true;
+    } catch (_) {
+      return false;
+    } finally {
+      store?.close();
+    }
+  }
+
+  Widget _photoGrid(List<PhotoInfo> photos) {
+    return Padding(
+      padding: const EdgeInsets.only(top: 6),
+      child: GridView.builder(
+        shrinkWrap: true,
+        physics: const NeverScrollableScrollPhysics(),
+        gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
+          crossAxisCount: 3,
+          mainAxisSpacing: 3,
+          crossAxisSpacing: 3,
+        ),
+        itemCount: photos.length,
+        itemBuilder: (context, i) {
+          final p = photos[i];
+          return GestureDetector(
+            onTap: () => Navigator.of(context).push(MaterialPageRoute(
+              builder: (_) => PhotoViewScreen(path: p.path),
+            )),
+            child: ClipRRect(
+              borderRadius: BorderRadius.circular(6),
+              child: p.thumb == null
+                  ? Container(color: Colors.black12)
+                  : Image.memory(p.thumb!,
+                      fit: BoxFit.cover, gaplessPlayback: true),
+            ),
+          );
+        },
+      ),
+    );
+  }
+
   /// A citation is openable when it points at a PDF on disk.
   bool _canOpen(Citation c) =>
       c.path != null && c.path!.toLowerCase().endsWith('.pdf');
@@ -1438,9 +1582,16 @@ class _ChatScreenState extends State<ChatScreen> {
             )
           : m.text.isEmpty
               ? const Text('…')
-              : GptMarkdown(
-                  m.text,
-                  style: Theme.of(context).textTheme.bodyMedium,
+              : Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    GptMarkdown(
+                      m.text,
+                      style: Theme.of(context).textTheme.bodyMedium,
+                    ),
+                    if (m.photos != null && m.photos!.isNotEmpty)
+                      _photoGrid(m.photos!),
+                  ],
                 ),
     );
 

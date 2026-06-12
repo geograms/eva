@@ -9,6 +9,8 @@ import 'document_service.dart';
 import 'documents_screen.dart';
 import 'model_catalog.dart';
 import 'model_manager.dart';
+import 'photo_service.dart';
+import 'photos_screen.dart';
 import 'system_voice.dart';
 import 'voice_service.dart';
 
@@ -35,6 +37,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
   final VoiceService _voice = VoiceService();
   final SystemVoiceService _systemVoice = SystemVoiceService();
   final DocumentService _docs = DocumentService();
+  late final PhotoService _photos = PhotoService(_docs);
   List<DocumentInfo> _documents = const [];
   String _corpusLocation = 'App storage (default)';
   List<ModelSpec> _catalog = const [];
@@ -52,6 +55,8 @@ class _SettingsScreenState extends State<SettingsScreen> {
   int _maxTokens = kDefaultMaxTokens;
   String _modelsLocation = '';
   int _skippedBad = 0;
+  int _photoCount = 0;
+  bool _photoCancel = false;
   String? _error;
 
   @override
@@ -77,6 +82,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
     _maxTokens = await loadMaxTokens();
     _modelsLocation = await loadModelsLocation();
     _skippedBad = await _docs.skippedCount();
+    _photoCount = await _photos.photoCount();
     _documents = await _docs.list();
     _corpusLocation = await _docs.locationLabel();
     await _refreshInstalled();
@@ -170,6 +176,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
       );
       await _refreshDocs();
       _skippedBad = await _docs.skippedCount();
+    _photoCount = await _photos.photoCount();
       if (mounted) setState(() {});
       await _toast('Added ${res.added} documents — ${res.failed} had no text '
           '(remembered, won\'t be re-scanned). Indexing continues in the '
@@ -670,9 +677,107 @@ class _SettingsScreenState extends State<SettingsScreen> {
               style: TextStyle(fontSize: 12, color: Colors.grey),
             ),
           ),
+          const Divider(),
+          _sectionHeader('Photos'),
+          ListTile(
+            leading: const Icon(Icons.photo_library_outlined),
+            title: const Text('Browse photos'),
+            subtitle: Text(_photoCount == 0
+                ? 'Scan your gallery to browse and search photos.'
+                : '$_photoCount photos indexed — view by day and type'),
+            trailing:
+                _photoCount == 0 ? null : const Icon(Icons.chevron_right),
+            onTap: _photoCount == 0
+                ? null
+                : () async {
+                    await Navigator.of(context).push(MaterialPageRoute(
+                      builder: (_) => PhotosScreen(photos: _photos),
+                    ));
+                  },
+          ),
+          ListTile(
+            leading: const Icon(Icons.image_search),
+            title: const Text('Scan photo gallery'),
+            subtitle: const Text(
+                'Indexes every photo on the phone with a cached thumbnail, by '
+                'date and type. One-time; resumable.'),
+            onTap: busy ? null : _scanPhotos,
+          ),
+          const Padding(
+            padding: EdgeInsets.fromLTRB(16, 4, 16, 16),
+            child: Text(
+              'Recognising what is inside each photo (so you can search by '
+              'content) runs on-device later in the background. This step just '
+              'catalogs them by date and makes thumbnails.',
+              style: TextStyle(fontSize: 12, color: Colors.grey),
+            ),
+          ),
         ],
       ),
     );
+  }
+
+  /// Scans the whole gallery into the photo index with a cancellable progress
+  /// dialog. Resumable: already-indexed photos are skipped.
+  Future<void> _scanPhotos() async {
+    var ok = await Permission.photos.request();
+    if (!ok.isGranted) {
+      // Pre-13 devices use storage permission instead of media-images.
+      ok = await Permission.storage.request();
+    }
+    if (!ok.isGranted &&
+        !(await Permission.manageExternalStorage.isGranted)) {
+      await _toast('Photo access is required to scan the gallery.');
+      return;
+    }
+    _photoCancel = false;
+    var scanned = 0;
+    var partial = PhotoScanResult();
+    StateSetter? update;
+    if (mounted) {
+      showDialog<void>(
+        context: context,
+        barrierDismissible: false,
+        builder: (ctx) => StatefulBuilder(builder: (ctx, set) {
+          update = set;
+          return AlertDialog(
+            title: const Text('Scanning photos'),
+            content: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                const LinearProgressIndicator(),
+                const SizedBox(height: 12),
+                Text('Scanned $scanned images\n'
+                    'Added ${partial.added} · already indexed '
+                    '${partial.skippedExisting}\nUnreadable ${partial.failed}'),
+              ],
+            ),
+            actions: [
+              TextButton(
+                onPressed: () => _photoCancel = true,
+                child: const Text('Stop'),
+              ),
+            ],
+          );
+        }),
+      );
+    }
+    try {
+      final res = await _photos.scan(
+        onProgress: (n, p) {
+          scanned = n;
+          partial = p;
+          update?.call(() {});
+        },
+        shouldContinue: () => !_photoCancel,
+      );
+      _photoCount = await _photos.photoCount();
+      if (mounted) setState(() {});
+      await _toast('Indexed ${res.added} new photos '
+          '($_photoCount total). You can browse them now.');
+    } finally {
+      if (mounted) Navigator.of(context, rootNavigator: true).pop();
+    }
   }
 
   Widget _systemVoiceConfig() {
