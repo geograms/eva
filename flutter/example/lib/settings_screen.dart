@@ -51,6 +51,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
   bool _localesLoading = false;
   int _maxTokens = kDefaultMaxTokens;
   String _modelsLocation = '';
+  int _skippedBad = 0;
   String? _error;
 
   @override
@@ -75,6 +76,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
     _voiceLocale = await loadVoiceLocale();
     _maxTokens = await loadMaxTokens();
     _modelsLocation = await loadModelsLocation();
+    _skippedBad = await _docs.skippedCount();
     _documents = await _docs.list();
     _corpusLocation = await _docs.locationLabel();
     await _refreshInstalled();
@@ -142,8 +144,8 @@ class _SettingsScreenState extends State<SettingsScreen> {
                 Text('Scanned $scanned files\n'
                     'Added ${partial.added} · already present '
                     '${partial.skippedExisting}\n'
-                    'No text/failed ${partial.failed} · skipped '
-                    '${partial.skippedOther}'),
+                    'No text/failed ${partial.failed} · known-bad '
+                    '${partial.skippedKnownBad}'),
               ],
             ),
             actions: [
@@ -167,9 +169,11 @@ class _SettingsScreenState extends State<SettingsScreen> {
         shouldContinue: () => !_importCancelled,
       );
       await _refreshDocs();
-      await _toast('Added ${res.added} documents '
-          '(${res.skippedExisting} already present, ${res.failed} unreadable). '
-          'Indexing continues in the background.');
+      _skippedBad = await _docs.skippedCount();
+      if (mounted) setState(() {});
+      await _toast('Added ${res.added} documents — ${res.failed} had no text '
+          '(remembered, won\'t be re-scanned). Indexing continues in the '
+          'background.');
     } finally {
       if (mounted) Navigator.of(context, rootNavigator: true).pop();
     }
@@ -615,6 +619,23 @@ class _SettingsScreenState extends State<SettingsScreen> {
             title: const Text('Import documents from a folder'),
             onTap: busy ? null : _pickFolderAndImport,
           ),
+          if (_skippedBad > 0)
+            ListTile(
+              leading: const Icon(Icons.refresh),
+              title: Text('Retry $_skippedBad skipped file'
+                  '${_skippedBad == 1 ? '' : 's'}'),
+              subtitle: const Text(
+                  'Files with no extractable text are skipped on scans. Forget '
+                  'that so the next scan tries them again.'),
+              onTap: busy
+                  ? null
+                  : () async {
+                      await _docs.clearSkipped();
+                      setState(() => _skippedBad = 0);
+                      await _toast('Skip-list cleared — they will be tried on '
+                          'the next scan.');
+                    },
+            ),
           ListTile(
             leading: const Icon(Icons.sd_storage_outlined),
             title: const Text('Storage location'),

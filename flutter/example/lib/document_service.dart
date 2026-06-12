@@ -47,6 +47,7 @@ class BulkImportResult {
   int added = 0;
   int skippedExisting = 0;
   int skippedOther = 0; // too large / empty
+  int skippedKnownBad = 0; // previously failed — skipped without re-reading
   int failed = 0; // unreadable or no extractable text (e.g. scanned PDFs)
 }
 
@@ -284,6 +285,8 @@ class DocumentService {
   }) async {
     final res = BulkImportResult();
     final existing = (await list()).map((d) => d.name).toSet();
+    final skipped = await loadSkipped();
+    final initialSkipped = skipped.length;
     var scanned = 0;
     final stack = <Directory>[Directory(root)];
 
@@ -320,15 +323,23 @@ class DocumentService {
           onProgress?.call(scanned, res);
           continue;
         }
+        // Known to have failed before — skip instantly, no re-read.
+        if (skipped.contains(e.path)) {
+          res.skippedKnownBad++;
+          onProgress?.call(scanned, res);
+          continue;
+        }
         int size;
         try {
           size = await e.length();
         } catch (_) {
           res.failed++;
+          skipped.add(e.path);
           continue;
         }
         if (size > maxBytes || size < 16) {
           res.skippedOther++;
+          skipped.add(e.path); // won't become valid by re-scanning
           onProgress?.call(scanned, res);
           continue;
         }
@@ -338,13 +349,45 @@ class DocumentService {
           res.added++;
         } catch (_) {
           res.failed++; // e.g. image-only PDF with no extractable text
+          skipped.add(e.path); // remember so future scans don't re-parse it
         }
         onProgress?.call(scanned, res);
       }
       // Hand the event loop back so the UI stays responsive between folders.
       await Future<void>.delayed(Duration.zero);
     }
+    // Persist newly-discovered bad files once (cheap; avoids per-file writes).
+    if (skipped.length != initialSkipped) await _saveSkipped(skipped);
     return res;
+  }
+
+  // ── Skip-list (files known to have no extractable text) ───────────────────
+  // Persisted by absolute path in the corpus pack so a re-scan doesn't re-parse
+  // the same image-only/failed PDFs every time. Device-specific (paths), which
+  // is fine — the failures are device-specific too.
+
+  Future<File> _skipFile() async => File('${await corpusPath()}/_skipped.json');
+
+  Future<Set<String>> loadSkipped() async {
+    final f = await _skipFile();
+    if (!await f.exists()) return <String>{};
+    try {
+      return (jsonDecode(await f.readAsString()) as List).cast<String>().toSet();
+    } catch (_) {
+      return <String>{};
+    }
+  }
+
+  Future<void> _saveSkipped(Set<String> paths) async =>
+      (await _skipFile()).writeAsString(jsonEncode(paths.toList()));
+
+  Future<int> skippedCount() async => (await loadSkipped()).length;
+
+  /// Forgets the skip-list so a future scan retries those files (e.g. after the
+  /// files changed, or once OCR is available).
+  Future<void> clearSkipped() async {
+    final f = await _skipFile();
+    if (await f.exists()) await f.delete();
   }
 
   Future<void> remove(String id) async {
