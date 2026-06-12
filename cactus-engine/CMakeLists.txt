@@ -1,0 +1,128 @@
+cmake_minimum_required(VERSION 3.10)
+project(CactusEngine LANGUAGES CXX)
+
+set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+if(NOT TARGET cactus_graph)
+    add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../cactus-graph ${CMAKE_CURRENT_BINARY_DIR}/cactus-graph)
+endif()
+
+# --- libcurl ---
+set(CACTUS_CURL_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/libs/curl" CACHE PATH "Path to vendored libcurl")
+
+set(CACTUS_CURL_INCLUDE_DIR "${CACTUS_CURL_ROOT}/include")
+if(APPLE)
+    if(CMAKE_SYSTEM_NAME STREQUAL "iOS")
+        string(TOLOWER "${CMAKE_OSX_SYSROOT}" _sysroot_lower)
+        if(_sysroot_lower MATCHES "simulator")
+            set(CACTUS_CURL_LIBRARY "${CACTUS_CURL_ROOT}/ios/simulator/libcurl.a")
+        else()
+            set(CACTUS_CURL_LIBRARY "${CACTUS_CURL_ROOT}/ios/device/libcurl.a")
+        endif()
+    else()
+        set(CACTUS_CURL_LIBRARY "${CACTUS_CURL_ROOT}/macos/libcurl.a")
+    endif()
+    if(EXISTS "${CACTUS_CURL_INCLUDE_DIR}/curl/curl.h" AND EXISTS "${CACTUS_CURL_LIBRARY}")
+        set(CACTUS_HAS_CURL TRUE)
+    else()
+        set(CACTUS_HAS_CURL FALSE)
+        message(WARNING "Vendored libcurl not found at ${CACTUS_CURL_ROOT}; cloud features disabled")
+    endif()
+elseif(ANDROID)
+    set(CACTUS_CURL_LIBRARY "${CACTUS_CURL_ROOT}/android/${ANDROID_ABI}/libcurl.a")
+    if(EXISTS "${CACTUS_CURL_INCLUDE_DIR}/curl/curl.h" AND EXISTS "${CACTUS_CURL_LIBRARY}")
+        set(CACTUS_HAS_CURL TRUE)
+    else()
+        set(CACTUS_HAS_CURL FALSE)
+        message(WARNING "Vendored libcurl not found for Android; cloud features disabled")
+    endif()
+else()
+    find_package(CURL QUIET)
+    set(CACTUS_HAS_CURL ${CURL_FOUND})
+endif()
+
+# --- Sources ---
+set(ENGINE_SOURCES
+    src/bpe.cpp
+    src/sp.cpp
+    src/constraints.cpp
+    src/model.cpp
+    src/model_npu.cpp
+    src/engine_image.cpp
+    src/index.cpp
+    src/index_ffi.cpp
+    src/log.cpp
+    src/graph_ffi.cpp
+    src/rag.cpp
+    src/telemetry.cpp
+    src/telemetry_impl.cpp
+    src/cloud.cpp
+    src/init.cpp
+    src/embed.cpp
+    src/complete.cpp
+    src/transcribe.cpp
+    src/tokenizer.cpp
+)
+if(APPLE)
+    enable_language(OBJCXX)
+    list(APPEND ENGINE_SOURCES src/npu_ane.mm)
+    set_source_files_properties(src/npu_ane.mm PROPERTIES COMPILE_FLAGS "-fobjc-arc")
+else()
+    list(APPEND ENGINE_SOURCES src/npu.cpp)
+endif()
+
+add_library(cactus_engine STATIC ${ENGINE_SOURCES})
+
+set_target_properties(cactus_engine PROPERTIES
+    POSITION_INDEPENDENT_CODE ON
+)
+
+target_include_directories(cactus_engine
+    PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}
+    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src
+            ${CMAKE_CURRENT_SOURCE_DIR}/libs
+            ${CMAKE_CURRENT_SOURCE_DIR}/../cactus-kernels/src
+            ${CMAKE_CURRENT_SOURCE_DIR}/../cactus-kernels/libs
+)
+
+target_link_libraries(cactus_engine PUBLIC cactus_graph)
+
+# --- curl linking ---
+if(CACTUS_HAS_CURL)
+    if(APPLE OR ANDROID)
+        target_link_libraries(cactus_engine PRIVATE "${CACTUS_CURL_LIBRARY}")
+        target_include_directories(cactus_engine PRIVATE "${CACTUS_CURL_INCLUDE_DIR}")
+    else()
+        target_link_libraries(cactus_engine PRIVATE ${CURL_LIBRARIES})
+        target_include_directories(cactus_engine PRIVATE ${CURL_INCLUDE_DIRS})
+    endif()
+    target_compile_definitions(cactus_engine PRIVATE CACTUS_USE_CURL=1)
+endif()
+
+# --- Apple frameworks ---
+if(APPLE)
+    find_library(COREML_FRAMEWORK CoreML REQUIRED)
+    find_library(FOUNDATION_FRAMEWORK Foundation REQUIRED)
+    find_library(SECURITY_FRAMEWORK Security REQUIRED)
+    find_library(SYSTEMCONFIGURATION_FRAMEWORK SystemConfiguration REQUIRED)
+    find_library(CFNETWORK_FRAMEWORK CFNetwork REQUIRED)
+    target_link_libraries(cactus_engine PUBLIC
+        ${COREML_FRAMEWORK} ${FOUNDATION_FRAMEWORK}
+        ${SECURITY_FRAMEWORK} ${SYSTEMCONFIGURATION_FRAMEWORK} ${CFNETWORK_FRAMEWORK}
+    )
+endif()
+
+# --- Version ---
+set(_CACTUS_VERSION_FILE "${CMAKE_CURRENT_SOURCE_DIR}/../CACTUS_VERSION")
+if(EXISTS "${_CACTUS_VERSION_FILE}")
+    file(READ "${_CACTUS_VERSION_FILE}" _CACTUS_VERSION_CONTENT)
+    string(STRIP "${_CACTUS_VERSION_CONTENT}" CACTUS_VERSION_STR)
+    target_compile_definitions(cactus_engine PRIVATE CACTUS_COMPILE_TIME_VERSION="${CACTUS_VERSION_STR}")
+endif()
+
+target_compile_options(cactus_engine PRIVATE
+    -Wall -Wextra -pedantic -Wno-missing-field-initializers
+    $<$<CXX_COMPILER_ID:AppleClang,Clang>:-Wno-c99-extensions>
+    $<$<CXX_COMPILER_ID:GNU>:-Wno-pedantic>
+)

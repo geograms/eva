@@ -1,0 +1,825 @@
+#ifndef KERNEL_UTILS_H
+#define KERNEL_UTILS_H
+
+#include <arm_neon.h>
+#if defined(__APPLE__)
+#include <TargetConditionals.h>
+#include <sys/sysctl.h>
+#endif
+#if defined(__ANDROID__)
+#include <sys/auxv.h>
+#include <asm/hwcap.h>
+#include <sched.h>
+#include <fstream>
+#endif
+#include <algorithm>
+#include <cmath>
+#include <thread>
+#include <vector>
+#include <functional>
+#include <queue>
+#include <mutex>
+#include <condition_variable>
+#include <atomic>
+#include <cstdint>
+#include <future>
+#include <unistd.h>
+#include <unordered_map>
+#include <chrono>
+#include <string>
+#include <cstdio>
+
+constexpr size_t NEON_VECTOR_SIZE = 16;
+constexpr size_t STREAMING_STORE_THRESHOLD = 32768;
+
+inline void stream_store_f16x8(__fp16* dst, float16x8_t val) {
+#if defined(__aarch64__)
+    float16x4_t lo = vget_low_f16(val);
+    float16x4_t hi = vget_high_f16(val);
+    __asm__ __volatile__(
+        "stnp %d0, %d1, [%2]"
+        :
+        : "w"(lo), "w"(hi), "r"(dst)
+        : "memory"
+    );
+#else
+    vst1q_f16(dst, val);
+#endif
+}
+
+inline bool cpu_has_i8mm() {
+#if defined(__aarch64__)
+    static std::once_flag once;
+    static bool has = false;
+
+    std::call_once(once, []() {
+#if defined(__APPLE__)
+    int ret = 0;
+    size_t size = sizeof(ret);
+    if (sysctlbyname("hw.optional.arm.FEAT_I8MM", &ret, &size, nullptr, 0) == 0) {
+        has = (ret == 1);
+    }
+#elif defined(__ANDROID__)
+    unsigned long hwcap2 = getauxval(AT_HWCAP2);
+    #ifndef HWCAP2_I8MM
+    #define HWCAP2_I8MM (1 << 13)
+    #endif
+    has = (hwcap2 & HWCAP2_I8MM) != 0;
+#endif
+    });
+
+    return has;
+#else
+    return false;
+#endif
+}
+
+inline float32x4_t fast_exp_f32x4(float32x4_t x) {
+    const float32x4_t log2e = vdupq_n_f32(1.44269504088896341f);
+    const float32x4_t ln2_hi = vdupq_n_f32(6.93145751953125e-1f);
+    const float32x4_t ln2_lo = vdupq_n_f32(1.42860682030941723212e-6f);
+
+    const float32x4_t p0 = vdupq_n_f32(1.9875691500e-4f);
+    const float32x4_t p1 = vdupq_n_f32(1.3981999507e-3f);
+    const float32x4_t p2 = vdupq_n_f32(8.3334519073e-3f);
+    const float32x4_t p3 = vdupq_n_f32(4.1665795894e-2f);
+    const float32x4_t p4 = vdupq_n_f32(1.6666665459e-1f);
+    const float32x4_t p5 = vdupq_n_f32(5.0000001201e-1f);
+    const float32x4_t one = vdupq_n_f32(1.0f);
+
+    x = vmaxq_f32(x, vdupq_n_f32(-87.0f));
+    x = vminq_f32(x, vdupq_n_f32(87.0f));
+
+    float32x4_t z = vmulq_f32(x, log2e);
+    float32x4_t n = vrndnq_f32(z);
+
+    float32x4_t r = vfmsq_f32(x, n, ln2_hi);
+    r = vfmsq_f32(r, n, ln2_lo);
+
+    float32x4_t r2 = vmulq_f32(r, r);
+    float32x4_t p = p0;
+    p = vfmaq_f32(p1, p, r);
+    p = vfmaq_f32(p2, p, r);
+    p = vfmaq_f32(p3, p, r);
+    p = vfmaq_f32(p4, p, r);
+    p = vfmaq_f32(p5, p, r);
+    p = vfmaq_f32(r, p, r2);
+    p = vaddq_f32(p, one);
+
+    int32x4_t ni = vcvtq_s32_f32(n);
+    int32x4_t exp_bits = vshlq_n_s32(vaddq_s32(ni, vdupq_n_s32(127)), 23);
+    float32x4_t scale = vreinterpretq_f32_s32(exp_bits);
+
+    return vmulq_f32(p, scale);
+}
+
+alignas(16) inline constexpr float kFastTanhAlpha[7][4] = {
+    { 4.89352455891786e-03f, 4.89352455891786e-03f, 4.89352455891786e-03f, 4.89352455891786e-03f },
+    { 6.37261928875436e-04f, 6.37261928875436e-04f, 6.37261928875436e-04f, 6.37261928875436e-04f },
+    { 1.48572235717979e-05f, 1.48572235717979e-05f, 1.48572235717979e-05f, 1.48572235717979e-05f },
+    { 5.12229709037114e-08f, 5.12229709037114e-08f, 5.12229709037114e-08f, 5.12229709037114e-08f },
+    {-8.60467152213735e-11f,-8.60467152213735e-11f,-8.60467152213735e-11f,-8.60467152213735e-11f },
+    { 2.00018790482477e-13f, 2.00018790482477e-13f, 2.00018790482477e-13f, 2.00018790482477e-13f },
+    {-2.76076847742355e-16f,-2.76076847742355e-16f,-2.76076847742355e-16f,-2.76076847742355e-16f },
+};
+alignas(16) inline constexpr float kFastTanhBeta[4][4] = {
+    { 4.89352518554385e-03f, 4.89352518554385e-03f, 4.89352518554385e-03f, 4.89352518554385e-03f },
+    { 2.26843463243900e-03f, 2.26843463243900e-03f, 2.26843463243900e-03f, 2.26843463243900e-03f },
+    { 1.18534705686654e-04f, 1.18534705686654e-04f, 1.18534705686654e-04f, 1.18534705686654e-04f },
+    { 1.19825839466702e-06f, 1.19825839466702e-06f, 1.19825839466702e-06f, 1.19825839466702e-06f },
+};
+alignas(16) inline constexpr float kFastTanhClampHi[4] = { 9.0f, 9.0f, 9.0f, 9.0f };
+alignas(16) inline constexpr float kFastTanhClampLo[4] = {-9.0f,-9.0f,-9.0f,-9.0f };
+
+inline float32x4_t fast_tanh_f32x4(float32x4_t x) {
+    x = vmaxq_f32(vld1q_f32(kFastTanhClampLo), vminq_f32(vld1q_f32(kFastTanhClampHi), x));
+    float32x4_t x2 = vmulq_f32(x, x);
+    float32x4_t p = vfmaq_f32(vld1q_f32(kFastTanhAlpha[5]), vld1q_f32(kFastTanhAlpha[6]), x2);
+    p = vfmaq_f32(vld1q_f32(kFastTanhAlpha[4]), p, x2);
+    p = vfmaq_f32(vld1q_f32(kFastTanhAlpha[3]), p, x2);
+    p = vfmaq_f32(vld1q_f32(kFastTanhAlpha[2]), p, x2);
+    p = vfmaq_f32(vld1q_f32(kFastTanhAlpha[1]), p, x2);
+    p = vfmaq_f32(vld1q_f32(kFastTanhAlpha[0]), p, x2);
+    p = vmulq_f32(p, x);
+    float32x4_t q = vfmaq_f32(vld1q_f32(kFastTanhBeta[2]), vld1q_f32(kFastTanhBeta[3]), x2);
+    q = vfmaq_f32(vld1q_f32(kFastTanhBeta[1]), q, x2);
+    q = vfmaq_f32(vld1q_f32(kFastTanhBeta[0]), q, x2);
+    return vdivq_f32(p, q);
+}
+
+constexpr size_t SIMD_F16_WIDTH = 8;
+
+inline size_t simd_align(size_t count, size_t width = SIMD_F16_WIDTH) {
+    return (count / width) * width;
+}
+
+inline void f16x8_split_f32(float16x8_t v, float32x4_t& lo, float32x4_t& hi) {
+    lo = vcvt_f32_f16(vget_low_f16(v));
+    hi = vcvt_f32_f16(vget_high_f16(v));
+}
+
+inline float16x8_t f32_merge_f16(float32x4_t lo, float32x4_t hi) {
+    return vcombine_f16(vcvt_f16_f32(lo), vcvt_f16_f32(hi));
+}
+
+inline float32x4_t fast_sigmoid_f32x4(float32x4_t x) {
+    const float32x4_t one = vdupq_n_f32(1.0f);
+    return vdivq_f32(one, vaddq_f32(one, fast_exp_f32x4(vnegq_f32(x))));
+}
+
+template<typename F32x4Op>
+inline float16x8_t apply_f32_op_on_f16x8(float16x8_t v, F32x4Op op) {
+    float32x4_t lo, hi;
+    f16x8_split_f32(v, lo, hi);
+    return f32_merge_f16(op(lo), op(hi));
+}
+
+namespace CactusThreading {
+
+#if defined(__ANDROID__)
+    static constexpr size_t ANDROID_DYNAMIC_CHUNK_MULTIPLIER = 16;
+    class ThreadPool;
+    inline ThreadPool& get_thread_pool();
+
+    struct CoreTopology {
+        std::vector<int> performance_cores;  
+        std::vector<int> performance_core_capacities;
+        std::vector<int> all_cores;
+
+        static CoreTopology& get() {
+            static CoreTopology topo = detect();
+            return topo;
+        }
+
+    private:
+        static int read_sysfs_int(const char* path) {
+            std::ifstream f(path);
+            if (!f.is_open()) return -1;
+            int val = -1;
+            f >> val;
+            return val;
+        }
+
+        static CoreTopology detect() {
+            CoreTopology topo;
+            constexpr int MAX_CPUS = 16;
+            std::vector<std::pair<int, int>> core_caps; 
+
+            for (int i = 0; i < MAX_CPUS; ++i) {
+                char path[128];
+
+                snprintf(path, sizeof(path),
+                         "/sys/devices/system/cpu/cpu%d/cpu_capacity", i);
+                int cap = read_sysfs_int(path);
+                if (cap > 0) {
+                    core_caps.push_back({i, cap});
+                    topo.all_cores.push_back(i);
+                    continue;
+                }
+
+                snprintf(path, sizeof(path),
+                         "/sys/devices/system/cpu/cpu%d/cpufreq/cpuinfo_max_freq", i);
+                int freq = read_sysfs_int(path);
+                if (freq > 0) {
+                    core_caps.push_back({i, freq});
+                    topo.all_cores.push_back(i);
+                }
+            }
+
+            if (core_caps.empty()) return topo;
+
+            int max_cap = 0;
+            for (auto& [id, cap] : core_caps) {
+                max_cap = std::max(max_cap, cap);
+            }
+
+            int threshold = static_cast<int>(max_cap * 0.70);
+            for (auto& [id, cap] : core_caps) {
+                if (cap >= threshold) {
+                    topo.performance_cores.push_back(id);
+                    topo.performance_core_capacities.push_back(cap);
+                }
+            }
+
+            return topo;
+        }
+    };
+
+    inline bool pin_current_thread_to_cores(const std::vector<int>& cores) {
+        if (cores.empty()) return false;
+        cpu_set_t current_mask;
+        const bool has_current_mask = sched_getaffinity(0, sizeof(current_mask), &current_mask) == 0;
+        cpu_set_t mask;
+        CPU_ZERO(&mask);
+        bool selected = false;
+        for (int core : cores) {
+            if (!has_current_mask || CPU_ISSET(core, &current_mask)) {
+                CPU_SET(core, &mask);
+                selected = true;
+            }
+        }
+        if (!selected && has_current_mask) return true;
+        return sched_setaffinity(0, sizeof(mask), &mask) == 0;
+    }
+
+    struct ThreadAffinityState {
+        cpu_set_t original_mask{};
+        bool has_original_mask{false};
+
+        static ThreadAffinityState& current() {
+            static thread_local ThreadAffinityState state;
+            return state;
+        }
+
+        void capture_once() {
+            if (has_original_mask) return;
+            has_original_mask = sched_getaffinity(0, sizeof(original_mask), &original_mask) == 0;
+        }
+
+        void restore() const {
+            if (has_original_mask) {
+                sched_setaffinity(0, sizeof(original_mask), &original_mask);
+            }
+        }
+    };
+
+    struct CpuTimeSample {
+        uint64_t idle{0};
+        uint64_t total{0};
+        bool valid{false};
+    };
+
+    inline std::vector<CpuTimeSample> read_cpu_time_samples() {
+        std::ifstream f("/proc/stat");
+        std::vector<CpuTimeSample> samples;
+        std::string label;
+        while (f >> label) {
+            if (label.size() <= 3 || label[0] != 'c' || label[1] != 'p' || label[2] != 'u') {
+                std::string rest;
+                std::getline(f, rest);
+                continue;
+            }
+
+            int cpu = 0;
+            for (size_t i = 3; i < label.size(); ++i) {
+                if (label[i] < '0' || label[i] > '9') {
+                    cpu = -1;
+                    break;
+                }
+                cpu = cpu * 10 + (label[i] - '0');
+            }
+            if (cpu < 0) continue;
+
+            uint64_t user = 0, nice = 0, system = 0, idle = 0, iowait = 0;
+            uint64_t irq = 0, softirq = 0, steal = 0, guest = 0, guest_nice = 0;
+            f >> user >> nice >> system >> idle >> iowait >> irq >> softirq >> steal >> guest >> guest_nice;
+            if (samples.size() <= static_cast<size_t>(cpu)) samples.resize(static_cast<size_t>(cpu) + 1);
+            auto& sample = samples[static_cast<size_t>(cpu)];
+            sample.idle = idle + iowait;
+            sample.total = user + nice + system + idle + iowait + irq + softirq + steal + guest + guest_nice;
+            sample.valid = sample.total > 0;
+        }
+        return samples;
+    }
+
+    inline int select_load_aware_performance_core(
+        const std::vector<CpuTimeSample>& before,
+        const std::vector<CpuTimeSample>& after
+    ) {
+        auto& topo = CoreTopology::get();
+        if (topo.performance_cores.empty()) return -1;
+
+        cpu_set_t current_mask;
+        const bool has_current_mask = sched_getaffinity(0, sizeof(current_mask), &current_mask) == 0;
+        int best_core = -1;
+        double best_score = -1.0;
+        int max_cap = 1;
+        for (int cap : topo.performance_core_capacities) max_cap = std::max(max_cap, cap);
+
+        for (size_t i = 0; i < topo.performance_cores.size(); ++i) {
+            int core = topo.performance_cores[i];
+            if (has_current_mask && !CPU_ISSET(core, &current_mask)) continue;
+
+            double busy = 0.0;
+            if (static_cast<size_t>(core) < before.size() && static_cast<size_t>(core) < after.size()) {
+                const auto& prev = before[static_cast<size_t>(core)];
+                const auto& curr = after[static_cast<size_t>(core)];
+                if (prev.valid && curr.valid && curr.total >= prev.total && curr.idle >= prev.idle) {
+                    uint64_t total_delta = curr.total - prev.total;
+                    uint64_t idle_delta = curr.idle - prev.idle;
+                    if (total_delta > 0 && idle_delta <= total_delta) {
+                        busy = 1.0 - (static_cast<double>(idle_delta) / static_cast<double>(total_delta));
+                    }
+                }
+            }
+
+            int cap = i < topo.performance_core_capacities.size() ? topo.performance_core_capacities[i] : max_cap;
+            double score = (static_cast<double>(cap) / static_cast<double>(max_cap)) / (1.0 + busy);
+            if (score > best_score || (score == best_score && core > best_core)) {
+                best_score = score;
+                best_core = core;
+            }
+        }
+        return best_core;
+    }
+
+    inline void prepare_current_thread_for_cactus_work() {
+        auto& affinity = ThreadAffinityState::current();
+        affinity.capture_once();
+        (void)get_thread_pool();
+        affinity.restore();
+
+        auto before = read_cpu_time_samples();
+        if (!before.empty()) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        }
+        int core = select_load_aware_performance_core(before, read_cpu_time_samples());
+        if (core >= 0) {
+            pin_current_thread_to_cores({core});
+        }
+    }
+#else
+    inline void prepare_current_thread_for_cactus_work() {}
+#endif
+
+    class ThreadPool {
+    private:
+        static constexpr size_t MAX_WORKERS = 16;
+
+        std::vector<std::thread> workers;
+        std::deque<std::function<void()>> tasks;
+
+        std::mutex mutex;
+        std::condition_variable work_available;
+        std::condition_variable work_done;
+
+        bool stop{false};
+        std::atomic<size_t> pending_tasks{0};
+        size_t num_workers_;
+
+        void worker_thread() {
+            while (true) {
+                std::function<void()> task;
+                {
+                    std::unique_lock<std::mutex> lock(mutex);
+                    work_available.wait(lock, [this] {
+                        return stop || !tasks.empty();
+                    });
+
+                    if (stop && tasks.empty()) {
+                        return;
+                    }
+
+                    task = std::move(tasks.front());
+                    tasks.pop_front();
+                }
+
+                task();
+
+                if (pending_tasks.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+                    std::lock_guard<std::mutex> lock(mutex);
+                    work_done.notify_one();
+                }
+            }
+        }
+
+    public:
+        explicit ThreadPool(size_t num_threads = std::thread::hardware_concurrency())
+            : stop(false), pending_tasks(0) {
+            num_workers_ = std::min(num_threads, MAX_WORKERS);
+            if (num_workers_ == 0) num_workers_ = 1;
+
+#if defined(__ANDROID__)
+            auto& topo = CoreTopology::get();
+            if (!topo.performance_cores.empty()) {
+                num_workers_ = std::min(num_workers_, topo.performance_cores.size());
+            }
+#endif
+
+            workers.reserve(num_workers_);
+            for (size_t i = 0; i < num_workers_; ++i) {
+                workers.emplace_back([this, i]() {
+#if defined(__ANDROID__)
+                    auto& perf = CoreTopology::get().performance_cores;
+                    if (!perf.empty()) {
+                        pin_current_thread_to_cores({perf[i % perf.size()]});
+                    }
+#else
+                    (void)i;
+#endif
+                    worker_thread();
+                });
+            }
+        }
+
+        ~ThreadPool() {
+            {
+                std::lock_guard<std::mutex> lock(mutex);
+                stop = true;
+            }
+            work_available.notify_all();
+            for (auto& worker : workers) {
+                if (worker.joinable()) {
+                    worker.join();
+                }
+            }
+        }
+
+        template<typename F>
+        auto enqueue(F&& f) -> std::future<decltype(f())> {
+            using return_type = decltype(f());
+
+            auto task = std::make_shared<std::packaged_task<return_type()>>(
+                std::forward<F>(f)
+            );
+
+            std::future<return_type> res = task->get_future();
+
+            {
+                std::lock_guard<std::mutex> lock(mutex);
+                pending_tasks.fetch_add(1, std::memory_order_relaxed);
+                tasks.emplace_back([task](){ (*task)(); });
+            }
+            work_available.notify_one();
+
+            return res;
+        }
+
+        template<typename F>
+        void enqueue_batch(size_t total_work, F task_func) {
+            if (total_work == 0) return;
+
+            const size_t num_tasks = std::min(num_workers_, total_work);
+            const size_t per_worker = total_work / num_tasks;
+            const size_t remainder = total_work % num_tasks;
+
+            {
+                std::lock_guard<std::mutex> lock(mutex);
+                pending_tasks.fetch_add(num_tasks, std::memory_order_relaxed);
+
+                for (size_t w = 0; w < num_tasks; ++w) {
+                    size_t start = w * per_worker + std::min(w, remainder);
+                    size_t end = start + per_worker + (w < remainder ? 1 : 0);
+                    tasks.emplace_back([=]() { task_func(start, end); });
+                }
+            }
+            work_available.notify_all();
+        }
+
+        void wait_all() {
+            std::unique_lock<std::mutex> lock(mutex);
+            work_done.wait(lock, [this] {
+                return pending_tasks.load(std::memory_order_acquire) == 0;
+            });
+        }
+
+        template<typename F>
+        void enqueue_n_threads(size_t total_work, size_t num_threads, F task_func) {
+            if (total_work == 0 || num_threads == 0) return;
+
+            num_threads = std::min(num_threads, std::min(num_workers_, total_work));
+            size_t num_tasks = num_threads;
+#if defined(__ANDROID__)
+            if (num_threads > 1) {
+                num_tasks = std::min(total_work, std::max(num_threads, num_threads * ANDROID_DYNAMIC_CHUNK_MULTIPLIER));
+            }
+#endif
+            const size_t per_task = total_work / num_tasks;
+            const size_t remainder = total_work % num_tasks;
+
+            {
+                std::lock_guard<std::mutex> lock(mutex);
+                pending_tasks.fetch_add(num_tasks, std::memory_order_relaxed);
+
+                for (size_t t = 0; t < num_tasks; ++t) {
+                    size_t start = t * per_task + std::min(t, remainder);
+                    size_t end = start + per_task + (t < remainder ? 1 : 0);
+                    tasks.emplace_back([=]() { task_func(start, end); });
+                }
+            }
+            work_available.notify_all();
+        }
+
+        size_t num_workers() const { return num_workers_; }
+    };
+
+    inline ThreadPool& get_thread_pool() {
+        static ThreadPool pool;
+        return pool;
+    }
+    
+    struct ParallelConfig {
+        size_t min_work_gate;  
+        size_t work_per_thread; 
+
+        constexpr ParallelConfig(size_t gate, size_t per_thread)
+            : min_work_gate(gate), work_per_thread(per_thread) {}
+    };
+
+    inline size_t get_optimal_thread_count(size_t total_work, ParallelConfig config) {
+        if (total_work < config.min_work_gate) return 1;
+
+        size_t pool_size = get_thread_pool().num_workers();
+        size_t num_threads = (total_work + config.work_per_thread - 1) / config.work_per_thread;
+        return std::min(pool_size, std::max(static_cast<size_t>(1), num_threads));
+    }
+
+    struct Thresholds {
+        #if defined(__ANDROID__)
+        static constexpr ParallelConfig ATTENTION{64, 32};
+        static constexpr ParallelConfig ELEMENT_WISE{5000, 2500};
+        static constexpr ParallelConfig AXIS_REDUCE{1000, 500};
+        static constexpr ParallelConfig ALL_REDUCE{10000, 5000};
+        static constexpr ParallelConfig SCALAR_BASIC{30000, 15000};
+        static constexpr ParallelConfig SCALAR_EXPENSIVE{10000, 5000};
+        #else // Apple
+        static constexpr ParallelConfig ATTENTION{32, 16};
+        static constexpr ParallelConfig ELEMENT_WISE{5000, 2500};
+        static constexpr ParallelConfig AXIS_REDUCE{1000, 500};
+        static constexpr ParallelConfig ALL_REDUCE{10000, 5000};
+        static constexpr ParallelConfig SCALAR_BASIC{5000, 2500};
+        static constexpr ParallelConfig SCALAR_EXPENSIVE{2500, 1250};
+        #endif
+    };
+
+    struct GemmThreading {
+        #if defined(__ANDROID__)
+        static size_t get_num_threads(size_t M, size_t pool_size) {
+            if (M <= 1) return 1;
+            return pool_size;
+        }
+        static size_t get_gemv_threads(size_t /*N_blocks*/, size_t /*pool_size*/) {
+            return 1; 
+        }
+        #elif defined(__APPLE__) && TARGET_OS_IPHONE
+        static constexpr size_t GEMV_MIN_N_BLOCKS = 512; 
+        static size_t get_num_threads(size_t M, size_t pool_size) {
+            if (M <= 1) return std::min(pool_size, static_cast<size_t>(2));
+            return pool_size;
+        }
+        static size_t get_gemv_threads(size_t N_blocks, size_t pool_size) {
+            if (N_blocks < GEMV_MIN_N_BLOCKS) return 1;
+            return std::min(pool_size, static_cast<size_t>(3));
+        }
+        #else 
+        static constexpr size_t GEMV_MIN_N_BLOCKS = 256;  
+        static size_t get_num_threads(size_t M, size_t pool_size) {
+            if (M <= 1) return std::min(pool_size, static_cast<size_t>(4));
+            return pool_size;
+        }
+        static size_t get_gemv_threads(size_t N_blocks, size_t pool_size) {
+            if (N_blocks < GEMV_MIN_N_BLOCKS) return 1;
+            if (N_blocks < 512) return std::min(pool_size, static_cast<size_t>(2));
+            return std::min(pool_size, static_cast<size_t>(5));
+        }
+        #endif
+    };
+
+    inline size_t& get_gemm_thread_override() {
+        static size_t override_threads = 0; 
+        return override_threads;
+    }
+
+    inline void set_gemm_threads(size_t num_threads) {
+        get_gemm_thread_override() = num_threads;
+    }
+
+    inline void reset_gemm_threads() {
+        get_gemm_thread_override() = 0;
+    }
+    
+    class TaskHandle {
+    private:
+        std::vector<std::future<void>> futures_;
+        bool auto_wait_;
+        
+    public:
+        TaskHandle(bool auto_wait = true) : auto_wait_(auto_wait) {}
+        
+        ~TaskHandle() {
+            if (auto_wait_) {
+                wait();
+            }
+        }
+        
+        TaskHandle(TaskHandle&&) = default;
+        TaskHandle& operator=(TaskHandle&&) = default;
+        TaskHandle(const TaskHandle&) = delete;
+        TaskHandle& operator=(const TaskHandle&) = delete;
+        
+        void add_future(std::future<void>&& f) {
+            futures_.push_back(std::move(f));
+        }
+        
+        void wait() {
+            for (auto& f : futures_) {
+                if (f.valid()) {
+                    f.wait();
+                }
+            }
+            futures_.clear();
+        }
+        
+        bool is_ready() const {
+            for (const auto& f : futures_) {
+                if (f.valid() && f.wait_for(std::chrono::seconds(0)) != std::future_status::ready) {
+                    return false;
+                }
+            }
+            return true;
+        }
+        
+        size_t task_count() const { return futures_.size(); }
+    };
+    
+    template<typename WorkFunc>
+    TaskHandle parallel_for(size_t total_work, ParallelConfig config, WorkFunc work_func, bool wait = true) {
+        const size_t num_threads = get_optimal_thread_count(total_work, config);
+        TaskHandle handle(!wait);
+
+        if (num_threads == 1) {
+            if (wait) {
+                work_func(0, total_work);
+                return handle;
+            }
+            auto& pool = get_thread_pool();
+            handle.add_future(pool.enqueue([work_func, total_work]() {
+                work_func(0, total_work);
+            }));
+            return handle;
+        }
+
+        auto& pool = get_thread_pool();
+#if defined(__ANDROID__)
+        if (wait) {
+            pool.enqueue_n_threads(total_work, num_threads, work_func);
+            pool.wait_all();
+            return handle;
+        }
+#endif
+
+        const size_t work_per_thread = total_work / num_threads;
+
+        for (size_t t = 0; t < num_threads; ++t) {
+            handle.add_future(pool.enqueue([work_func, t, num_threads, work_per_thread, total_work]() {
+                const size_t start_idx = t * work_per_thread;
+                const size_t end_idx = (t == num_threads - 1) ? total_work : (t + 1) * work_per_thread;
+                work_func(start_idx, end_idx);
+            }));
+        }
+
+        if (wait) {
+            handle.wait();
+        }
+        return handle;
+    }
+
+    template<typename WorkFunc>
+    void parallel_for_2d(size_t outer_size, size_t inner_size, ParallelConfig config, WorkFunc work_func) {
+        const size_t total_work = outer_size * inner_size;
+        parallel_for(total_work, config, [&](size_t start_idx, size_t end_idx) {
+            for (size_t work_idx = start_idx; work_idx < end_idx; ++work_idx) {
+                const size_t outer = work_idx / inner_size;
+                const size_t inner = work_idx % inner_size;
+                work_func(outer, inner);
+            }
+        });
+    }
+
+    template<typename WorkFunc, typename ResultType, typename CombineFunc>
+    ResultType parallel_reduce(size_t total_work, ParallelConfig config,
+                              WorkFunc work_func, ResultType init_value, CombineFunc combine_func) {
+        const size_t num_threads = get_optimal_thread_count(total_work, config);
+        
+        if (num_threads == 1) {
+            return work_func(0, total_work);
+        }
+        
+        auto& pool = get_thread_pool();
+        std::vector<std::future<ResultType>> futures;
+        std::vector<ResultType> partial_results(num_threads, init_value);
+        const size_t work_per_thread = total_work / num_threads;
+        
+        for (size_t t = 0; t < num_threads; ++t) {
+            futures.push_back(pool.enqueue([work_func, t, num_threads, work_per_thread, total_work]() -> ResultType {
+                const size_t start_idx = t * work_per_thread;
+                const size_t end_idx = (t == num_threads - 1) ? total_work : (t + 1) * work_per_thread;
+                return work_func(start_idx, end_idx);
+            }));
+        }
+        
+        ResultType result = init_value;
+        for (auto& future : futures) {
+            result = combine_func(result, future.get());
+        }
+        return result;
+    }
+
+    template<typename WorkFunc>
+    void parallel_gemm_tiles(size_t M, size_t total_tiles, WorkFunc work_func) {
+        auto& pool = get_thread_pool();
+
+        size_t override = get_gemm_thread_override();
+        size_t num_threads = (override > 0) ? override : GemmThreading::get_num_threads(M, pool.num_workers());
+        num_threads = std::min(num_threads, total_tiles);
+
+        if (num_threads <= 1) {
+            work_func(0, total_tiles);
+            return;
+        }
+
+        pool.enqueue_n_threads(total_tiles, num_threads, work_func);
+        pool.wait_all();
+    }
+
+}
+
+template<typename SimdOp, typename ScalarOp>
+void elementwise_op_f16(const __fp16* input, __fp16* output, size_t num_elements,
+                        bool use_streaming, CactusThreading::ParallelConfig config,
+                        SimdOp simd_op, ScalarOp scalar_op, size_t unroll = 4) {
+    CactusThreading::parallel_for(num_elements, config,
+        [&](size_t start, size_t end) {
+            const size_t n = end - start;
+            const size_t vec_end = start + simd_align(n);
+
+            if (use_streaming && unroll >= 4) {
+                const size_t unrolled_end = start + simd_align(n, SIMD_F16_WIDTH * 4);
+                for (size_t i = start; i < unrolled_end; i += SIMD_F16_WIDTH * 4) {
+                    __builtin_prefetch(&input[i + 256], 0, 0);
+                    float16x8_t v0 = simd_op(vld1q_f16(&input[i]));
+                    float16x8_t v1 = simd_op(vld1q_f16(&input[i + 8]));
+                    float16x8_t v2 = simd_op(vld1q_f16(&input[i + 16]));
+                    float16x8_t v3 = simd_op(vld1q_f16(&input[i + 24]));
+                    stream_store_f16x8(&output[i], v0);
+                    stream_store_f16x8(&output[i + 8], v1);
+                    stream_store_f16x8(&output[i + 16], v2);
+                    stream_store_f16x8(&output[i + 24], v3);
+                }
+                for (size_t i = unrolled_end; i < vec_end; i += SIMD_F16_WIDTH) {
+                    stream_store_f16x8(&output[i], simd_op(vld1q_f16(&input[i])));
+                }
+            } else if (use_streaming && unroll >= 2) {
+                const size_t unrolled_end = start + simd_align(n, SIMD_F16_WIDTH * 2);
+                for (size_t i = start; i < unrolled_end; i += SIMD_F16_WIDTH * 2) {
+                    __builtin_prefetch(&input[i + 128], 0, 0);
+                    float16x8_t v0 = simd_op(vld1q_f16(&input[i]));
+                    float16x8_t v1 = simd_op(vld1q_f16(&input[i + 8]));
+                    stream_store_f16x8(&output[i], v0);
+                    stream_store_f16x8(&output[i + 8], v1);
+                }
+                for (size_t i = unrolled_end; i < vec_end; i += SIMD_F16_WIDTH) {
+                    stream_store_f16x8(&output[i], simd_op(vld1q_f16(&input[i])));
+                }
+            } else {
+                for (size_t i = start; i < vec_end; i += SIMD_F16_WIDTH) {
+                    vst1q_f16(&output[i], simd_op(vld1q_f16(&input[i])));
+                }
+            }
+            for (size_t i = vec_end; i < end; ++i) {
+                output[i] = scalar_op(input[i]);
+            }
+        });
+}
+
+#endif // KERNEL_UTILS_H

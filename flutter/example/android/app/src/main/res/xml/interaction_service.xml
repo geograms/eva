@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Declares Eva as a voice-interaction (assistant) app. supportsAssist routes
+     assist invocations (power-button hold, assist gesture, lock screen) to
+     EvaVoiceInteractionSession. -->
+<voice-interaction-service
+    xmlns:android="http://schemas.android.com/apk/res/android"
+    android:sessionService="radio.geogram.eva.EvaVoiceInteractionSessionService"
+    android:recognitionService="radio.geogram.eva.EvaRecognitionService"
+    android:supportsAssist="true"
+    android:supportsLaunchVoiceAssistFromKeyguard="true"
+    android:supportsLocalInteraction="true" />
