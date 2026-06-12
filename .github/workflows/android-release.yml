@@ -152,10 +152,26 @@ jobs:
       # No model is bundled into the APK — the app downloads models (including
       # the default) from the GitHub release on demand to keep the APK small.
 
+      # Stable release signing: decode the shared keystore so every published
+      # APK is signed with the same key and updates installs in place. Skipped
+      # (debug signing) when the secrets are absent, e.g. on forks.
+      - name: Set up release keystore
+        env:
+          EVA_KEYSTORE_B64: ${{ secrets.EVA_KEYSTORE_B64 }}
+        run: |
+          if [ -n "$EVA_KEYSTORE_B64" ]; then
+            echo "$EVA_KEYSTORE_B64" | base64 -d > "$RUNNER_TEMP/eva-release.keystore"
+            echo "EVA_KEYSTORE_PATH=$RUNNER_TEMP/eva-release.keystore" >> "$GITHUB_ENV"
+            echo "Release keystore installed."
+          else
+            echo "No keystore secret — APK will be debug-signed."
+          fi
+
       - name: Build APK
         working-directory: flutter/example
         env:
           TAG: ${{ steps.tag.outputs.tag }}
+          EVA_KEYSTORE_PASSWORD: ${{ secrets.EVA_KEYSTORE_PASSWORD }}
         run: |
           flutter pub get
           # The baked-in tag powers the in-app "new version available" banner.

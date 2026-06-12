@@ -32,11 +32,33 @@ android {
         }
     }
 
+    // Stable release signing so published APKs update each other in place.
+    // The keystore comes from EVA_KEYSTORE_PATH/EVA_KEYSTORE_PASSWORD (CI
+    // decodes them from repo secrets) or from ~/.keys/eva-release.keystore +
+    // .pass locally. Without either, falls back to debug signing so any clone
+    // still builds.
+    val home = System.getProperty("user.home")
+    val evaKeystore = file(
+        System.getenv("EVA_KEYSTORE_PATH") ?: "$home/.keys/eva-release.keystore")
+    val evaPassFile = file("$home/.keys/eva-release.pass")
+    val evaKeystorePass = System.getenv("EVA_KEYSTORE_PASSWORD")
+        ?: if (evaPassFile.exists()) evaPassFile.readText().trim() else null
+
+    signingConfigs {
+        if (evaKeystore.exists() && evaKeystorePass != null) {
+            create("release") {
+                storeFile = evaKeystore
+                storePassword = evaKeystorePass
+                keyAlias = "eva"
+                keyPassword = evaKeystorePass
+            }
+        }
+    }
+
     buildTypes {
         release {
-            // TODO: Add your own signing config for the release build.
-            // Signing with the debug keys for now, so `flutter run --release` works.
-            signingConfig = signingConfigs.getByName("debug")
+            signingConfig = signingConfigs.findByName("release")
+                ?: signingConfigs.getByName("debug")
         }
     }
 }
