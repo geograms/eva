@@ -1,9 +1,12 @@
+import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
 import 'package:exif/exif.dart';
+import 'package:flutter/foundation.dart';
 import 'package:flutter_image_compress/flutter_image_compress.dart';
 
+import 'app_prefs.dart';
 import 'document_service.dart';
 import 'photo_store.dart';
 
@@ -62,6 +65,7 @@ class PhotoService {
     List<String> roots = const ['/storage/emulated/0'],
     void Function(int scanned, PhotoScanResult partial)? onProgress,
     bool Function()? shouldContinue,
+    Duration perItemDelay = Duration.zero,
   }) async {
     final res = PhotoScanResult();
     final store = await openStore();
@@ -113,6 +117,8 @@ class PhotoService {
             skip.add(e.path);
           }
           onProgress?.call(scanned, res);
+          // Background throttle: spare CPU/battery between photos.
+          if (perItemDelay > Duration.zero) await Future<void>.delayed(perItemDelay);
         }
         await Future<void>.delayed(Duration.zero); // keep the UI responsive
       }
@@ -211,5 +217,85 @@ class PhotoService {
   int? _exifInt(Map<String, IfdTag> tags, String key) {
     final v = tags[key]?.printable;
     return v == null ? null : int.tryParse(v.trim());
+  }
+}
+
+/// Drives the gallery scan as a continuous background task: auto-resumes until
+/// the whole gallery is catalogued, throttled so the app stays responsive, and
+/// pausable (e.g. while the model answers). Progress is observable for a banner.
+class PhotoIndexController extends ChangeNotifier {
+  PhotoIndexController(this._photos);
+  final PhotoService _photos;
+
+  bool _running = false;
+  bool _paused = false;
+  int _scanned = 0;
+  int _added = 0;
+  int _total = 0; // best-effort total in the index
+  Completer<void>? _idle;
+
+  bool get isIndexing => _running && !_paused;
+  int get added => _added;
+  int get scanned => _scanned;
+  int get total => _total;
+
+  /// Starts/continues the gallery scan if it hasn't fully completed yet. Safe to
+  /// call repeatedly — coalesces into the running pass.
+  Future<void> ensureRunning() async {
+    if (_running || _paused) return;
+    if (await loadPhotoScanDone()) return; // whole gallery already catalogued
+    unawaited(_run());
+  }
+
+  /// Forces a fresh full pass (e.g. to pick up new photos).
+  Future<void> rescan() async {
+    await savePhotoScanDone(false);
+    _paused = false;
+    if (!_running) unawaited(_run());
+  }
+
+  void pause() => _paused = true;
+
+  void resume() {
+    if (!_paused) return;
+    _paused = false;
+    if (!_running) unawaited(_run());
+  }
+
+  Future<void> stop() async {
+    _paused = true;
+    if (!_running) return;
+    _idle ??= Completer<void>();
+    await _idle!.future;
+  }
+
+  Future<void> _run() async {
+    if (_running || _paused) return;
+    _running = true;
+    try {
+      _total = await _photos.photoCount();
+      final res = await _photos.scan(
+        perItemDelay: const Duration(milliseconds: 20),
+        onProgress: (n, p) {
+          _scanned = n;
+          _added = p.added;
+          _total = (_total) < p.added ? p.added : _total;
+          notifyListeners();
+        },
+        shouldContinue: () => !_paused,
+      );
+      // Completed the whole walk (not paused) — mark done so we don't re-walk.
+      if (!_paused) {
+        await savePhotoScanDone(true);
+        _added = res.added;
+      }
+    } catch (_) {
+      // transient — will retry next launch / resume
+    } finally {
+      _running = false;
+      _idle?.complete();
+      _idle = null;
+      notifyListeners();
+    }
   }
 }

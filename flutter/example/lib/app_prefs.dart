@@ -136,6 +136,23 @@ Future<void> saveModelsLocation(String path) async {
   await prefs.setString(_kModelsLocationKey, path);
 }
 
+// ── Photo gallery indexing ───────────────────────────────────────────────────
+
+const String _kPhotoScanDoneKey = 'photo_scan_done';
+
+/// Whether the gallery has been fully walked at least once. While false, the
+/// background photo indexer auto-resumes on launch until the whole gallery is
+/// catalogued. Reset to force a fresh pass (e.g. to pick up new photos).
+Future<bool> loadPhotoScanDone() async {
+  final prefs = await SharedPreferences.getInstance();
+  return prefs.getBool(_kPhotoScanDoneKey) ?? false;
+}
+
+Future<void> savePhotoScanDone(bool done) async {
+  final prefs = await SharedPreferences.getInstance();
+  await prefs.setBool(_kPhotoScanDoneKey, done);
+}
+
 // ── Document corpus location ─────────────────────────────────────────────────
 
 const String _kCorpusLocationKey = 'corpus_location';

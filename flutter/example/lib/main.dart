@@ -105,6 +105,7 @@ class _ChatScreenState extends State<ChatScreen> {
   final SystemVoiceService _systemVoice = SystemVoiceService();
   final DocumentService _docs = DocumentService();
   late final PhotoService _photos = PhotoService(_docs);
+  PhotoIndexController? _photoIndexer;
   bool _listening = false;
   VoiceEngine _voiceEngine = VoiceEngine.fast;
   String _voiceLocale = '';
@@ -170,6 +171,9 @@ class _ChatScreenState extends State<ChatScreen> {
     _tts.stop();
     _indexer?.removeListener(_onIndexerProgress);
     _indexer?.dispose();
+    _photoIndexer?.removeListener(_onPhotoProgress);
+    _photoIndexer?.pause();
+    _photoIndexer?.dispose();
     _rag?.close();
     _chats?.close();
     super.dispose();
@@ -551,6 +555,7 @@ class _ChatScreenState extends State<ChatScreen> {
       // Fully automatic: resume/continue indexing any document backlog in the
       // background, no user action required.
       unawaited(_autoIndexPending());
+      _startPhotoIndexing();
     } catch (e) {
       setState(() {
         _phase = AppPhase.error;
@@ -581,10 +586,13 @@ class _ChatScreenState extends State<ChatScreen> {
     // A changed corpus location closes the current index (it lives in the pack).
     if (_corpusLocation != locBefore) {
       await _indexer?.stop();
+      await _photoIndexer?.stop(); // photos.sqlite lives in the pack too
       _rag?.close();
       _rag = null;
       _embedderReady = false;
     }
+    // Pick up a requested re-index of new photos / continue the gallery pass.
+    _startPhotoIndexing();
     // Documents added in Settings (e.g. a bulk phone scan) start indexing in
     // the background right away — the chat stays usable meanwhile.
     if (docsNow.difference(docsBefore).isNotEmpty) {
@@ -909,6 +917,18 @@ class _ChatScreenState extends State<ChatScreen> {
 
   int _lastFailedReported = 0;
 
+  /// Starts (or resumes) the continuous background gallery scan, which keeps
+  /// running across launches until the whole gallery is catalogued.
+  void _startPhotoIndexing() {
+    _photoIndexer ??= PhotoIndexController(_photos)
+      ..addListener(_onPhotoProgress);
+    unawaited(_photoIndexer!.ensureRunning());
+  }
+
+  void _onPhotoProgress() {
+    if (mounted) setState(() {});
+  }
+
   void _onIndexerProgress() {
     if (!mounted) return;
     // Per-document failures are deferred (skipped), not fatal. Once the backlog
@@ -1192,6 +1212,7 @@ class _ChatScreenState extends State<ChatScreen> {
   /// is working through the document backlog (null = nothing to show).
   PreferredSizeWidget? _indexingBanner() {
     final ix = _indexer;
+    final px = _photoIndexer;
     final String? label;
     if (_preparingDocs && (ix == null || !ix.isIndexing)) {
       label = 'Preparing document search…';
@@ -1199,6 +1220,8 @@ class _ChatScreenState extends State<ChatScreen> {
       label = ix.currentName == null
           ? 'Indexing ${ix.pending} document${ix.pending == 1 ? '' : 's'}…'
           : 'Indexing "${ix.currentName}" — ${ix.pending} left';
+    } else if (px != null && px.isIndexing) {
+      label = 'Indexing photos — ${px.total} done…';
     } else {
       return null;
     }

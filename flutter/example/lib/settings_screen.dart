@@ -56,7 +56,6 @@ class _SettingsScreenState extends State<SettingsScreen> {
   String _modelsLocation = '';
   int _skippedBad = 0;
   int _photoCount = 0;
-  bool _photoCancel = false;
   String? _error;
 
   @override
@@ -697,87 +696,37 @@ class _SettingsScreenState extends State<SettingsScreen> {
           ),
           ListTile(
             leading: const Icon(Icons.image_search),
-            title: const Text('Scan photo gallery'),
+            title: const Text('Index photo gallery'),
             subtitle: const Text(
-                'Indexes every photo on the phone with a cached thumbnail, by '
-                'date and type. One-time; resumable.'),
-            onTap: busy ? null : _scanPhotos,
+                'Catalogs every photo with a cached thumbnail, by date and '
+                'type, continuously in the background. Tap to (re)scan for new '
+                'photos.'),
+            onTap: () async {
+              var ok = await Permission.photos.request();
+              if (!ok.isGranted) ok = await Permission.storage.request();
+              if (!ok.isGranted &&
+                  !(await Permission.manageExternalStorage.isGranted)) {
+                await _toast('Photo access is required to index the gallery.');
+                return;
+              }
+              await savePhotoScanDone(false);
+              await _toast('Photo indexing will run in the background — '
+                  'progress shows at the top of the chat.');
+            },
           ),
           const Padding(
             padding: EdgeInsets.fromLTRB(16, 4, 16, 16),
             child: Text(
-              'Recognising what is inside each photo (so you can search by '
-              'content) runs on-device later in the background. This step just '
-              'catalogs them by date and makes thumbnails.',
+              'Indexing runs continuously in the background until the whole '
+              'gallery is catalogued. Recognising what is inside each photo (so '
+              'you can search by content) is a separate on-device pass added '
+              'later.',
               style: TextStyle(fontSize: 12, color: Colors.grey),
             ),
           ),
         ],
       ),
     );
-  }
-
-  /// Scans the whole gallery into the photo index with a cancellable progress
-  /// dialog. Resumable: already-indexed photos are skipped.
-  Future<void> _scanPhotos() async {
-    var ok = await Permission.photos.request();
-    if (!ok.isGranted) {
-      // Pre-13 devices use storage permission instead of media-images.
-      ok = await Permission.storage.request();
-    }
-    if (!ok.isGranted &&
-        !(await Permission.manageExternalStorage.isGranted)) {
-      await _toast('Photo access is required to scan the gallery.');
-      return;
-    }
-    _photoCancel = false;
-    var scanned = 0;
-    var partial = PhotoScanResult();
-    StateSetter? update;
-    if (mounted) {
-      showDialog<void>(
-        context: context,
-        barrierDismissible: false,
-        builder: (ctx) => StatefulBuilder(builder: (ctx, set) {
-          update = set;
-          return AlertDialog(
-            title: const Text('Scanning photos'),
-            content: Column(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                const LinearProgressIndicator(),
-                const SizedBox(height: 12),
-                Text('Scanned $scanned images\n'
-                    'Added ${partial.added} · already indexed '
-                    '${partial.skippedExisting}\nUnreadable ${partial.failed}'),
-              ],
-            ),
-            actions: [
-              TextButton(
-                onPressed: () => _photoCancel = true,
-                child: const Text('Stop'),
-              ),
-            ],
-          );
-        }),
-      );
-    }
-    try {
-      final res = await _photos.scan(
-        onProgress: (n, p) {
-          scanned = n;
-          partial = p;
-          update?.call(() {});
-        },
-        shouldContinue: () => !_photoCancel,
-      );
-      _photoCount = await _photos.photoCount();
-      if (mounted) setState(() {});
-      await _toast('Indexed ${res.added} new photos '
-          '($_photoCount total). You can browse them now.');
-    } finally {
-      if (mounted) Navigator.of(context, rootNavigator: true).pop();
-    }
   }
 
   Widget _systemVoiceConfig() {
