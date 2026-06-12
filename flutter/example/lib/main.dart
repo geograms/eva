@@ -672,7 +672,11 @@ class _ChatScreenState extends State<ChatScreen> {
         final hits = await _rag!
             .query(queryVec: qvec, queryText: text, topK: 4);
         if (hits.isNotEmpty) {
-          final pathById = {for (final d in _documents) d.id: d.sourcePath};
+          // Read paths fresh so citations are openable even right after a scan
+          // backfilled them (the cached list may not have reloaded yet).
+          final pathById = {
+            for (final d in await _docs.list()) d.id: d.sourcePath
+          };
           final buf = StringBuffer(_systemPrompt);
           buf.writeln(
               "\n\nAnswer the user's question using ONLY the document excerpts below. "
