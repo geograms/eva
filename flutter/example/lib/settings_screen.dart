@@ -6,6 +6,7 @@ import 'package:speech_to_text/speech_to_text.dart' as stt;
 import 'app_prefs.dart';
 import 'assistant_channel.dart';
 import 'document_service.dart';
+import 'documents_screen.dart';
 import 'model_catalog.dart';
 import 'model_manager.dart';
 import 'system_voice.dart';
@@ -293,12 +294,6 @@ class _SettingsScreenState extends State<SettingsScreen> {
         ),
       );
 
-  Future<void> _removeDocument(DocumentInfo doc) async {
-    await _docs.remove(doc.id);
-    _documents = await _docs.list();
-    if (mounted) setState(() {});
-  }
-
   /// Loads the device's available recognition locales (for the system engine).
   Future<void> _loadLocales() async {
     if (_locales.isNotEmpty || _localesLoading) return;
@@ -467,10 +462,18 @@ class _SettingsScreenState extends State<SettingsScreen> {
               ),
             ),
           ),
-          ListTile(
-            title: const Text('Reply length'),
-            subtitle: const Text('Longer replies take more time to generate.'),
-            trailing: SegmentedButton<int>(
+          const Padding(
+            padding: EdgeInsets.fromLTRB(16, 4, 16, 0),
+            child: Text('Reply length'),
+          ),
+          const Padding(
+            padding: EdgeInsets.fromLTRB(16, 0, 16, 6),
+            child: Text('Longer replies take more time to generate.',
+                style: TextStyle(fontSize: 12, color: Colors.grey)),
+          ),
+          Padding(
+            padding: const EdgeInsets.fromLTRB(16, 0, 16, 8),
+            child: SegmentedButton<int>(
               segments: const [
                 ButtonSegment(value: 256, label: Text('Short')),
                 ButtonSegment(value: 1024, label: Text('Normal')),
@@ -582,38 +585,24 @@ class _SettingsScreenState extends State<SettingsScreen> {
           _assistantTile(),
           const Divider(),
           _sectionHeader('Documents'),
-          if (_documents.isEmpty)
-            const Padding(
-              padding: EdgeInsets.fromLTRB(16, 0, 16, 8),
-              child: Text('No documents added yet.',
-                  style: TextStyle(color: Colors.grey)),
-            )
-          else ...[
-            Padding(
-              padding: const EdgeInsets.fromLTRB(16, 0, 16, 4),
-              child: Text('${_documents.length} documents in the corpus',
-                  style: const TextStyle(color: Colors.grey)),
-            ),
-            for (final d in _documents.take(8))
-              ListTile(
-                dense: true,
-                leading: const Icon(Icons.description_outlined),
-                title: Text(d.name,
-                    maxLines: 1, overflow: TextOverflow.ellipsis),
-                subtitle: Text('${(d.chars / 1000).toStringAsFixed(1)}k characters'),
-                trailing: IconButton(
-                  tooltip: 'Remove',
-                  icon: const Icon(Icons.delete_outline),
-                  onPressed: () => _removeDocument(d),
-                ),
-              ),
-            if (_documents.length > 8)
-              Padding(
-                padding: const EdgeInsets.fromLTRB(16, 0, 16, 8),
-                child: Text('… and ${_documents.length - 8} more',
-                    style: const TextStyle(color: Colors.grey)),
-              ),
-          ],
+          ListTile(
+            leading: const Icon(Icons.folder_copy_outlined),
+            title: const Text('Browse indexed documents'),
+            subtitle: Text(_documents.isEmpty
+                ? 'No documents added yet.'
+                : '${_documents.length} documents — view by folder, open, remove'),
+            trailing: _documents.isEmpty
+                ? null
+                : const Icon(Icons.chevron_right),
+            onTap: _documents.isEmpty
+                ? null
+                : () async {
+                    await Navigator.of(context).push(MaterialPageRoute(
+                      builder: (_) => DocumentsScreen(docs: _docs),
+                    ));
+                    await _refreshDocs();
+                  },
+          ),
           ListTile(
             leading: const Icon(Icons.travel_explore),
             title: const Text('Scan phone for documents'),

@@ -23,6 +23,7 @@ import 'inference_isolate.dart';
 import 'intro_screen.dart';
 import 'model_catalog.dart';
 import 'model_manager.dart';
+import 'pdf_viewer_screen.dart';
 import 'rag_index.dart';
 import 'settings_screen.dart';
 import 'system_voice.dart';
@@ -73,7 +74,7 @@ class ChatMessage {
   // Absolute path of an image the user attached to this message (vision chat).
   final String? imagePath;
   // Document sources cited for this answer (RAG), shown under the bubble.
-  List<String>? sources;
+  List<Citation>? sources;
 }
 
 class ChatScreen extends StatefulWidget {
@@ -660,7 +661,7 @@ class _ChatScreenState extends State<ChatScreen> {
     // When documents are loaded, retrieve relevant passages and ground the
     // answer on them (RAG). The retrieved excerpts augment the system prompt.
     var systemContent = _systemPrompt;
-    List<String>? sources;
+    List<Citation>? sources;
     if (_documents.isNotEmpty) {
       try {
         await _ensureRag();
@@ -671,20 +672,27 @@ class _ChatScreenState extends State<ChatScreen> {
         final hits = await _rag!
             .query(queryVec: qvec, queryText: text, topK: 4);
         if (hits.isNotEmpty) {
+          final pathById = {for (final d in _documents) d.id: d.sourcePath};
           final buf = StringBuffer(_systemPrompt);
           buf.writeln(
               "\n\nAnswer the user's question using ONLY the document excerpts below. "
               'Cite the source document (and page if shown). If the answer is not '
               'in them, say you could not find it in the documents.\n');
-          final cited = <String>{};
+          final cites = <Citation>[];
+          final seen = <String>{};
           for (final h in hits) {
             buf.writeln('\n--- Source: ${h.docName}'
                 '${h.page != null ? ' (page ${h.page})' : ''} ---');
             buf.writeln(h.text.trim());
-            cited.add(h.page != null ? '${h.docName} (p.${h.page})' : h.docName);
+            final label =
+                h.page != null ? '${h.docName} (p.${h.page})' : h.docName;
+            if (seen.add(label)) {
+              cites.add(Citation(
+                  label: label, path: pathById[h.docId], page: h.page));
+            }
           }
           systemContent = buf.toString();
-          sources = cited.toList();
+          sources = cites;
         }
       } catch (_) {
         // Retrieval failed (e.g. embedder unavailable) — answer without RAG,
@@ -1254,12 +1262,7 @@ class _ChatScreenState extends State<ChatScreen> {
                         width: 20,
                         height: 20,
                         child: CircularProgressIndicator(strokeWidth: 2))
-                    : _documents.isEmpty
-                        ? const Icon(Icons.attach_file)
-                        : Badge(
-                            label: Text('${_documents.length}'),
-                            child: const Icon(Icons.attach_file),
-                          ),
+                    : const Icon(Icons.attach_file),
               ),
               if (_visionActive)
                 IconButton(
@@ -1375,6 +1378,26 @@ class _ChatScreenState extends State<ChatScreen> {
     );
   }
 
+  /// A citation is openable when it points at a PDF on disk.
+  bool _canOpen(Citation c) =>
+      c.path != null && c.path!.toLowerCase().endsWith('.pdf');
+
+  /// Opens the cited PDF at the referenced page.
+  Future<void> _openCitation(Citation c) async {
+    if (!File(c.path!).existsSync()) {
+      if (mounted) {
+        setState(() => _notice =
+            'The original file for "${c.label}" is no longer at its saved '
+            'location. Re-scan to refresh it.');
+      }
+      return;
+    }
+    await Navigator.of(context).push(MaterialPageRoute(
+      builder: (_) => PdfViewerScreen(
+          path: c.path!, title: c.label, initialPage: c.page),
+    ));
+  }
+
   Widget _bubble(ChatMessage m) {
     final isUser = m.role == 'user';
     final scheme = Theme.of(context).colorScheme;
@@ -1445,12 +1468,18 @@ class _ChatScreenState extends State<ChatScreen> {
                     runSpacing: -8,
                     children: [
                       for (final s in sources)
-                        Chip(
-                          avatar: const Icon(Icons.description_outlined, size: 14),
-                          label: Text(s, style: const TextStyle(fontSize: 11)),
+                        ActionChip(
+                          avatar: Icon(
+                              _canOpen(s)
+                                  ? Icons.picture_as_pdf_outlined
+                                  : Icons.description_outlined,
+                              size: 14),
+                          label: Text(s.label,
+                              style: const TextStyle(fontSize: 11)),
                           visualDensity: VisualDensity.compact,
                           materialTapTargetSize:
                               MaterialTapTargetSize.shrinkWrap,
+                          onPressed: _canOpen(s) ? () => _openCitation(s) : null,
                         ),
                     ],
                   ),

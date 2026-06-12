@@ -67,6 +67,21 @@ class RagIndex {
   int get shardCount => _active != null ? _activeShard + 1 : _sealed.length;
   bool get isEmpty => _db.chunkCount == 0;
 
+  /// Reads which documents are indexed straight from the pack's catalog, without
+  /// loading the embedder or vector shards — for the documents browser.
+  static Set<String> peekIndexedDocIds(String packDir) {
+    try {
+      final db = CorpusDb.open('$packDir/catalog.sqlite');
+      try {
+        return db.indexedDocIds();
+      } finally {
+        db.close();
+      }
+    } catch (_) {
+      return <String>{};
+    }
+  }
+
   /// Vectors whose chunk was deleted (document removal leaves them in the
   /// shards as harmless orphans; they waste space and candidate slots).
   int get orphanVectorCount {

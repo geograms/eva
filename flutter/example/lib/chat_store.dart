@@ -14,6 +14,22 @@ class ConversationInfo {
   final DateTime updatedAt;
 }
 
+/// A cited source under an answer: a display label plus, when known, the
+/// original file and page so tapping it can open the PDF there.
+class Citation {
+  Citation({required this.label, this.path, this.page});
+  final String label;
+  final String? path;
+  final int? page;
+
+  Map<String, dynamic> toJson() => {'label': label, 'path': path, 'page': page};
+  static Citation fromJson(Map<String, dynamic> j) => Citation(
+        label: j['label'] as String,
+        path: j['path'] as String?,
+        page: (j['page'] as num?)?.toInt(),
+      );
+}
+
 /// One persisted chat message.
 class StoredMessage {
   StoredMessage({
@@ -25,7 +41,7 @@ class StoredMessage {
   final String role;
   final String text;
   final String? imagePath;
-  final List<String>? sources;
+  final List<Citation>? sources;
 }
 
 /// SQLite-backed chat history (conversations + messages) so chats survive app
@@ -110,7 +126,9 @@ class ChatStore {
         m.role,
         m.text,
         m.imagePath,
-        m.sources == null ? null : jsonEncode(m.sources),
+        m.sources == null
+            ? null
+            : jsonEncode([for (final c in m.sources!) c.toJson()]),
         now,
       ],
     );
@@ -132,7 +150,13 @@ class ChatStore {
           imagePath: r['image_path'] as String?,
           sources: r['sources'] == null
               ? null
-              : (jsonDecode(r['sources'] as String) as List).cast<String>(),
+              : [
+                  for (final c in jsonDecode(r['sources'] as String) as List)
+                    // Back-compat: old rows stored plain-string labels.
+                    c is String
+                        ? Citation(label: c)
+                        : Citation.fromJson(c as Map<String, dynamic>)
+                ],
         )
     ];
   }

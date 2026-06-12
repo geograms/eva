@@ -11,16 +11,34 @@ import 'model_catalog.dart';
 
 /// A document the user added for question-answering.
 class DocumentInfo {
-  DocumentInfo({required this.id, required this.name, required this.chars});
+  DocumentInfo({
+    required this.id,
+    required this.name,
+    required this.chars,
+    this.sourcePath,
+  });
   final String id; // corpus filename stem
   final String name; // original filename shown to the user
   final int chars; // extracted character count
+  // Absolute path of the original file on the device, so citations can open it
+  // (null for documents added before this was tracked).
+  final String? sourcePath;
 
-  Map<String, dynamic> toJson() => {'id': id, 'name': name, 'chars': chars};
+  /// The folder the original file lives in (for grouping in the browser).
+  String get folder {
+    final p = sourcePath;
+    if (p == null) return 'Unknown location';
+    final i = p.lastIndexOf('/');
+    return i <= 0 ? '/' : p.substring(0, i);
+  }
+
+  Map<String, dynamic> toJson() =>
+      {'id': id, 'name': name, 'chars': chars, 'sourcePath': sourcePath};
   static DocumentInfo fromJson(Map<String, dynamic> j) => DocumentInfo(
         id: j['id'] as String,
         name: j['name'] as String,
         chars: (j['chars'] as num).toInt(),
+        sourcePath: j['sourcePath'] as String?,
       );
 }
 
@@ -225,10 +243,31 @@ class DocumentService {
 
     final id = _uniqueId(name, await list());
     await File('${await corpusPath()}/$id.txt').writeAsString(text);
-    final info = DocumentInfo(id: id, name: name, chars: text.length);
+    final info = DocumentInfo(
+        id: id, name: name, chars: text.length, sourcePath: filePath);
     final docs = await list()..add(info);
     await _saveList(docs);
     return info;
+  }
+
+  /// Records the original [path] for an already-present document (matched by
+  /// filename) that was added before paths were tracked — cheap backfill so a
+  /// re-scan makes old documents openable without re-extracting them.
+  Future<void> _backfillPath(String name, String path) async {
+    final docs = await list();
+    var changed = false;
+    final updated = [
+      for (final d in docs)
+        if (d.name == name && (d.sourcePath == null || d.sourcePath!.isEmpty))
+          () {
+            changed = true;
+            return DocumentInfo(
+                id: d.id, name: d.name, chars: d.chars, sourcePath: path);
+          }()
+        else
+          d
+    ];
+    if (changed) await _saveList(updated);
   }
 
   /// Walks [root] recursively and adds every supported document found (used by
@@ -275,6 +314,9 @@ class DocumentService {
         }
         if (existing.contains(name)) {
           res.skippedExisting++;
+          // Backfill the original path for docs added before paths were tracked,
+          // so citations can open them — no re-extraction needed.
+          await _backfillPath(name, e.path);
           onProgress?.call(scanned, res);
           continue;
         }
