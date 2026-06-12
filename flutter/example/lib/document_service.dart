@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 import 'dart:isolate';
@@ -21,6 +22,14 @@ class DocumentInfo {
         name: j['name'] as String,
         chars: (j['chars'] as num).toInt(),
       );
+}
+
+/// Outcome counts of a bulk folder import.
+class BulkImportResult {
+  int added = 0;
+  int skippedExisting = 0;
+  int skippedOther = 0; // too large / empty
+  int failed = 0; // unreadable or no extractable text (e.g. scanned PDFs)
 }
 
 /// Manages the on-device document corpus that the RAG embedder indexes.
@@ -196,13 +205,16 @@ class DocumentService {
   /// Extracts text from [filePath] (PDF/txt/md), stores it in the corpus, and
   /// records it. Returns the new document's info. Throws if no text could be
   /// extracted (e.g. a scanned/image-only PDF).
-  Future<DocumentInfo> addFile(String filePath) async {
+  Future<DocumentInfo> addFile(String filePath,
+      {Duration extractTimeout = const Duration(seconds: 45)}) async {
     final name = filePath.split(Platform.pathSeparator).last;
     final lower = name.toLowerCase();
     final String text;
     if (lower.endsWith('.pdf')) {
       final bytes = await File(filePath).readAsBytes();
-      text = await Isolate.run(() => _extractPdfText(bytes));
+      // Time-bounded + killable: a single pathological/huge PDF must not stall
+      // a bulk import. On timeout the worker isolate is terminated.
+      text = await _extractPdfBounded(bytes, extractTimeout);
     } else {
       text = await File(filePath).readAsString();
     }
@@ -217,6 +229,80 @@ class DocumentService {
     final docs = await list()..add(info);
     await _saveList(docs);
     return info;
+  }
+
+  /// Walks [root] recursively and adds every supported document found (used by
+  /// "scan phone storage" / "import folder"). Skips `Android/` app data and
+  /// hidden directories, files over [maxBytes], and documents whose filename is
+  /// already in the corpus. Errors are counted per file, never fatal.
+  /// [onProgress] reports running counts; return false from [shouldContinue]
+  /// to stop early (already-added documents stay).
+  Future<BulkImportResult> importFolder(
+    String root, {
+    int maxBytes = 64 * 1024 * 1024,
+    void Function(int scanned, BulkImportResult partial)? onProgress,
+    bool Function()? shouldContinue,
+  }) async {
+    final res = BulkImportResult();
+    final existing = (await list()).map((d) => d.name).toSet();
+    var scanned = 0;
+    final stack = <Directory>[Directory(root)];
+
+    while (stack.isNotEmpty) {
+      if (shouldContinue != null && !shouldContinue()) break;
+      final dir = stack.removeLast();
+      List<FileSystemEntity> entries;
+      try {
+        entries = dir.listSync(followLinks: false);
+      } catch (_) {
+        continue; // unreadable directory — skip
+      }
+      for (final e in entries) {
+        if (shouldContinue != null && !shouldContinue()) break;
+        final name = e.path.split(Platform.pathSeparator).last;
+        if (e is Directory) {
+          // App-private data (inaccessible/huge) and hidden dirs are skipped.
+          if (name == 'Android' || name.startsWith('.')) continue;
+          stack.add(e);
+          continue;
+        }
+        if (e is! File) continue;
+        scanned++;
+        final lower = name.toLowerCase();
+        if (!supportedExtensions.any((x) => lower.endsWith('.$x'))) {
+          if (scanned % 200 == 0) onProgress?.call(scanned, res);
+          continue;
+        }
+        if (existing.contains(name)) {
+          res.skippedExisting++;
+          onProgress?.call(scanned, res);
+          continue;
+        }
+        int size;
+        try {
+          size = await e.length();
+        } catch (_) {
+          res.failed++;
+          continue;
+        }
+        if (size > maxBytes || size < 16) {
+          res.skippedOther++;
+          onProgress?.call(scanned, res);
+          continue;
+        }
+        try {
+          final info = await addFile(e.path);
+          existing.add(info.name);
+          res.added++;
+        } catch (_) {
+          res.failed++; // e.g. image-only PDF with no extractable text
+        }
+        onProgress?.call(scanned, res);
+      }
+      // Hand the event loop back so the UI stays responsive between folders.
+      await Future<void>.delayed(Duration.zero);
+    }
+    return res;
   }
 
   Future<void> remove(String id) async {
@@ -247,6 +333,36 @@ class DocumentService {
       n++;
     }
     return id;
+  }
+}
+
+/// Runs [_extractPdfText] in a dedicated isolate with a hard [limit]; if it
+/// exceeds the limit (a pathological/huge PDF) the isolate is killed and an
+/// empty string is returned, so a bulk import never hangs on one file.
+Future<String> _extractPdfBounded(List<int> bytes, Duration limit) async {
+  final port = ReceivePort();
+  final iso = await Isolate.spawn(_pdfIsolateEntry, [port.sendPort, bytes]);
+  try {
+    final result = await port.first.timeout(limit);
+    return result is String ? result : '';
+  } on TimeoutException {
+    iso.kill(priority: Isolate.immediate);
+    return '';
+  } catch (_) {
+    iso.kill(priority: Isolate.immediate);
+    return '';
+  } finally {
+    port.close();
+  }
+}
+
+void _pdfIsolateEntry(List<dynamic> args) {
+  final SendPort send = args[0] as SendPort;
+  final List<int> bytes = (args[1] as List).cast<int>();
+  try {
+    send.send(_extractPdfText(bytes));
+  } catch (_) {
+    send.send('');
   }
 }
 

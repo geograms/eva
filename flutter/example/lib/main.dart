@@ -131,7 +131,8 @@ class _ChatScreenState extends State<ChatScreen> {
   // dismissible notice for failures that would otherwise be silent.
   String? _updateTag;
   String? _notice;
-  Object? _seenIndexError;
+  // True while the embedder is being set up in the background (before indexing).
+  bool _preparingDocs = false;
 
   /// Whether the active model can see images (exposes the attach button).
   bool get _visionActive => modelById(_catalog, _activeModelId).isVision;
@@ -540,6 +541,9 @@ class _ChatScreenState extends State<ChatScreen> {
         });
       });
       await _loadModel(path);
+      // Fully automatic: resume/continue indexing any document backlog in the
+      // background, no user action required.
+      unawaited(_autoIndexPending());
     } catch (e) {
       setState(() {
         _phase = AppPhase.error;
@@ -573,6 +577,11 @@ class _ChatScreenState extends State<ChatScreen> {
       _rag?.close();
       _rag = null;
       _embedderReady = false;
+    }
+    // Documents added in Settings (e.g. a bulk phone scan) start indexing in
+    // the background right away — the chat stays usable meanwhile.
+    if (docsNow.difference(docsBefore).isNotEmpty) {
+      unawaited(_ensureRag().catchError((_) {}));
     }
     // Documents removed in Settings must be dropped from the index too.
     final removed = docsBefore.difference(docsNow);
@@ -809,9 +818,27 @@ class _ChatScreenState extends State<ChatScreen> {
   /// Ensures the embedding model is downloaded + loaded and the RAG index for
   /// the current corpus location is open. Shows a progress dialog (the embedder
   /// download is ~200 MB the first time).
-  Future<void> _ensureRag() async {
+  /// Auto-starts (and resumes) document indexing on launch, with no taps and no
+  /// modal. Cheaply checks the corpus catalog for a backlog first, so the
+  /// ~0.2 GB embedder is only loaded when there is actually something to index —
+  /// then the background indexer drains it and the app-bar banner shows progress.
+  Future<void> _autoIndexPending() async {
+    try {
+      if (!await _docs.hasDocuments) return;
+      // Opening the pack does NOT need the embedder — it only reads the catalog
+      // + vector shards. Use it to detect a backlog before loading anything big.
+      _rag ??= await RagIndex.open(await _docs.corpusPath());
+      final indexed = _rag!.indexedDocIds;
+      final pending =
+          (await _docs.list()).where((d) => !indexed.contains(d.id)).length;
+      if (pending == 0) return;
+      await _ensureRag(modal: false);
+    } catch (_) {/* will retry on next launch / interaction */}
+  }
+
+  Future<void> _ensureRag({bool modal = true}) async {
     if (_embedderReady && _rag != null) return;
-    await _withProgressDialog('Setting up document search', (update) async {
+    Future<void> load(void Function(String, double?) update) async {
       final dir = await _models.ensureInstalled(
           kEmbedderModel, (phase, p) => update(phase, p));
       update('Loading…', null);
@@ -820,7 +847,19 @@ class _ChatScreenState extends State<ChatScreen> {
       _rag?.close();
       _rag = await RagIndex.open(await _docs.corpusPath());
       _embedderReady = true;
-    });
+    }
+
+    if (modal) {
+      await _withProgressDialog('Setting up document search', load);
+    } else {
+      // Background: a lightweight banner instead of a blocking dialog.
+      if (mounted) setState(() => _preparingDocs = true);
+      try {
+        await load((_, _) {});
+      } finally {
+        if (mounted) setState(() => _preparingDocs = false);
+      }
+    }
     // Compaction: after many document deletions the shards accumulate orphaned
     // vectors. When more than a quarter of the index (and a meaningful amount)
     // is orphans, drop the vectors and let the self-heal indexer rebuild.
@@ -838,13 +877,18 @@ class _ChatScreenState extends State<ChatScreen> {
     unawaited(_indexer!.run());
   }
 
+  int _lastFailedReported = 0;
+
   void _onIndexerProgress() {
     if (!mounted) return;
-    // Surface a failed indexing run once (it would otherwise be silent).
-    final err = _indexer?.lastError;
-    if (err != null && !identical(err, _seenIndexError)) {
-      _seenIndexError = err;
-      _notice = 'Document indexing hit a problem and will retry: $err';
+    // Per-document failures are deferred (skipped), not fatal. Once the backlog
+    // is drained, note how many were skipped so it isn't silent.
+    final ix = _indexer;
+    if (ix != null && !ix.isIndexing && ix.failedCount > _lastFailedReported) {
+      _lastFailedReported = ix.failedCount;
+      _notice = '${ix.failedCount} document'
+          '${ix.failedCount == 1 ? '' : 's'} could not be indexed and were '
+          'skipped (e.g. no extractable text).';
     }
     setState(() {});
   }
@@ -1118,10 +1162,16 @@ class _ChatScreenState extends State<ChatScreen> {
   /// is working through the document backlog (null = nothing to show).
   PreferredSizeWidget? _indexingBanner() {
     final ix = _indexer;
-    if (ix == null || !ix.isIndexing || ix.pending <= 0) return null;
-    final label = ix.currentName == null
-        ? 'Indexing ${ix.pending} document${ix.pending == 1 ? '' : 's'}…'
-        : 'Indexing "${ix.currentName}" — ${ix.pending} left';
+    final String? label;
+    if (_preparingDocs && (ix == null || !ix.isIndexing)) {
+      label = 'Preparing document search…';
+    } else if (ix != null && ix.isIndexing && ix.pending > 0) {
+      label = ix.currentName == null
+          ? 'Indexing ${ix.pending} document${ix.pending == 1 ? '' : 's'}…'
+          : 'Indexing "${ix.currentName}" — ${ix.pending} left';
+    } else {
+      return null;
+    }
     return PreferredSize(
       preferredSize: const Size.fromHeight(24),
       child: Column(

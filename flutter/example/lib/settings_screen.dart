@@ -93,6 +93,87 @@ class _SettingsScreenState extends State<SettingsScreen> {
     }
   }
 
+  bool _importCancelled = false;
+
+  Future<void> _pickFolderAndImport() async {
+    var status = await Permission.manageExternalStorage.status;
+    if (!status.isGranted) {
+      status = await Permission.manageExternalStorage.request();
+    }
+    if (!status.isGranted) {
+      await _toast('Storage permission is required to scan folders.');
+      return;
+    }
+    final dir = await FilePicker.platform.getDirectoryPath();
+    if (dir == null) return;
+    await _bulkImport(dir);
+  }
+
+  /// Walks [root] adding every supported document, with a cancellable progress
+  /// dialog. Indexing itself happens later in the background (on return to the
+  /// chat screen), so this only extracts text.
+  Future<void> _bulkImport(String root) async {
+    var status = await Permission.manageExternalStorage.status;
+    if (!status.isGranted) {
+      status = await Permission.manageExternalStorage.request();
+    }
+    if (!status.isGranted) {
+      await _toast('Storage permission is required to scan the phone.');
+      return;
+    }
+    _importCancelled = false;
+    var scanned = 0;
+    var partial = BulkImportResult();
+    StateSetter? update;
+    if (mounted) {
+      showDialog<void>(
+        context: context,
+        barrierDismissible: false,
+        builder: (ctx) => StatefulBuilder(builder: (ctx, set) {
+          update = set;
+          return AlertDialog(
+            title: const Text('Scanning for documents'),
+            content: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                const LinearProgressIndicator(),
+                const SizedBox(height: 12),
+                Text('Scanned $scanned files\n'
+                    'Added ${partial.added} · already present '
+                    '${partial.skippedExisting}\n'
+                    'No text/failed ${partial.failed} · skipped '
+                    '${partial.skippedOther}'),
+              ],
+            ),
+            actions: [
+              TextButton(
+                onPressed: () => _importCancelled = true,
+                child: const Text('Stop'),
+              ),
+            ],
+          );
+        }),
+      );
+    }
+    try {
+      final res = await _docs.importFolder(
+        root,
+        onProgress: (n, p) {
+          scanned = n;
+          partial = p;
+          update?.call(() {});
+        },
+        shouldContinue: () => !_importCancelled,
+      );
+      await _refreshDocs();
+      await _toast('Added ${res.added} documents '
+          '(${res.skippedExisting} already present, ${res.failed} unreadable). '
+          'Indexing continues in the background.');
+    } finally {
+      if (mounted) Navigator.of(context, rootNavigator: true).pop();
+    }
+  }
+
   /// Lets the user choose where model downloads are stored (e.g. SD card) so
   /// they survive a reinstall; an existing folder with models is reused.
   Future<void> _chooseModelsLocation() async {
@@ -507,11 +588,18 @@ class _SettingsScreenState extends State<SettingsScreen> {
               child: Text('No documents added yet.',
                   style: TextStyle(color: Colors.grey)),
             )
-          else
-            for (final d in _documents)
+          else ...[
+            Padding(
+              padding: const EdgeInsets.fromLTRB(16, 0, 16, 4),
+              child: Text('${_documents.length} documents in the corpus',
+                  style: const TextStyle(color: Colors.grey)),
+            ),
+            for (final d in _documents.take(8))
               ListTile(
+                dense: true,
                 leading: const Icon(Icons.description_outlined),
-                title: Text(d.name),
+                title: Text(d.name,
+                    maxLines: 1, overflow: TextOverflow.ellipsis),
                 subtitle: Text('${(d.chars / 1000).toStringAsFixed(1)}k characters'),
                 trailing: IconButton(
                   tooltip: 'Remove',
@@ -519,6 +607,25 @@ class _SettingsScreenState extends State<SettingsScreen> {
                   onPressed: () => _removeDocument(d),
                 ),
               ),
+            if (_documents.length > 8)
+              Padding(
+                padding: const EdgeInsets.fromLTRB(16, 0, 16, 8),
+                child: Text('… and ${_documents.length - 8} more',
+                    style: const TextStyle(color: Colors.grey)),
+              ),
+          ],
+          ListTile(
+            leading: const Icon(Icons.travel_explore),
+            title: const Text('Scan phone for documents'),
+            subtitle: const Text(
+                'Finds every PDF/text file on this phone and adds it.'),
+            onTap: busy ? null : () => _bulkImport('/storage/emulated/0'),
+          ),
+          ListTile(
+            leading: const Icon(Icons.drive_folder_upload_outlined),
+            title: const Text('Import documents from a folder'),
+            onTap: busy ? null : _pickFolderAndImport,
+          ),
           ListTile(
             leading: const Icon(Icons.sd_storage_outlined),
             title: const Text('Storage location'),

@@ -32,6 +32,10 @@ class IndexingController extends ChangeNotifier {
   String? _current;
   Object? _lastError;
   Completer<void>? _idle;
+  // Documents that errored this session. They are skipped (deferred to the
+  // bottom) so one bad document never blocks the rest; cleared on rebind, so a
+  // fresh launch retries them once.
+  final Set<String> _failed = {};
 
   /// Whether the backlog is actively being worked through.
   bool get isIndexing => _running;
@@ -44,9 +48,14 @@ class IndexingController extends ChangeNotifier {
   String? get currentName => _current;
   Object? get lastError => _lastError;
 
-  /// Binds the controller to the currently-open pack. Call on (re)open.
+  /// How many documents were skipped this session because indexing them failed.
+  int get failedCount => _failed.length;
+
+  /// Binds the controller to the currently-open pack. Call on (re)open. Clears
+  /// the per-session failed set so previously-failed documents are retried once.
   void bind(RagIndex rag) {
     _rag = rag;
+    _failed.clear();
   }
 
   /// Requests a pause at the next batch boundary (does not interrupt mid-batch).
@@ -82,8 +91,11 @@ class IndexingController extends ChangeNotifier {
         if (rag == null) break;
         final indexed = rag.indexedDocIds;
         final docs = await _docs.list();
-        final pendingDocs =
-            docs.where((d) => !indexed.contains(d.id)).toList();
+        // Skip already-indexed AND already-failed docs — failures are deferred
+        // so they never block the documents behind them.
+        final pendingDocs = docs
+            .where((d) => !indexed.contains(d.id) && !_failed.contains(d.id))
+            .toList();
         _total = docs.length;
         _processed = docs.length - pendingDocs.length;
         if (pendingDocs.isEmpty) break;
@@ -92,14 +104,21 @@ class IndexingController extends ChangeNotifier {
         _current = d.name;
         notifyListeners();
 
-        final text = await _docs.readText(d.id);
-        await rag.addDocument(
-          docId: d.id,
-          name: d.name,
-          fullText: text,
-          embed: _embed,
-          shouldContinue: () async => !_paused,
-        );
+        // A single bad document (bad text, embedder hiccup, FFI error) must not
+        // stop the run — record it and move on.
+        try {
+          final text = await _docs.readText(d.id);
+          await rag.addDocument(
+            docId: d.id,
+            name: d.name,
+            fullText: text,
+            embed: _embed,
+            shouldContinue: () async => !_paused,
+          );
+        } catch (e) {
+          _failed.add(d.id);
+          _lastError = e;
+        }
 
         _current = null;
         notifyListeners();
@@ -107,7 +126,7 @@ class IndexingController extends ChangeNotifier {
         await Future<void>.delayed(const Duration(milliseconds: 50));
       }
     } catch (e) {
-      _lastError = e;
+      _lastError = e; // unexpected loop-level failure (not a per-doc error)
     } finally {
       _running = false;
       _idle?.complete();
