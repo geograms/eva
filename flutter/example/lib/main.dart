@@ -159,6 +159,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
   Timer? _rescanTimer;
   DateTime? _lastRescan;
   bool _charging = false;
+  bool _appActive = true; // app is in the foreground (chat in active use)
   bool _captioning = false; // VLM loaded, captioning photos
   bool _captionStop = false;
   String? _modelBeforeCaption;
@@ -187,8 +188,18 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
 
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
-    // Coming back to the app is a good moment to pick up newly-added files.
-    if (state == AppLifecycleState.resumed) _rescanForNewFiles();
+    _appActive = state == AppLifecycleState.resumed;
+    if (_appActive) {
+      // Back in the app: stop the photo-captioning pass immediately so the chat
+      // is responsive (it competes for the model slot), and pick up new files.
+      if (_captioning) _captionStop = true;
+      _rescanForNewFiles();
+    } else if (state == AppLifecycleState.paused ||
+        state == AppLifecycleState.hidden) {
+      // Truly backgrounded: catch up on photo captioning while the user is away
+      // (only runs if charging).
+      _maybeStartCaptioning();
+    }
   }
 
   /// First run shows the intro (permissions + downloads explainer, optional
@@ -1020,7 +1031,6 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     unawaited(_indexer!.run());
   }
 
-  int _lastFailedReported = 0;
 
   // ── Periodic discovery of newly-added files ─────────────────────────────────
 
@@ -1273,14 +1283,15 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
         _phase != AppPhase.ready ||
         !_charging ||
         _generating ||
-        _preparingDocs) {
+        _preparingDocs ||
+        _appActive) {
       return;
     }
     unawaited(_runCaptioning());
   }
 
   Future<void> _runCaptioning() async {
-    if (_captioning || !_charging || _generating) return;
+    if (_captioning || !_charging || _generating || _appActive) return;
     // Anything to do?
     final probe = await _photos.openStore();
     int pending;
@@ -1303,7 +1314,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
       final vlm = modelById(_catalog, _kCaptionModelId);
       final dir = await _models.ensureInstalled(vlm, (_, _) {});
       await _engine.initModel(dir); // swaps the chat model out
-      while (!_captionStop && _charging && !_generating) {
+      while (!_captionStop && _charging && !_generating && !_appActive) {
         final store = await _photos.openStore();
         List<PhotoInfo> batch;
         try {
@@ -1332,7 +1343,9 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
           break;
         }
         for (final p in batch) {
-          if (_captionStop || _charging == false || _generating) break;
+          if (_captionStop || _charging == false || _generating || _appActive) {
+            break;
+          }
           final cap = await _captionOne(p, tmp);
           final s2 = await _photos.openStore();
           try {
@@ -1408,15 +1421,8 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     if (!mounted) return;
     // When the document backlog drains, the engine is free for the vision pass.
     if (_indexer?.isIndexing == false) _maybeStartCaptioning();
-    // Per-document failures are deferred (skipped), not fatal. Once the backlog
-    // is drained, note how many were skipped so it isn't silent.
-    final ix = _indexer;
-    if (ix != null && !ix.isIndexing && ix.failedCount > _lastFailedReported) {
-      _lastFailedReported = ix.failedCount;
-      _notice = '${ix.failedCount} document'
-          '${ix.failedCount == 1 ? '' : 's'} could not be indexed and were '
-          'skipped (e.g. no extractable text).';
-    }
+    // Per-document failures (skipped, not fatal) are surfaced quietly in the
+    // Settings panel — no need to interrupt the chat with a banner about them.
     setState(() {});
   }
 
@@ -1654,20 +1660,6 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
       appBar: AppBar(
         title: const Text('Eva'),
         actions: [
-          if (_phase == AppPhase.ready && _backgroundStatus() != null)
-            Tooltip(
-              message: _backgroundStatus()!,
-              child: const Padding(
-                padding: EdgeInsets.symmetric(horizontal: 10),
-                child: Center(
-                  child: SizedBox(
-                    width: 15,
-                    height: 15,
-                    child: CircularProgressIndicator(strokeWidth: 2),
-                  ),
-                ),
-              ),
-            ),
           if (_phase == AppPhase.ready)
             IconButton(
               tooltip: 'New chat',
@@ -1688,26 +1680,6 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
         _ => _buildLoading(),
       },
     );
-  }
-
-  /// A short description of any background activity, shown only as a small
-  /// spinner + tooltip in the AppBar (never a distracting full-width banner).
-  /// Returns null when nothing is running.
-  String? _backgroundStatus() {
-    final ix = _indexer;
-    final px = _photoIndexer;
-    final mx = _musicIndexer;
-    if (_captioning) return 'Recognising photo contents ($_captionsDone done)';
-    if (_preparingDocs && (ix == null || !ix.isIndexing)) {
-      return 'Preparing document search';
-    }
-    if (ix != null && ix.isIndexing && ix.pending > 0) {
-      return 'Indexing documents (${ix.pending} left)';
-    }
-    if (px != null && px.isIndexing) return 'Indexing photos (${px.total})';
-    if (mx != null && mx.isIndexing) return 'Indexing music (${mx.total})';
-    if (mx != null && mx.isFetchingLyrics) return 'Fetching lyrics';
-    return null;
   }
 
   Widget _buildLoading() {
