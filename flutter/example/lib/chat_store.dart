@@ -14,19 +14,37 @@ class ConversationInfo {
   final DateTime updatedAt;
 }
 
-/// A cited source under an answer: a display label plus, when known, the
-/// original file and page so tapping it can open the PDF there.
+/// A cited source under an answer: a display label plus, when known, enough to
+/// reopen it at the quoted passage. PDFs use [path] + [page] (native viewer);
+/// other documents (Word/EPUB/…) use [docId] + [snippet] to open the extracted
+/// text in-app, scrolled to and highlighting the quote.
 class Citation {
-  Citation({required this.label, this.path, this.page});
+  Citation({
+    required this.label,
+    this.path,
+    this.page,
+    this.docId,
+    this.snippet,
+  });
   final String label;
   final String? path;
   final int? page;
+  final String? docId; // corpus id, to load the extracted text
+  final String? snippet; // the quoted chunk, to locate/highlight in the text
 
-  Map<String, dynamic> toJson() => {'label': label, 'path': path, 'page': page};
+  Map<String, dynamic> toJson() => {
+        'label': label,
+        'path': path,
+        'page': page,
+        'docId': docId,
+        'snippet': snippet,
+      };
   static Citation fromJson(Map<String, dynamic> j) => Citation(
         label: j['label'] as String,
         path: j['path'] as String?,
         page: (j['page'] as num?)?.toInt(),
+        docId: j['docId'] as String?,
+        snippet: j['snippet'] as String?,
       );
 }
 

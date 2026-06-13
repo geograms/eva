@@ -27,6 +27,7 @@ import 'model_manager.dart';
 import 'music_player.dart';
 import 'music_service.dart';
 import 'music_store.dart';
+import 'doc_text_viewer_screen.dart';
 import 'pdf_viewer_screen.dart';
 import 'photo_service.dart';
 import 'photo_store.dart';
@@ -780,7 +781,13 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                 h.page != null ? '${h.docName} (p.${h.page})' : h.docName;
             if (seen.add(label)) {
               cites.add(Citation(
-                  label: label, path: pathById[h.docId], page: h.page));
+                  label: label,
+                  path: pathById[h.docId],
+                  page: h.page,
+                  docId: h.docId,
+                  // Carry the quoted passage so non-PDF docs can be opened in-app
+                  // scrolled to (and highlighting) the citation.
+                  snippet: h.text.trim()));
             }
           }
           systemContent = buf.toString();
@@ -2060,24 +2067,59 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     );
   }
 
-  /// A citation is openable when it points at a PDF on disk.
-  bool _canOpen(Citation c) =>
+  /// A citation is openable when it points at a PDF on disk, or at any other
+  /// extracted-text document (opened in-app at the quote).
+  bool _canOpen(Citation c) {
+    if (_isPdf(c)) return true;
+    return c.docId != null; // text viewer loads the extracted text by id
+  }
+
+  bool _isPdf(Citation c) =>
       c.path != null && c.path!.toLowerCase().endsWith('.pdf');
 
-  /// Opens the cited PDF at the referenced page.
+  /// Opens a citation at the quoted passage: PDFs in the page viewer, every
+  /// other document type in the in-app text viewer (scrolled to the quote).
   Future<void> _openCitation(Citation c) async {
-    if (!File(c.path!).existsSync()) {
-      if (mounted) {
-        setState(() => _notice =
-            'The original file for "${c.label}" is no longer at its saved '
-            'location. Re-scan to refresh it.');
+    if (_isPdf(c)) {
+      if (!File(c.path!).existsSync()) {
+        if (mounted) {
+          setState(() => _notice =
+              'The original file for "${c.label}" is no longer at its saved '
+              'location. Re-scan to refresh it.');
+        }
+        return;
       }
+      await Navigator.of(context).push(MaterialPageRoute(
+        builder: (_) => PdfViewerScreen(
+            path: c.path!, title: c.label, initialPage: c.page),
+      ));
+      return;
+    }
+    // Non-PDF: render the extracted text, highlighting the cited snippet.
+    final id = c.docId;
+    final text = id == null ? '' : await _docs.readText(id);
+    if (!mounted) return;
+    if (text.trim().isEmpty) {
+      setState(() => _notice =
+          'The text for "${c.label}" is no longer available. Re-scan to '
+          'refresh it.');
       return;
     }
     await Navigator.of(context).push(MaterialPageRoute(
-      builder: (_) => PdfViewerScreen(
-          path: c.path!, title: c.label, initialPage: c.page),
+      builder: (_) => DocTextViewerScreen(
+          title: c.label, fullText: text, snippet: c.snippet ?? ''),
     ));
+  }
+
+  /// Icon for a citation chip, by document type.
+  IconData _citeIcon(Citation c) {
+    final p = (c.path ?? c.label).toLowerCase();
+    if (p.endsWith('.pdf')) return Icons.picture_as_pdf_outlined;
+    if (p.endsWith('.epub')) return Icons.menu_book_outlined;
+    if (p.endsWith('.pptx')) return Icons.slideshow_outlined;
+    if (p.endsWith('.xlsx')) return Icons.table_chart_outlined;
+    if (p.endsWith('.docx')) return Icons.description_outlined;
+    return Icons.article_outlined;
   }
 
   Widget _bubble(ChatMessage m) {
@@ -2158,11 +2200,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                     children: [
                       for (final s in sources)
                         ActionChip(
-                          avatar: Icon(
-                              _canOpen(s)
-                                  ? Icons.picture_as_pdf_outlined
-                                  : Icons.description_outlined,
-                              size: 14),
+                          avatar: Icon(_citeIcon(s), size: 14),
                           label: Text(s.label,
                               style: const TextStyle(fontSize: 11)),
                           visualDensity: VisualDensity.compact,
