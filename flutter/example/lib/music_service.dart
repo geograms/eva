@@ -59,6 +59,26 @@ class MusicService {
     }
   }
 
+  /// Resolves a "play …" request into an ordered queue of tracks.
+  Future<List<TrackInfo>> resolvePlay(String query) async {
+    final store = await openStore();
+    try {
+      return store.resolvePlay(query);
+    } finally {
+      store.close();
+    }
+  }
+
+  /// Records that [trackId] was played (for favourites ranking).
+  Future<void> recordPlay(int trackId, int whenMs) async {
+    final store = await openStore();
+    try {
+      store.recordPlay(trackId, whenMs);
+    } finally {
+      store.close();
+    }
+  }
+
   /// Walks [roots] (default: whole shared storage) and indexes new audio files.
   /// Resumable: already-indexed and known-bad paths are skipped.
   Future<MusicScanResult> scan({

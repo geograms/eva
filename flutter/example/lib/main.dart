@@ -24,7 +24,9 @@ import 'inference_isolate.dart';
 import 'intro_screen.dart';
 import 'model_catalog.dart';
 import 'model_manager.dart';
+import 'music_player.dart';
 import 'music_service.dart';
+import 'music_store.dart';
 import 'pdf_viewer_screen.dart';
 import 'photo_service.dart';
 import 'photo_store.dart';
@@ -110,6 +112,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
   PhotoIndexController? _photoIndexer;
   late final MusicService _music = MusicService(_docs);
   MusicIndexController? _musicIndexer;
+  late final MusicPlayer _player = MusicPlayer(_music)..addListener(_onPlayer);
   bool _listening = false;
   VoiceEngine _voiceEngine = VoiceEngine.fast;
   String _voiceLocale = '';
@@ -210,6 +213,8 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     _musicIndexer?.removeListener(_onMusicProgress);
     _musicIndexer?.pause();
     _musicIndexer?.dispose();
+    _player.removeListener(_onPlayer);
+    _player.dispose();
     _captionStop = true;
     _batterySub?.cancel();
     _captionTimer?.cancel();
@@ -721,6 +726,14 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     _persistMessage(user);
     _scrollToBottom();
 
+    // "play <artist/song>" starts the in-app music player directly, no model.
+    if (imagePath == null && await _handlePlayCommand(text, assistant)) {
+      setState(() => _generating = false);
+      _persistMessage(assistant);
+      _scrollToBottom();
+      return;
+    }
+
     // Photo-gallery requests ("show my screenshots", "photos from last week")
     // are answered directly with a thumbnail grid instead of the language model.
     if (imagePath == null) {
@@ -1085,6 +1098,69 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
   void _onPhotoProgress() {
     if (mounted) setState(() {});
     _maybeStartCaptioning(); // frequent re-check while metadata indexing runs
+  }
+
+  void _onPlayer() {
+    if (mounted) setState(() {});
+  }
+
+  // A leading "play" verb (EN/PT) that starts the in-app player.
+  static final RegExp _playVerb = RegExp(
+      r'^\s*(play|put\s+on|toca(?:r)?|p[õo]e|ouvir|coloca(?:r)?)\b',
+      caseSensitive: false);
+  // Filler stripped from the request to leave just the artist/song/genre.
+  static const Set<String> _playFiller = {
+    'me', 'some', 'a', 'an', 'the', 'song', 'songs', 'music', 'track', 'tracks',
+    'tune', 'tunes', 'by', 'from', 'for', 'please', 'something', 'anything',
+    'of', 'my', 'uma', 'umas', 'uns', 'músicas', 'musicas', 'música', 'musica',
+    'canção', 'cancao', 'canções', 'cancoes', 'do', 'da', 'de', 'algo',
+  };
+
+  /// Handles "play …" by starting the music player. Returns true when the turn
+  /// was a play request (so [_send] stops before calling the model).
+  Future<bool> _handlePlayCommand(String text, ChatMessage assistant) async {
+    if (!_playVerb.hasMatch(text)) return false;
+    // Strip the verb, then drop filler words to isolate the query.
+    final rest = text.replaceFirst(_playVerb, '').trim();
+    final words = RegExp(r'[\p{L}\p{N}&]+', unicode: true)
+        .allMatches(rest)
+        .map((m) => m.group(0)!)
+        .toList();
+    final meaningful =
+        words.where((w) => !_playFiller.contains(w.toLowerCase())).toList();
+    final query = meaningful.join(' ');
+
+    List<TrackInfo> tracks;
+    try {
+      tracks = await _music.resolvePlay(query);
+    } catch (_) {
+      tracks = const [];
+    }
+
+    if (tracks.isEmpty) {
+      final indexed = await _music.trackCount();
+      setState(() {
+        assistant.text = indexed == 0
+            ? "I don't have any music indexed yet. Once your audio files are "
+                'scanned (Settings → Music), I can play them.'
+            : query.isEmpty
+                ? "I couldn't find anything to play in your music library."
+                : 'I could not find "$query" in your music library.';
+      });
+      return true;
+    }
+
+    await _player.playQueue(tracks);
+    final first = tracks.first;
+    final more = tracks.length - 1;
+    setState(() {
+      assistant.text = query.isEmpty
+          ? '▶ Playing your music — starting with ${first.label}'
+              '${more > 0 ? ' and $more more.' : '.'}'
+          : '▶ Now playing ${first.label}'
+              '${more > 0 ? ' and $more more from "$query".' : '.'}';
+    });
+    return true;
   }
 
   // ── Photo content understanding (vision caption pass) ───────────────────────
@@ -1621,6 +1697,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                   itemBuilder: (context, i) => _bubble(_messages[i]),
                 ),
         ),
+        if (_player.hasTrack) _nowPlayingBar(),
         const Divider(height: 1),
         if (_pendingImagePath != null) _pendingImagePreview(),
         Padding(
@@ -1677,6 +1754,80 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
           ),
         ),
       ],
+    );
+  }
+
+  /// Compact now-playing bar with transport controls, shown above the input
+  /// whenever a track is loaded in the in-app player.
+  Widget _nowPlayingBar() {
+    final t = _player.current;
+    if (t == null) return const SizedBox.shrink();
+    final scheme = Theme.of(context).colorScheme;
+    return Material(
+      color: scheme.secondaryContainer,
+      child: Padding(
+        padding: const EdgeInsets.fromLTRB(12, 4, 4, 4),
+        child: Row(
+          children: [
+            Icon(Icons.music_note, size: 18, color: scheme.onSecondaryContainer),
+            const SizedBox(width: 8),
+            Expanded(
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    t.title.isNotEmpty ? t.title : t.path.split('/').last,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: TextStyle(
+                        fontSize: 13,
+                        fontWeight: FontWeight.w600,
+                        color: scheme.onSecondaryContainer),
+                  ),
+                  Text(
+                    t.artist.isNotEmpty
+                        ? (_player.queueLength > 1
+                            ? '${t.artist} · ${_player.queueLength} in queue'
+                            : t.artist)
+                        : '${_player.queueLength} in queue',
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: TextStyle(
+                        fontSize: 11,
+                        color: scheme.onSecondaryContainer.withValues(alpha: 0.8)),
+                  ),
+                ],
+              ),
+            ),
+            IconButton(
+              tooltip: 'Previous',
+              visualDensity: VisualDensity.compact,
+              onPressed: () => _player.previous(),
+              icon: Icon(Icons.skip_previous, color: scheme.onSecondaryContainer),
+            ),
+            IconButton(
+              tooltip: _player.isPlaying ? 'Pause' : 'Play',
+              visualDensity: VisualDensity.compact,
+              onPressed: () => _player.toggle(),
+              icon: Icon(_player.isPlaying ? Icons.pause : Icons.play_arrow,
+                  color: scheme.onSecondaryContainer),
+            ),
+            IconButton(
+              tooltip: 'Next',
+              visualDensity: VisualDensity.compact,
+              onPressed: () => _player.next(),
+              icon: Icon(Icons.skip_next, color: scheme.onSecondaryContainer),
+            ),
+            IconButton(
+              tooltip: 'Stop',
+              visualDensity: VisualDensity.compact,
+              onPressed: () => _player.stop(),
+              icon: Icon(Icons.close, color: scheme.onSecondaryContainer),
+            ),
+          ],
+        ),
+      ),
     );
   }
 

@@ -18,6 +18,7 @@ class TrackInfo {
     required this.bucket,
     this.lyrics,
     this.lyricsFetched = false,
+    this.playCount = 0,
   });
 
   final int id;
@@ -33,6 +34,7 @@ class TrackInfo {
   final String bucket; // source folder name
   final String? lyrics;
   final bool lyricsFetched;
+  final int playCount; // times this track has been played in-app
 
   /// A human label for chat results, e.g. "Artist — Title".
   String get label {
@@ -67,11 +69,26 @@ class MusicStore {
         size INTEGER NOT NULL DEFAULT 0,
         bucket TEXT NOT NULL DEFAULT '',
         lyrics TEXT,
-        lyrics_fetched INTEGER NOT NULL DEFAULT 0
+        lyrics_fetched INTEGER NOT NULL DEFAULT 0,
+        play_count INTEGER NOT NULL DEFAULT 0,
+        last_played INTEGER NOT NULL DEFAULT 0
       );
     ''');
+    // Migrate older catalogs (created before play tracking) in place.
+    for (final col in const [
+      'play_count INTEGER NOT NULL DEFAULT 0',
+      'last_played INTEGER NOT NULL DEFAULT 0',
+    ]) {
+      try {
+        db.execute('ALTER TABLE tracks ADD COLUMN $col;');
+      } catch (_) {
+        // column already exists
+      }
+    }
     db.execute('CREATE INDEX IF NOT EXISTS idx_tracks_artist ON tracks(artist);');
     db.execute('CREATE INDEX IF NOT EXISTS idx_tracks_genre ON tracks(genre);');
+    db.execute(
+        'CREATE INDEX IF NOT EXISTS idx_tracks_plays ON tracks(play_count);');
     // One FTS row per track over everything an LLM might match on. Self-stored
     // (not external-content) so we can safely DELETE/re-insert a row when its
     // lyrics arrive later. rowid is kept equal to tracks.id for the JOIN.
@@ -199,6 +216,54 @@ class MusicStore {
     return [for (final r in rs) _row(r)];
   }
 
+  /// Records that a track was played: bumps its play count and recency. Used to
+  /// surface the user's favourites first when they just ask to "play music".
+  void recordPlay(int id, int whenMs) {
+    _db.execute(
+      'UPDATE tracks SET play_count = play_count + 1, last_played = ? '
+      'WHERE id = ?;',
+      [whenMs, id],
+    );
+  }
+
+  /// Most-played tracks first (favourites), then most-recently played. Tracks
+  /// never played fall to the end. Used for a bare "play music" request.
+  /// Before any play history exists, properly-tagged tracks (with an artist)
+  /// lead so we don't open with stray voice notes / untagged clips.
+  List<TrackInfo> topPlayed({int limit = 100}) {
+    final rs = _db.select(
+      'SELECT * FROM tracks '
+      'ORDER BY play_count DESC, last_played DESC, '
+      "(CASE WHEN artist='' THEN 1 ELSE 0 END), artist, album, track_no "
+      'LIMIT ?;',
+      [limit],
+    );
+    return [for (final r in rs) _row(r)];
+  }
+
+  /// Resolves a "play …" request into an ordered queue of tracks.
+  /// - empty/generic query → favourites first (then the rest), shuffled feel is
+  ///   left to the caller;
+  /// - otherwise: exact-ish artist match wins (whole albums in order), else a
+  ///   full-text match across title/album/genre/lyrics.
+  /// Favourites are used as a tiebreaker so often-played tracks lead.
+  List<TrackInfo> resolvePlay(String query, {int limit = 200}) {
+    final q = query.trim();
+    if (q.isEmpty) return topPlayed(limit: limit);
+    // Artist match (most common: "play Radiohead"), ordered by favourites then
+    // album/track so a coherent set plays.
+    final artist = _db.select(
+      'SELECT * FROM tracks WHERE LOWER(artist) LIKE ? '
+      'ORDER BY play_count DESC, album, track_no, title LIMIT ?;',
+      ['%${q.toLowerCase()}%', limit],
+    );
+    if (artist.isNotEmpty) return [for (final r in artist) _row(r)];
+    // Fall back to full-text (song title, genre, a lyric line…).
+    final hits = search(q, limit: limit);
+    if (hits.isNotEmpty) return hits;
+    return const [];
+  }
+
   /// Recent/representative tracks for browsing.
   List<TrackInfo> query({int limit = 500}) {
     final rs = _db.select(
@@ -221,6 +286,7 @@ class MusicStore {
         bucket: r['bucket'] as String,
         lyrics: r['lyrics'] as String?,
         lyricsFetched: (r['lyrics_fetched'] as int) == 1,
+        playCount: (r['play_count'] as int?) ?? 0,
       );
 
   void removeMissing(bool Function(String path) exists) {
