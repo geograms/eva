@@ -135,14 +135,13 @@ class WikipediaService {
 
   String get openPath => _openPath ?? '';
 
-  /// Full-text search (falls back to title suggestion when the archive lacks a
-  /// full-text index, e.g. some "mini" ZIMs).
+  /// Full-text search, with a title-suggestion fallback (for ZIMs without a
+  /// full-text index, or queries the full-text parser returns nothing for).
   Future<List<ZimHit>> search(String query, {int k = 5}) async {
     if (!await ensureOpen()) return const [];
     final ffi = _ffi!, h = _handle!;
-    final hits = ffi.hasFulltext(h)
-        ? ffi.search(h, query, k: k)
-        : ffi.suggest(h, query, k: k);
+    var hits = ffi.hasFulltext(h) ? ffi.search(h, query, k: k) : const <ZimHit>[];
+    if (hits.isEmpty) hits = ffi.suggest(h, query, k: k);
     return hits;
   }
 
@@ -158,15 +157,31 @@ class WikipediaService {
     return _ffi!.mainPath(_handle!);
   }
 
-  /// Plain-text lead of an article, trimmed to [maxChars] at a line boundary —
-  /// what we inject into the LLM as grounding context.
-  Future<String> leadText(String path, {int maxChars = 5000}) async {
+  /// Plain-text lead of an article for grounding: the intro prose, taken from
+  /// the article's paragraph (<p>) elements so we skip the navigation, infobox,
+  /// "see also" and external-links cruft that a whole-page strip would capture.
+  /// Trimmed to [maxChars] at a paragraph boundary.
+  Future<String> leadText(String path, {int maxChars = 3500}) async {
     final c = await content(path);
     if (c == null) return '';
     final mime = c.mimetype.toLowerCase();
     if (!mime.contains('html') && !mime.contains('text')) return '';
-    var text = htmlToPlainText(String.fromCharCodes(c.bytes));
-    text = text.trim();
+    final html = String.fromCharCodes(c.bytes);
+    final buf = StringBuffer();
+    for (final m in RegExp(r'<p\b[^>]*>(.*?)</p>',
+            dotAll: true, caseSensitive: false)
+        .allMatches(html)) {
+      final para = htmlToPlainText(m.group(1)!).trim();
+      // Skip empty/short fragments (hatnotes, captions, stray nav text).
+      if (para.length < 40) continue;
+      buf
+        ..writeln(para)
+        ..writeln();
+      if (buf.length >= maxChars) break;
+    }
+    var text = buf.toString().trim();
+    // Fallback for articles without <p> structure: strip the whole page.
+    if (text.length < 40) text = htmlToPlainText(html).trim();
     if (text.length <= maxChars) return text;
     final cut = text.lastIndexOf('\n', maxChars);
     return text.substring(0, cut > maxChars ~/ 2 ? cut : maxChars).trim();

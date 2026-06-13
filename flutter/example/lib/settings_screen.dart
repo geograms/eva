@@ -12,7 +12,9 @@ import 'model_manager.dart';
 import 'music_service.dart';
 import 'photo_service.dart';
 import 'photos_screen.dart';
+import 'disk_space.dart';
 import 'system_voice.dart';
+import 'wikipedia_download.dart';
 import 'wikipedia_service.dart';
 import 'voice_service.dart';
 
@@ -62,12 +64,18 @@ class _SettingsScreenState extends State<SettingsScreen> {
   int _musicCount = 0;
   bool _wikiEnabled = true;
   String _wikiPath = '';
+  final WikipediaDownload _wikiDl = WikipediaDownload.instance;
   String? _error;
 
   @override
   void initState() {
     super.initState();
+    _wikiDl.addListener(_onWikiDl);
     _load();
+  }
+
+  void _onWikiDl() {
+    if (mounted) setState(() {});
   }
 
   @override
@@ -75,6 +83,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
     _prompt.dispose();
     _voice.dispose();
     _systemVoice.dispose();
+    _wikiDl.removeListener(_onWikiDl);
     super.dispose();
   }
 
@@ -784,12 +793,43 @@ class _SettingsScreenState extends State<SettingsScreen> {
               setState(() => _wikiEnabled = v);
             },
           ),
+          if (_wikiDl.downloading)
+            ListTile(
+              leading: const Icon(Icons.downloading),
+              title: const Text('Downloading Simple English Wikipedia…'),
+              subtitle: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  const SizedBox(height: 6),
+                  LinearProgressIndicator(
+                      value: _wikiDl.progress > 0 ? _wikiDl.progress : null),
+                  const SizedBox(height: 4),
+                  Text(_wikiDl.total > 0
+                      ? '${formatBytes(_wikiDl.received)} of '
+                          '${formatBytes(_wikiDl.total)} '
+                          '(${(_wikiDl.progress * 100).round()}%)'
+                      : formatBytes(_wikiDl.received)),
+                ],
+              ),
+              trailing: TextButton(
+                onPressed: _wikiDl.cancel,
+                child: const Text('Cancel'),
+              ),
+            )
+          else
+            ListTile(
+              leading: const Icon(Icons.download_outlined),
+              title: const Text('Download Simple English Wikipedia'),
+              subtitle: const Text(
+                  'No images, ~937 MB. Checks free space first and won\'t '
+                  'download if there isn\'t room.'),
+              onTap: _downloadSimpleWiki,
+            ),
           ListTile(
             leading: const Icon(Icons.file_open_outlined),
-            title: const Text('Install a Wikipedia file (.zim)'),
+            title: const Text('Install a .zim you already have'),
             subtitle: const Text(
-                'Pick a Kiwix .zim you downloaded, or detect one already on '
-                'this device.'),
+                'Pick a Kiwix file from this device, or detect one.'),
             trailing: TextButton(
               onPressed: _scanForWiki,
               child: const Text('Detect'),
@@ -799,17 +839,43 @@ class _SettingsScreenState extends State<SettingsScreen> {
           const Padding(
             padding: EdgeInsets.fromLTRB(16, 4, 16, 16),
             child: Text(
-              'Download a Kiwix Wikipedia archive at kiwix.org/downloads (Simple '
-              'English, no images ≈ 937 MB is a good fit; full English is 48–115 '
-              'GB). Save it to this phone, then install it above. Eva then '
-              'answers general-knowledge questions from it — fully offline — and '
-              'cites the article, which you can open and read here.',
+              'Eva answers general-knowledge questions from the offline '
+              'Wikipedia — fully offline — and cites the article, which you can '
+              'open and read here. Full English is 48–115 GB if you ever want it '
+              '(download from kiwix.org and install above).',
               style: TextStyle(fontSize: 12, color: Colors.grey),
             ),
           ),
         ],
       ),
     );
+  }
+
+  Future<void> _downloadSimpleWiki() async {
+    await _toast('Checking free space…');
+    final check = await _wikiDl.check(WikipediaDownload.simpleNopic);
+    if (check == null) {
+      await _toast('Could not reach the download server. Check your internet.');
+      return;
+    }
+    if (!check.ok) {
+      final need = formatBytes(check.needBytes);
+      final free = check.freeBytes == null ? 'unknown' : formatBytes(check.freeBytes!);
+      await _toast('Not enough storage: needs about $need free, but only '
+          '$free is available. Free up space and try again.');
+      return;
+    }
+    final ok = await _wikiDl.start(check);
+    if (!mounted) return;
+    if (ok) {
+      _wikiPath = await loadWikipediaZimPath();
+      setState(() {});
+      await _toast('Simple English Wikipedia installed.');
+    } else if (_wikiDl.error != null) {
+      await _toast(_wikiDl.error!);
+    } else {
+      await _toast('Download cancelled.');
+    }
   }
 
   Future<void> _pickWikiFile() async {

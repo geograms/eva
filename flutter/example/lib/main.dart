@@ -841,18 +841,16 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
       }
     } catch (_) {}
 
-    // 3) Combine: instruct the model to synthesise the sources above with its
-    // own knowledge, citing the sources for specifics.
-    if (contextBuf.isNotEmpty) {
-      systemContent = (StringBuffer(_systemPrompt)
-            ..writeln('\n\nAnswer the question directly and helpfully, drawing '
-                'primarily on your own knowledge. The excerpts below — from the '
-                "user's documents and possibly Wikipedia — MAY be relevant: use "
-                'and cite any that genuinely help, and silently ignore the rest. '
-                'Do NOT say that a source does not mention the topic and do NOT '
-                'describe the excerpts; just answer the question well.')
-            ..write(contextBuf.toString()))
-          .toString();
+    // 3) Combine: a short directive in the system prompt; the actual reference
+    // material is co-located with the question in the user turn below — small
+    // models follow that far better than a large system-prompt dump (which made
+    // this one just echo the topic word).
+    final grounding = contextBuf.toString();
+    if (grounding.isNotEmpty) {
+      systemContent = "$_systemPrompt\n\nWhen the user's message includes "
+          'reference material, use it together with your own knowledge to '
+          'answer clearly, and mention the source (the document name, or '
+          'Wikipedia) for any fact you take from it.';
       sources = cites;
     }
     assistant.sources = sources;
@@ -889,7 +887,13 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     final messagesJson = jsonEncode([
       {'role': 'system', 'content': systemContent},
       ...kept.reversed.map((m) {
-        final msg = <String, dynamic>{'role': m.role, 'content': m.text};
+        // Co-locate the grounding with the current question so the model treats
+        // it as material for THIS answer, not background it can ignore/echo.
+        final content = (m == user && grounding.isNotEmpty)
+            ? '$grounding\n\n---\nUsing the reference material above where it '
+                'helps, answer this question: ${m.text}'
+            : m.text;
+        final msg = <String, dynamic>{'role': m.role, 'content': content};
         if (m.imagePath != null) msg['images'] = [m.imagePath];
         return msg;
       }),
@@ -1195,16 +1199,17 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     if (!_wiki.nativeAvailable) return null;
     if (!await loadWikipediaEnabled()) return null;
     if (!looksLikeQuestion(text)) return null;
-    final hits = await _wiki.search(text, k: 3);
+    // Search on the meaningful keywords, not the raw question — the full-text
+    // query parser does better with "gravity" than "What is gravity?".
+    final kw = significantWords(text).join(' ');
+    final hits = await _wiki.search(kw.isEmpty ? text : kw, k: 3);
     if (hits.isEmpty) return null;
     final top = hits.first;
     if (!_wiki.isConfident(text, top)) return null;
-    final lead = await _wiki.leadText(top.path, maxChars: 3500);
+    final lead = await _wiki.leadText(top.path, maxChars: 3000);
     if (lead.trim().length < 40) return null;
     final buf = StringBuffer()
-      ..writeln('\n\nWikipedia (offline) — article "${top.title}". Use this '
-          'excerpt to answer; cite Wikipedia; if it does not contain the answer, '
-          'say so.\n')
+      ..writeln('\n\n--- Wikipedia article: "${top.title}" ---')
       ..writeln(lead);
     // A clean snippet (strip the FTS <b> markers) lets the reader scroll to the
     // cited passage.
