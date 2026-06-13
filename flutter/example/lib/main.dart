@@ -90,7 +90,7 @@ class ChatScreen extends StatefulWidget {
   State<ChatScreen> createState() => _ChatScreenState();
 }
 
-class _ChatScreenState extends State<ChatScreen> {
+class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
   final ModelManager _models = ModelManager();
   final InferenceEngine _engine = InferenceEngine();
   final TextEditingController _input = TextEditingController();
@@ -146,6 +146,9 @@ class _ChatScreenState extends State<ChatScreen> {
   final Battery _battery = Battery();
   StreamSubscription<BatteryState>? _batterySub;
   Timer? _captionTimer;
+  // Periodic discovery of newly-added files (documents, photos, …).
+  Timer? _rescanTimer;
+  DateTime? _lastRescan;
   bool _charging = false;
   bool _captioning = false; // VLM loaded, captioning photos
   bool _captionStop = false;
@@ -168,8 +171,15 @@ class _ChatScreenState extends State<ChatScreen> {
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
     _setupAssistant();
     _start();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    // Coming back to the app is a good moment to pick up newly-added files.
+    if (state == AppLifecycleState.resumed) _rescanForNewFiles();
   }
 
   /// First run shows the intro (permissions + downloads explainer, optional
@@ -197,6 +207,8 @@ class _ChatScreenState extends State<ChatScreen> {
     _captionStop = true;
     _batterySub?.cancel();
     _captionTimer?.cancel();
+    _rescanTimer?.cancel();
+    WidgetsBinding.instance.removeObserver(this);
     _rag?.close();
     _chats?.close();
     super.dispose();
@@ -542,6 +554,7 @@ class _ChatScreenState extends State<ChatScreen> {
     await _engine.start();
     await _openChatStore();
     unawaited(_setupCaptioning());
+    _setupPeriodicRescan();
     _systemPrompt = await loadSystemPrompt();
     _maxTokens = await loadMaxTokens();
     _voiceEngine = await loadVoiceEngine();
@@ -944,6 +957,42 @@ class _ChatScreenState extends State<ChatScreen> {
   }
 
   int _lastFailedReported = 0;
+
+  // ── Periodic discovery of newly-added files ─────────────────────────────────
+
+  void _setupPeriodicRescan() {
+    _rescanTimer =
+        Timer.periodic(const Duration(minutes: 30), (_) => _rescanForNewFiles());
+  }
+
+  /// Re-discovers new files of every supported type (extensible — add a type by
+  /// adding a line here). Cheap: each scan skips already-indexed and known-bad
+  /// files. Throttled so frequent foregrounding doesn't thrash storage.
+  Future<void> _rescanForNewFiles() async {
+    if (_phase != AppPhase.ready) return;
+    final now = DateTime.now();
+    if (_lastRescan != null &&
+        now.difference(_lastRescan!) < const Duration(minutes: 10)) {
+      return;
+    }
+    _lastRescan = now;
+
+    // Documents (PDF/text): pick up newly-added files and index them.
+    try {
+      final res = await _docs.importFolder('/storage/emulated/0');
+      if (res.added > 0) {
+        _documents = await _docs.list();
+        if (mounted) setState(() {});
+        unawaited(_ensureRag().catchError((_) {}));
+      }
+    } catch (_) {}
+
+    // Photos: re-walk the gallery for new images (the indexer skips known ones).
+    await savePhotoScanDone(false);
+    _startPhotoIndexing();
+
+    // Music: (added with the music indexer) — _music.rescan() here.
+  }
 
   /// Starts (or resumes) the continuous background gallery scan, which keeps
   /// running across launches until the whole gallery is catalogued.
