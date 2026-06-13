@@ -133,7 +133,6 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
   AppPhase _phase = AppPhase.preparing;
   String _statusText = 'Starting…';
   double? _progress;
-  String? _lastStats;
   bool _generating = false;
   // Image queued by the user for the next message (vision models only).
   String? _pendingImagePath;
@@ -676,7 +675,6 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     await prefs.setString('selected_model', newId);
     setState(() {
       _messages.clear();
-      _lastStats = null;
     });
     await _prepareAndLoad();
   }
@@ -705,35 +703,35 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     // Allow sending an image on its own with a sensible default question.
     if (text.isEmpty && imagePath == null) return;
     if (_generating) return;
-    // Claim the turn now so the background vision pass can't restart and swap the
-    // caption model back in while we prepare (its gate checks _generating).
-    _generating = true;
-    // If the vision pass swapped in the caption model, restore the chat model.
-    await _stopCaptioningForChat();
-    await _tts.stop(); // don't talk over the next turn
+    if (text.isEmpty && imagePath != null) text = 'What is in this image?';
     // Pin this turn's language from the user's own words (keeps directive and
     // TTS voice consistent; falls back to the previous turn's when unsure).
     _turnLang = _detectLangBase(text) ?? _turnLang;
-    // Sending finalizes any in-progress dictation.
+
+    // Show the user's message and a thinking placeholder immediately (also
+    // claims the turn so the background vision pass can't restart). The model
+    // swap below then happens while the placeholder is visible.
+    final assistant = ChatMessage('assistant', '');
+    final user = ChatMessage('user', text, imagePath: imagePath);
+    _input.clear();
+    setState(() {
+      _messages.add(user);
+      _messages.add(assistant);
+      _generating = true;
+      _pendingImagePath = null;
+    });
+    _persistMessage(user);
+    _scrollToBottom();
+
+    // Finalize dictation, hush TTS, and restore the chat model if the vision
+    // pass had swapped in the caption model.
     if (_voice.isListening || _systemVoice.isListening) {
       await _voice.stop();
       await _systemVoice.stop();
       if (mounted) setState(() => _listening = false);
     }
-    if (text.isEmpty && imagePath != null) text = 'What is in this image?';
-    _input.clear();
-
-    final assistant = ChatMessage('assistant', '');
-    final user = ChatMessage('user', text, imagePath: imagePath);
-    setState(() {
-      _messages.add(user);
-      _messages.add(assistant);
-      _generating = true;
-      _lastStats = null;
-      _pendingImagePath = null;
-    });
-    _persistMessage(user);
-    _scrollToBottom();
+    await _stopCaptioningForChat();
+    await _tts.stop();
 
     // "play <artist/song>" starts the in-app music player directly, no model.
     if (imagePath == null && await _handlePlayCommand(text, assistant)) {
@@ -885,11 +883,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
       if (assistant.text.isEmpty && full != null && full.isNotEmpty) {
         setState(() => assistant.text = full);
       }
-      final tps = stats['decode_tps'];
-      setState(() {
-        _generating = false;
-        if (tps is num) _lastStats = '${tps.toStringAsFixed(1)} tok/s';
-      });
+      setState(() => _generating = false);
       // Speak the reply when Eva was invoked as the device assistant.
       if (_assistMode) _speak(assistant.text);
     } catch (_) {
@@ -908,7 +902,6 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     setState(() {
       _convId = null; // next message starts a fresh stored conversation
       _messages.clear();
-      _lastStats = null;
       _pendingImagePath = null;
     });
   }
@@ -1437,7 +1430,6 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     setState(() {
       _convId = null; // a model switch starts a fresh stored conversation
       _messages.clear();
-      _lastStats = null;
     });
     await _prepareAndLoad();
   }
@@ -1650,11 +1642,18 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
       appBar: AppBar(
         title: const Text('Eva'),
         actions: [
-          if (_lastStats != null)
-            Padding(
-              padding: const EdgeInsets.only(right: 4),
-              child: Center(
-                child: Text(_lastStats!, style: const TextStyle(fontSize: 12)),
+          if (_phase == AppPhase.ready && _backgroundStatus() != null)
+            Tooltip(
+              message: _backgroundStatus()!,
+              child: const Padding(
+                padding: EdgeInsets.symmetric(horizontal: 10),
+                child: Center(
+                  child: SizedBox(
+                    width: 15,
+                    height: 15,
+                    child: CircularProgressIndicator(strokeWidth: 2),
+                  ),
+                ),
               ),
             ),
           if (_phase == AppPhase.ready)
@@ -1665,12 +1664,11 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
             ),
           if (_phase == AppPhase.ready)
             IconButton(
-              tooltip: 'Models',
+              tooltip: 'Settings',
               onPressed: _generating ? null : _openSettings,
               icon: const Icon(Icons.tune),
             ),
         ],
-        bottom: _indexingBanner(),
       ),
       body: switch (_phase) {
         AppPhase.ready => _buildChat(),
@@ -1680,46 +1678,24 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     );
   }
 
-  /// A thin progress strip shown under the AppBar while the background indexer
-  /// is working through the document backlog (null = nothing to show).
-  PreferredSizeWidget? _indexingBanner() {
+  /// A short description of any background activity, shown only as a small
+  /// spinner + tooltip in the AppBar (never a distracting full-width banner).
+  /// Returns null when nothing is running.
+  String? _backgroundStatus() {
     final ix = _indexer;
     final px = _photoIndexer;
     final mx = _musicIndexer;
-    final String? label;
-    if (_captioning) {
-      label = 'Recognising photo contents — $_captionsDone done…';
-    } else if (_preparingDocs && (ix == null || !ix.isIndexing)) {
-      label = 'Preparing document search…';
-    } else if (ix != null && ix.isIndexing && ix.pending > 0) {
-      label = ix.currentName == null
-          ? 'Indexing ${ix.pending} document${ix.pending == 1 ? '' : 's'}…'
-          : 'Indexing "${ix.currentName}" — ${ix.pending} left';
-    } else if (px != null && px.isIndexing) {
-      label = 'Indexing photos — ${px.total} done…';
-    } else if (mx != null && mx.isIndexing) {
-      label = 'Indexing music — ${mx.total} done…';
-    } else if (mx != null && mx.isFetchingLyrics) {
-      label = 'Fetching lyrics — ${mx.lyricsFound} found…';
-    } else {
-      return null;
+    if (_captioning) return 'Recognising photo contents ($_captionsDone done)';
+    if (_preparingDocs && (ix == null || !ix.isIndexing)) {
+      return 'Preparing document search';
     }
-    return PreferredSize(
-      preferredSize: const Size.fromHeight(24),
-      child: Column(
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          const LinearProgressIndicator(minHeight: 2),
-          Padding(
-            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 2),
-            child: Align(
-              alignment: Alignment.centerLeft,
-              child: Text(label, style: const TextStyle(fontSize: 11)),
-            ),
-          ),
-        ],
-      ),
-    );
+    if (ix != null && ix.isIndexing && ix.pending > 0) {
+      return 'Indexing documents (${ix.pending} left)';
+    }
+    if (px != null && px.isIndexing) return 'Indexing photos (${px.total})';
+    if (mx != null && mx.isIndexing) return 'Indexing music (${mx.total})';
+    if (mx != null && mx.isFetchingLyrics) return 'Fetching lyrics';
+    return null;
   }
 
   Widget _buildLoading() {
@@ -1757,6 +1733,35 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     );
   }
 
+  /// Friendly empty state with Eva's avatar instead of a bare line of text.
+  Widget _emptyState() {
+    final scheme = Theme.of(context).colorScheme;
+    return Center(
+      child: Padding(
+        padding: const EdgeInsets.all(32),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            const CircleAvatar(
+              radius: 40,
+              backgroundImage: AssetImage('assets/eva_avatar.png'),
+            ),
+            const SizedBox(height: 16),
+            Text('Hi, I\'m Eva',
+                style: Theme.of(context).textTheme.titleMedium),
+            const SizedBox(height: 6),
+            Text(
+              'Ask me anything, or about your documents, photos, music and '
+              'offline Wikipedia.',
+              textAlign: TextAlign.center,
+              style: TextStyle(color: scheme.onSurfaceVariant, fontSize: 13),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
   Widget _buildChat() {
     return Column(
       children: [
@@ -1764,7 +1769,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
         if (_notice != null) _noticeBanner(),
         Expanded(
           child: _messages.isEmpty
-              ? const Center(child: Text('Say hello to start chatting.'))
+              ? _emptyState()
               : ListView.builder(
                   controller: _scroll,
                   padding: const EdgeInsets.all(12),
@@ -1933,18 +1938,21 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     );
   }
 
-  /// Dismissible notice for failures that would otherwise be invisible.
+  /// Dismissible, low-key notice for things that would otherwise be invisible
+  /// (e.g. some files had no extractable text). Informational, not alarming.
   Widget _noticeBanner() {
     final scheme = Theme.of(context).colorScheme;
     return Material(
-      color: scheme.errorContainer,
+      color: scheme.surfaceContainerHigh,
       child: ListTile(
         dense: true,
-        leading: Icon(Icons.info_outline, color: scheme.onErrorContainer),
+        leading: Icon(Icons.info_outline,
+            size: 18, color: scheme.onSurfaceVariant),
         title: Text(_notice!,
-            style: TextStyle(color: scheme.onErrorContainer, fontSize: 13)),
+            style: TextStyle(color: scheme.onSurfaceVariant, fontSize: 12.5)),
         trailing: IconButton(
-          icon: const Icon(Icons.close, size: 18),
+          icon: Icon(Icons.close, size: 18, color: scheme.onSurfaceVariant),
+          visualDensity: VisualDensity.compact,
           onPressed: () => setState(() => _notice = null),
         ),
       ),
@@ -2198,6 +2206,58 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     return Icons.article_outlined;
   }
 
+  /// One chip per cited source: collapses multiple chunks from the same document
+  /// (different pages) into a single entry like "Report · pp. 2, 4" instead of
+  /// several near-identical chips. Tapping opens the earliest cited page.
+  List<({Citation cite, String label, IconData icon})> _groupedSources(
+      List<Citation> sources) {
+    final order = <String>[];
+    final groups = <String, List<Citation>>{};
+    for (final s in sources) {
+      final key = s.wikiPath ?? s.path ?? s.docId ?? s.label;
+      final list = groups[key];
+      if (list == null) {
+        groups[key] = [s];
+        order.add(key);
+      } else {
+        list.add(s);
+      }
+    }
+    return [
+      for (final key in order)
+        () {
+          final group = groups[key]!
+            ..sort((a, b) => (a.page ?? 0).compareTo(b.page ?? 0));
+          return (
+            cite: group.first,
+            label: _citeLabel(group),
+            icon: _citeIcon(group.first)
+          );
+        }()
+    ];
+  }
+
+  String _citeLabel(List<Citation> group) {
+    final first = group.first;
+    // Wikipedia: the article title is enough (the globe icon says "Wikipedia").
+    if (first.wikiPath != null) {
+      return first.label.replaceFirst(RegExp(r'^Wikipedia:\s*'), '');
+    }
+    // Document name without folder/extension, ellipsized.
+    var name = first.path != null
+        ? first.path!.split('/').last
+        : first.label.replaceAll(RegExp(r'\s*\(p\.\d+\)\s*$'), '');
+    final dot = name.lastIndexOf('.');
+    if (dot > 0) name = name.substring(0, dot);
+    if (name.length > 26) name = '${name.substring(0, 25)}…';
+    final pages = group.map((g) => g.page).whereType<int>().toSet().toList()
+      ..sort();
+    if (pages.isEmpty) return name;
+    return pages.length == 1
+        ? '$name · p.${pages.first}'
+        : '$name · pp. ${pages.join(', ')}';
+  }
+
   Widget _bubble(ChatMessage m) {
     final isUser = m.role == 'user';
     final scheme = Theme.of(context).colorScheme;
@@ -2269,20 +2329,18 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
               bubble,
               if (sources != null && sources.isNotEmpty)
                 Padding(
-                  padding: const EdgeInsets.only(left: 6, top: 2, bottom: 4),
+                  padding: const EdgeInsets.only(left: 6, top: 6, bottom: 4),
                   child: Wrap(
                     spacing: 6,
-                    runSpacing: -8,
+                    runSpacing: 6,
                     children: [
-                      for (final s in sources)
-                        ActionChip(
-                          avatar: Icon(_citeIcon(s), size: 14),
-                          label: Text(s.label,
-                              style: const TextStyle(fontSize: 11)),
-                          visualDensity: VisualDensity.compact,
-                          materialTapTargetSize:
-                              MaterialTapTargetSize.shrinkWrap,
-                          onPressed: _canOpen(s) ? () => _openCitation(s) : null,
+                      for (final g in _groupedSources(sources))
+                        _SourceChip(
+                          icon: g.icon,
+                          label: g.label,
+                          onTap: _canOpen(g.cite)
+                              ? () => _openCitation(g.cite)
+                              : null,
                         ),
                     ],
                   ),
@@ -2291,6 +2349,59 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
           ),
         ),
       ],
+    );
+  }
+}
+
+/// A compact, tappable source pill under an assistant reply. Quieter than a
+/// Material chip: subtle surface, the source icon, the (grouped) label, and a
+/// small "open" hint when it can be opened.
+class _SourceChip extends StatelessWidget {
+  const _SourceChip({required this.icon, required this.label, this.onTap});
+
+  final IconData icon;
+  final String label;
+  final VoidCallback? onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    final enabled = onTap != null;
+    return Material(
+      color: scheme.surfaceContainerHigh,
+      borderRadius: BorderRadius.circular(8),
+      child: InkWell(
+        borderRadius: BorderRadius.circular(8),
+        onTap: onTap,
+        child: Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 5),
+          child: Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Icon(icon,
+                  size: 13,
+                  color: enabled ? scheme.primary : scheme.onSurfaceVariant),
+              const SizedBox(width: 5),
+              ConstrainedBox(
+                constraints: const BoxConstraints(maxWidth: 210),
+                child: Text(
+                  label,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: TextStyle(
+                      fontSize: 11.5, color: scheme.onSurfaceVariant),
+                ),
+              ),
+              if (enabled) ...[
+                const SizedBox(width: 4),
+                Icon(Icons.north_east,
+                    size: 11,
+                    color: scheme.onSurfaceVariant.withValues(alpha: 0.6)),
+              ],
+            ],
+          ),
+        ),
+      ),
     );
   }
 }
