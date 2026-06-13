@@ -70,6 +70,7 @@ dependencies:
   syncfusion_flutter_pdfviewer: ^27.2.5
   exif: ^3.3.0
   flutter_image_compress: ^2.4.0
+  battery_plus: ^7.0.0
 
 dev_dependencies:
   flutter_test:

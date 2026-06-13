@@ -63,7 +63,83 @@ class PhotoStore {
     ''');
     db.execute('CREATE INDEX IF NOT EXISTS idx_photos_taken ON photos(taken_at);');
     db.execute('CREATE INDEX IF NOT EXISTS idx_photos_type ON photos(type);');
+    // Full-text index over captions (the vision pass writes them), so content
+    // search ("beach", "dog", "receipt") matches on the photo id (= rowid).
+    db.execute('''
+      CREATE VIRTUAL TABLE IF NOT EXISTS captions_fts
+        USING fts5(caption, content='photos', content_rowid='id');
+    ''');
     return PhotoStore._(db);
+  }
+
+  /// Photos still needing a vision caption, oldest-first (so newest get done
+  /// last? no — newest first feels more useful), capped at [limit].
+  List<PhotoInfo> pendingCaption({int limit = 200}) {
+    final rs = _db.select(
+      'SELECT id, path, taken_at, width, height, size, bucket, type, '
+      'thumb, caption FROM photos WHERE captioned = 0 ORDER BY taken_at DESC '
+      'LIMIT ?;',
+      [limit],
+    );
+    return [for (final r in rs) _row(r)];
+  }
+
+  int get captionPendingCount =>
+      _db.select('SELECT COUNT(*) AS n FROM photos WHERE captioned=0;')
+          .first['n'] as int;
+  int get captionedCount =>
+      _db.select('SELECT COUNT(*) AS n FROM photos WHERE captioned=1;')
+          .first['n'] as int;
+
+  /// Stores a caption for a photo and keeps the FTS index in sync.
+  void setCaption(int id, String caption, {PhotoType? type}) {
+    _db.execute(
+      'UPDATE photos SET caption=?, captioned=1${type != null ? ', type=?' : ''} '
+      'WHERE id=?;',
+      type != null ? [caption, type.name, id] : [caption, id],
+    );
+    _db.execute('INSERT INTO captions_fts(rowid, caption) VALUES(?,?);',
+        [id, caption]);
+  }
+
+  /// Content search over captions (keyword). Returns matching photos, best
+  /// first, optionally filtered by time/type.
+  List<PhotoInfo> searchCaptions(String query,
+      {DateTime? from, DateTime? to, PhotoType? type, int limit = 60}) {
+    final tokens = RegExp(r'[\p{L}\p{N}]+', unicode: true)
+        .allMatches(query)
+        .map((m) => '"${m.group(0)}"')
+        .toList();
+    if (tokens.isEmpty) return const [];
+    final match = tokens.join(' OR ');
+    final extra = <String>[];
+    final args = <Object?>[match];
+    if (from != null) {
+      extra.add('p.taken_at >= ?');
+      args.add(from.millisecondsSinceEpoch);
+    }
+    if (to != null) {
+      extra.add('p.taken_at <= ?');
+      args.add(to.millisecondsSinceEpoch);
+    }
+    if (type != null) {
+      extra.add('p.type = ?');
+      args.add(type.name);
+    }
+    try {
+      final rs = _db.select(
+        'SELECT p.id, p.path, p.taken_at, p.width, p.height, p.size, p.bucket, '
+        'p.type, p.thumb, p.caption FROM captions_fts f '
+        'JOIN photos p ON p.id = f.rowid '
+        'WHERE captions_fts MATCH ?'
+        '${extra.isEmpty ? '' : ' AND ${extra.join(' AND ')}'} '
+        'ORDER BY bm25(captions_fts) LIMIT ?;',
+        [...args, limit],
+      );
+      return [for (final r in rs) _row(r)];
+    } catch (_) {
+      return const [];
+    }
   }
 
   /// Paths already indexed (to skip on re-scan).

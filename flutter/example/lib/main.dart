@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
+import 'package:battery_plus/battery_plus.dart';
 import 'package:flutter/material.dart';
 import 'package:gpt_markdown/gpt_markdown.dart';
 import 'package:image_picker/image_picker.dart';
@@ -141,6 +142,19 @@ class _ChatScreenState extends State<ChatScreen> {
   String? _notice;
   // True while the embedder is being set up in the background (before indexing).
   bool _preparingDocs = false;
+  // Photo content-understanding (vision) pass — runs only while charging+idle.
+  final Battery _battery = Battery();
+  StreamSubscription<BatteryState>? _batterySub;
+  bool _charging = false;
+  bool _captioning = false; // VLM loaded, captioning photos
+  bool _captionStop = false;
+  String? _modelBeforeCaption;
+  int _captionsDone = 0;
+  static const String _kCaptionModelId = 'lfm2-vl-450m-int4';
+  static const String _captionPrompt =
+      'Describe this image in one short sentence, then list 3-6 search keywords '
+      '(objects, scene, colours, and any visible text). If it is a meme or a '
+      'screenshot, say so.';
 
   /// Whether the active model can see images (exposes the attach button).
   bool get _visionActive => modelById(_catalog, _activeModelId).isVision;
@@ -174,6 +188,8 @@ class _ChatScreenState extends State<ChatScreen> {
     _photoIndexer?.removeListener(_onPhotoProgress);
     _photoIndexer?.pause();
     _photoIndexer?.dispose();
+    _captionStop = true;
+    _batterySub?.cancel();
     _rag?.close();
     _chats?.close();
     super.dispose();
@@ -518,6 +534,7 @@ class _ChatScreenState extends State<ChatScreen> {
     }));
     await _engine.start();
     await _openChatStore();
+    unawaited(_setupCaptioning());
     _systemPrompt = await loadSystemPrompt();
     _maxTokens = await loadMaxTokens();
     _voiceEngine = await loadVoiceEngine();
@@ -556,6 +573,7 @@ class _ChatScreenState extends State<ChatScreen> {
       // background, no user action required.
       unawaited(_autoIndexPending());
       _startPhotoIndexing();
+      _maybeStartCaptioning();
     } catch (e) {
       setState(() {
         _phase = AppPhase.error;
@@ -647,6 +665,8 @@ class _ChatScreenState extends State<ChatScreen> {
     // Allow sending an image on its own with a sensible default question.
     if (text.isEmpty && imagePath == null) return;
     if (_generating) return;
+    // If the vision pass swapped in the caption model, restore the chat model.
+    await _stopCaptioningForChat();
     await _tts.stop(); // don't talk over the next turn
     // Pin this turn's language from the user's own words (keeps directive and
     // TTS voice consistent; falls back to the previous turn's when unsure).
@@ -800,6 +820,7 @@ class _ChatScreenState extends State<ChatScreen> {
     if (assistant.text.isNotEmpty) _persistMessage(assistant);
     // The turn is done — let background indexing of the backlog continue.
     _indexer?.resume();
+    _maybeStartCaptioning(); // resume the vision pass if idle + charging
     _scrollToBottom();
   }
 
@@ -927,10 +948,151 @@ class _ChatScreenState extends State<ChatScreen> {
 
   void _onPhotoProgress() {
     if (mounted) setState(() {});
+    _maybeStartCaptioning(); // frequent re-check while metadata indexing runs
+  }
+
+  // ── Photo content understanding (vision caption pass) ───────────────────────
+
+  /// Watches the charger so captioning only runs while plugged in (gentle on
+  /// battery, per the chosen policy).
+  Future<void> _setupCaptioning() async {
+    try {
+      final s = await _battery.batteryState;
+      _charging = s == BatteryState.charging || s == BatteryState.full;
+      if (_charging) _maybeStartCaptioning(); // already plugged in at launch
+    } catch (_) {}
+    _batterySub = _battery.onBatteryStateChanged.listen((s) {
+      final charging = s == BatteryState.charging || s == BatteryState.full;
+      if (charging == _charging) return;
+      _charging = charging;
+      if (charging) {
+        _maybeStartCaptioning();
+      } else {
+        _captionStop = true; // unplugged — yield the engine back
+      }
+    });
+  }
+
+  /// Starts the vision pass when idle + charging and there's a backlog.
+  void _maybeStartCaptioning() {
+    // Captioning swaps the (idle) chat-model slot to the vision model; document
+    // indexing uses the separate embedder slot, so the two run concurrently.
+    if (_captioning ||
+        _phase != AppPhase.ready ||
+        !_charging ||
+        _generating ||
+        _preparingDocs) {
+      return;
+    }
+    unawaited(_runCaptioning());
+  }
+
+  Future<void> _runCaptioning() async {
+    if (_captioning || !_charging || _generating) return;
+    // Anything to do?
+    final probe = await _photos.openStore();
+    int pending;
+    try {
+      pending = probe.captionPendingCount;
+    } finally {
+      probe.close();
+    }
+    if (pending == 0) return;
+
+    _captioning = true;
+    _captionStop = false;
+    _modelBeforeCaption = _activeModelId;
+    if (mounted) setState(() {});
+    // Pause only the metadata photo indexer (it writes photos.sqlite too);
+    // document indexing keeps running on the separate embedder slot.
+    await _photoIndexer?.stop();
+    final tmp = File('${(await getTemporaryDirectory()).path}/caption_thumb.jpg');
+    try {
+      final vlm = modelById(_catalog, _kCaptionModelId);
+      final dir = await _models.ensureInstalled(vlm, (_, _) {});
+      await _engine.initModel(dir); // swaps the chat model out
+      while (!_captionStop && _charging && !_generating) {
+        final store = await _photos.openStore();
+        List<PhotoInfo> batch;
+        try {
+          batch = store.pendingCaption(limit: 8);
+        } finally {
+          store.close();
+        }
+        if (batch.isEmpty) break;
+        for (final p in batch) {
+          if (_captionStop || _charging == false || _generating) break;
+          final cap = await _captionOne(p, tmp);
+          final s2 = await _photos.openStore();
+          try {
+            s2.setCaption(p.id, cap ?? ''); // empty marks it done, won't retry
+          } finally {
+            s2.close();
+          }
+          if (cap != null && cap.isNotEmpty) _captionsDone++;
+          if (mounted) setState(() {});
+          await Future<void>.delayed(const Duration(milliseconds: 50));
+        }
+      }
+    } catch (_) {
+      // transient — retry next charging window
+    } finally {
+      await _restoreChatModel();
+      _captioning = false;
+      if (mounted) setState(() {});
+      // Resume the metadata photo indexer we paused.
+      _startPhotoIndexing();
+    }
+  }
+
+  Future<String?> _captionOne(PhotoInfo p, File tmp) async {
+    if (p.thumb == null) return null;
+    try {
+      await tmp.writeAsBytes(p.thumb!, flush: true);
+      final messages = jsonEncode([
+        {'role': 'user', 'content': _captionPrompt, 'images': [tmp.path]}
+      ]);
+      final run = _engine.complete(messages,
+          optionsJson: '{"max_tokens":80,"temperature":0.3}');
+      final buf = StringBuffer();
+      run.tokens.listen(buf.write, onError: (_) {});
+      final stats = await run.stats;
+      final full = (stats['response'] as String?)?.trim();
+      final text = (full != null && full.isNotEmpty) ? full : buf.toString().trim();
+      return text.isEmpty ? null : text;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  /// Reloads the user's chat model after a caption session.
+  Future<void> _restoreChatModel() async {
+    final id = _modelBeforeCaption;
+    _modelBeforeCaption = null;
+    if (id == null) return;
+    try {
+      final spec = modelById(_catalog, id);
+      final dir = await _models.ensureInstalled(spec, (_, _) {});
+      await _engine.initModel(dir);
+    } catch (_) {}
+  }
+
+  /// Ensures the chat model is loaded before a chat turn (caption mode may have
+  /// swapped in the vision model). Returns once the chat model is back.
+  Future<void> _stopCaptioningForChat() async {
+    if (!_captioning) return;
+    _captionStop = true;
+    var waited = 0;
+    while (_captioning && waited < 200) {
+      await Future<void>.delayed(const Duration(milliseconds: 60));
+      waited++;
+    }
   }
 
   void _onIndexerProgress() {
     if (!mounted) return;
+    // When the document backlog drains, the engine is free for the vision pass.
+    if (_indexer?.isIndexing == false) _maybeStartCaptioning();
     // Per-document failures are deferred (skipped), not fatal. Once the backlog
     // is drained, note how many were skipped so it isn't silent.
     final ix = _indexer;
@@ -1214,7 +1376,9 @@ class _ChatScreenState extends State<ChatScreen> {
     final ix = _indexer;
     final px = _photoIndexer;
     final String? label;
-    if (_preparingDocs && (ix == null || !ix.isIndexing)) {
+    if (_captioning) {
+      label = 'Recognising photo contents — $_captionsDone done…';
+    } else if (_preparingDocs && (ix == null || !ix.isIndexing)) {
       label = 'Preparing document search…';
     } else if (ix != null && ix.isIndexing && ix.pending > 0) {
       label = ix.currentName == null
@@ -1427,7 +1591,7 @@ class _ChatScreenState extends State<ChatScreen> {
 
   /// Detects a request for photos and returns the time range / type to show, or
   /// null if the message isn't about photos.
-  ({DateTime? from, DateTime? to, PhotoType? type, String label})?
+  ({DateTime? from, DateTime? to, PhotoType? type, String label, String content})?
       _parsePhotoQuery(String text) {
     final t = text.toLowerCase();
     const photoWords = [
@@ -1436,6 +1600,22 @@ class _ChatScreenState extends State<ChatScreen> {
       'foto', 'fotos', 'imagem', 'imagens', 'captura', 'capturas'
     ];
     if (!photoWords.any((w) => RegExp('\\b$w\\b').hasMatch(t))) return null;
+    // Content terms = meaningful words left after removing the photo/time/filler
+    // words; used for caption (content) search.
+    const filler = {
+      'show', 'me', 'my', 'of', 'the', 'a', 'with', 'from', 'find', 'see',
+      'get', 'all', 'any', 'some', 'in', 'on', 'and', 'to', 'that', 'have',
+      'mostra', 'as', 'os', 'da', 'do', 'com', 'todas', 'todos',
+      ...photoWords,
+      'today', 'yesterday', 'week', 'month', 'year', 'last', 'this', 'past',
+      'days', 'hoje', 'ontem', 'semana', 'mês', 'mes', 'ano', 'passada',
+      'passado', 'este', 'esta'
+    };
+    final content = RegExp(r'[\p{L}\p{N}]+', unicode: true)
+        .allMatches(t)
+        .map((m) => m.group(0)!)
+        .where((w) => w.length > 1 && !filler.contains(w))
+        .join(' ');
 
     PhotoType? type;
     if (RegExp(r'\bscreenshots?\b|\bcapturas?\b').hasMatch(t)) {
@@ -1482,31 +1662,39 @@ class _ChatScreenState extends State<ChatScreen> {
         label = ' from the last $n days';
       }
     }
-    return (from: from, to: to, type: type, label: label);
+    return (from: from, to: to, type: type, label: label, content: content);
   }
 
   /// Fills [assistant] with a thumbnail grid of matching photos. Returns false
   /// (so the normal model answer runs) when no photos are indexed at all.
   Future<bool> _answerWithPhotos(
-      ({DateTime? from, DateTime? to, PhotoType? type, String label}) q,
+      ({DateTime? from, DateTime? to, PhotoType? type, String label, String content}) q,
       ChatMessage assistant) async {
     PhotoStore? store;
     try {
       store = await _photos.openStore();
       if (store.count == 0) return false; // let the model reply normally
-      final results = store.query(
-          from: q.from, to: q.to, type: q.type, limit: 24);
+      // Content terms → caption (content) search; otherwise time/type listing.
+      final byContent = q.content.isNotEmpty;
+      final results = byContent
+          ? store.searchCaptions(q.content,
+              from: q.from, to: q.to, type: q.type, limit: 24)
+          : store.query(from: q.from, to: q.to, type: q.type, limit: 24);
       final kind = q.type == PhotoType.screenshot
           ? 'screenshots'
           : q.type == PhotoType.meme
               ? 'memes'
               : 'photos';
+      final about = byContent ? ' of "${q.content}"' : '';
       setState(() {
         if (results.isEmpty) {
-          assistant.text = 'No $kind found${q.label}.';
+          assistant.text = byContent
+              ? 'No $kind matching "${q.content}"${q.label} yet. Photo contents '
+                  'are still being recognised in the background while charging.'
+              : 'No $kind found${q.label}.';
         } else {
           assistant.text = 'Here ${results.length == 1 ? 'is' : 'are'} '
-              '${results.length} $kind${q.label}:';
+              '${results.length} $kind$about${q.label}:';
           assistant.photos = results;
         }
       });
