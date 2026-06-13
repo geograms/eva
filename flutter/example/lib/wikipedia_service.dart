@@ -6,6 +6,7 @@ import 'package:path_provider/path_provider.dart';
 
 import 'app_prefs.dart';
 import 'document_service.dart' show htmlToPlainText;
+import 'text_util.dart';
 import 'zim_ffi.dart';
 
 /// Reads the on-device offline Wikipedia (a Kiwix `.zim`) via libzim, for
@@ -175,24 +176,20 @@ class WikipediaService {
   /// should share a meaningful word with the query (avoids injecting unrelated
   /// articles into ordinary chat).
   bool isConfident(String query, ZimHit hit) {
-    final qWords = _words(query);
-    final tWords = _words(hit.title);
-    if (qWords.isEmpty || tWords.isEmpty) return false;
+    final qWords = significantWords(query).toSet();
+    if (qWords.isEmpty) return false;
+    final tWords = significantWords(hit.title).toSet();
     final overlap = tWords.where(qWords.contains).length;
-    // Whole title appears in the query, or a strong word overlap.
-    return overlap >= tWords.length || overlap >= 2 ||
-        (tWords.length == 1 && overlap == 1);
+    // Strong: the title shares meaningful words with the query.
+    if (overlap >= tWords.length || overlap >= 2 ||
+        (tWords.length == 1 && overlap == 1)) {
+      return true;
+    }
+    // Acronyms/synonyms: the title may not match (e.g. "UFOs" vs "Unidentified
+    // flying object"), but the full-text snippet — the matched excerpt — will
+    // contain the query term. Accept when a meaningful query word appears there.
+    final snip = hit.snippet.toLowerCase();
+    return qWords.any((w) => snip.contains(w));
   }
 
-  Set<String> _words(String s) => s
-      .toLowerCase()
-      .split(RegExp(r'[^\p{L}\p{N}]+', unicode: true))
-      .where((w) => w.length > 2 && !_stop.contains(w))
-      .toSet();
-
-  static const _stop = {
-    'the', 'and', 'for', 'are', 'was', 'who', 'what', 'where', 'when', 'why',
-    'how', 'does', 'did', 'can', 'could', 'would', 'should', 'about', 'with',
-    'from', 'that', 'this', 'tell', 'give', 'explain', 'their', 'them',
-  };
 }

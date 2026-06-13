@@ -35,6 +35,7 @@ import 'photos_screen.dart';
 import 'rag_index.dart';
 import 'settings_screen.dart';
 import 'system_voice.dart';
+import 'text_util.dart';
 import 'update_check.dart';
 import 'voice_service.dart';
 import 'wikipedia_reader_screen.dart';
@@ -134,6 +135,9 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
   String _statusText = 'Starting…';
   double? _progress;
   bool _generating = false;
+  // What the assistant is doing before the first token streams (e.g.
+  // "Searching your documents…", "Thinking…"), shown in the placeholder bubble.
+  String _thinkingStage = '';
   // Image queued by the user for the next message (vision models only).
   String? _pendingImagePath;
   // Digital-assistant mode (invoked via the power button): speaks replies and
@@ -729,6 +733,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
       _messages.add(user);
       _messages.add(assistant);
       _generating = true;
+      _thinkingStage = 'Thinking…';
       _pendingImagePath = null;
     });
     _persistMessage(user);
@@ -768,44 +773,46 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
 
     var systemContent = _systemPrompt;
     List<Citation>? sources;
+    // We combine three sources of knowledge in one answer: the user's own
+    // documents (RAG), the offline Wikipedia, and the model's own training
+    // knowledge. Each grounding source appends to [contextBuf] and contributes
+    // citations; the model is told to synthesise all of them.
+    final contextBuf = StringBuffer();
+    final cites = <Citation>[];
 
-    // Offline-Wikipedia grounding takes precedence for clearly factual questions
-    // with a confident article match (the user's own documents are personal and
-    // rarely about general-knowledge topics; the title-overlap gate ensures we
-    // only do this when a Wikipedia article genuinely matches the question).
-    ({String context, Citation cite})? wiki;
-    try {
-      wiki = await _wikiContext(text);
-    } catch (_) {}
-
-    // When documents are loaded (and Wikipedia didn't confidently answer),
-    // retrieve relevant passages and ground the answer on them (RAG).
-    if (wiki == null && _documents.isNotEmpty) {
+    // 1) The user's own documents.
+    if (_documents.isNotEmpty) {
+      _setThinking('Searching your documents…');
       try {
         await _ensureRag();
         // Yield the embedder to this turn; query whatever is already indexed
         // (background indexing continues afterward). Resumed in the finally.
         await _indexer?.stop();
         final qvec = (await _engine.embedBatch([text])).first;
-        final hits = await _rag!
-            .query(queryVec: qvec, queryText: text, topK: 4);
-        if (hits.isNotEmpty) {
+        final hits = await _rag!.query(queryVec: qvec, queryText: text, topK: 4);
+        // Keep only passages that actually mention a query keyword. Semantic
+        // retrieval always returns its top-N even for unrelated questions; left
+        // in, those off-topic excerpts make the small model fixate on them and
+        // answer "the documents don't mention X" instead of just answering.
+        final keywords = significantWords(text);
+        final relevant = keywords.isEmpty
+            ? hits
+            : hits
+                .where((h) =>
+                    keywords.any((k) => h.text.toLowerCase().contains(k)))
+                .toList();
+        if (relevant.isNotEmpty) {
           // Read paths fresh so citations are openable even right after a scan
           // backfilled them (the cached list may not have reloaded yet).
           final pathById = {
             for (final d in await _docs.list()) d.id: d.sourcePath
           };
-          final buf = StringBuffer(_systemPrompt);
-          buf.writeln(
-              "\n\nAnswer the user's question using ONLY the document excerpts below. "
-              'Cite the source document (and page if shown). If the answer is not '
-              'in them, say you could not find it in the documents.\n');
-          final cites = <Citation>[];
+          contextBuf.writeln("\n\nFrom the user's own documents:");
           final seen = <String>{};
-          for (final h in hits) {
-            buf.writeln('\n--- Source: ${h.docName}'
+          for (final h in relevant) {
+            contextBuf.writeln('\n--- ${h.docName}'
                 '${h.page != null ? ' (page ${h.page})' : ''} ---');
-            buf.writeln(h.text.trim());
+            contextBuf.writeln(h.text.trim());
             final label =
                 h.page != null ? '${h.docName} (p.${h.page})' : h.docName;
             if (seen.add(label)) {
@@ -814,29 +821,42 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                   path: pathById[h.docId],
                   page: h.page,
                   docId: h.docId,
-                  // Carry the quoted passage so non-PDF docs can be opened in-app
-                  // scrolled to (and highlighting) the citation.
                   snippet: h.text.trim()));
             }
           }
-          systemContent = buf.toString();
-          sources = cites;
         }
       } catch (_) {
-        // Retrieval failed (e.g. embedder unavailable) — answer without RAG,
-        // but tell the user instead of failing silently.
-        if (mounted) {
-          setState(() => _notice =
-              'Document search is unavailable right now — answering without '
-              'your documents.');
-        }
+        // Retrieval failed (e.g. embedder unavailable) — fall through and answer
+        // from Wikipedia / the model's own knowledge.
       }
     }
-    if (wiki != null) {
-      systemContent = '$systemContent${wiki.context}';
-      sources = [wiki.cite];
+
+    // 2) The offline Wikipedia (for general-knowledge questions with a match).
+    _setThinking('Checking Wikipedia…');
+    try {
+      final wiki = await _wikiContext(text);
+      if (wiki != null) {
+        contextBuf.write(wiki.context);
+        cites.add(wiki.cite);
+      }
+    } catch (_) {}
+
+    // 3) Combine: instruct the model to synthesise the sources above with its
+    // own knowledge, citing the sources for specifics.
+    if (contextBuf.isNotEmpty) {
+      systemContent = (StringBuffer(_systemPrompt)
+            ..writeln('\n\nAnswer the question directly and helpfully, drawing '
+                'primarily on your own knowledge. The excerpts below — from the '
+                "user's documents and possibly Wikipedia — MAY be relevant: use "
+                'and cite any that genuinely help, and silently ignore the rest. '
+                'Do NOT say that a source does not mention the topic and do NOT '
+                'describe the excerpts; just answer the question well.')
+            ..write(contextBuf.toString()))
+          .toString();
+      sources = cites;
     }
     assistant.sources = sources;
+    _setThinking('Thinking…');
 
     // Music-library grounding: questions about songs, artists, albums, genres,
     // or lyrics are answered from the on-device music catalog.
@@ -882,13 +902,17 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     final run = _engine.complete(messagesJson, optionsJson: options);
     run.tokens.listen(
       (token) {
-        setState(() => assistant.text += token);
+        setState(() {
+          assistant.text += token;
+          _thinkingStage = ''; // first token arrived — drop the status line
+        });
         _scrollToBottom();
       },
       onError: (e) {
         setState(() {
           assistant.text += '\n[error: $e]';
           _generating = false;
+          _thinkingStage = '';
         });
       },
     );
@@ -899,11 +923,17 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
       if (assistant.text.isEmpty && full != null && full.isNotEmpty) {
         setState(() => assistant.text = full);
       }
-      setState(() => _generating = false);
+      setState(() {
+        _generating = false;
+        _thinkingStage = '';
+      });
       // Speak the reply when Eva was invoked as the device assistant.
       if (_assistMode) _speak(assistant.text);
     } catch (_) {
-      setState(() => _generating = false);
+      setState(() {
+        _generating = false;
+        _thinkingStage = '';
+      });
     }
     if (assistant.text.isNotEmpty) _persistMessage(assistant);
     // The turn is done — let background indexing of the backlog continue.
@@ -919,9 +949,17 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     _engine.stopGeneration();
   }
 
+  /// Updates the "what am I doing" line shown in the placeholder bubble before
+  /// the first token streams.
+  void _setThinking(String stage) {
+    if (mounted) setState(() => _thinkingStage = stage);
+  }
+
   Future<void> _newChat() async {
     if (_generating) return;
     await _engine.reset();
+    // A send may have started during the await above; don't wipe its message.
+    if (_generating) return;
     setState(() {
       _convId = null; // next message starts a fresh stored conversation
       _messages.clear();
@@ -1149,24 +1187,14 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     if (mounted) setState(() {});
   }
 
-  // Looks like a question Wikipedia could answer (loose; the confidence gate on
-  // the matched article title is the real filter).
-  static final RegExp _knowledgeCue = RegExp(
-      r'^(who|what|whats|where|when|why|how|which|whose|tell me|explain|'
-      r'define|describe|give me)\b|\bwikipedia\b',
-      caseSensitive: false);
-  bool _looksLikeKnowledgeQuestion(String t) {
-    final s = t.trim();
-    if (s.length < 5) return false;
-    return s.contains('?') || _knowledgeCue.hasMatch(s.toLowerCase());
-  }
-
   /// Builds Wikipedia grounding for a factual turn: searches the offline ZIM and,
-  /// if a confident article matches, returns its lead text + a citation.
+  /// if a confident article matches, returns its lead text + a citation. Uses a
+  /// multilingual question heuristic (the confidence gate on the matched article
+  /// is the real filter).
   Future<({String context, Citation cite})?> _wikiContext(String text) async {
     if (!_wiki.nativeAvailable) return null;
     if (!await loadWikipediaEnabled()) return null;
-    if (!_looksLikeKnowledgeQuestion(text)) return null;
+    if (!looksLikeQuestion(text)) return null;
     final hits = await _wiki.search(text, k: 3);
     if (hits.isEmpty) return null;
     final top = hits.first;
@@ -1804,21 +1832,35 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                 ),
               ),
               const SizedBox(width: 8),
-              // While generating, the button becomes a Stop control (with a
-              // progress ring around it) so the user can interrupt a slow reply
-              // and type something else; otherwise it sends.
+              // While generating, the button becomes a larger, prominent Stop
+              // control (a clear ring + square) so it's easy to spot and tap to
+              // interrupt a slow reply; otherwise it sends.
               IconButton.filled(
                 tooltip: _generating ? 'Stop' : 'Send',
+                style: _generating
+                    ? IconButton.styleFrom(
+                        minimumSize: const Size(52, 52),
+                        backgroundColor:
+                            Theme.of(context).colorScheme.errorContainer,
+                        foregroundColor:
+                            Theme.of(context).colorScheme.onErrorContainer,
+                      )
+                    : null,
                 onPressed: _generating ? _stopGenerating : _send,
                 icon: _generating
-                    ? const SizedBox(
-                        width: 20,
-                        height: 20,
+                    ? SizedBox(
+                        width: 34,
+                        height: 34,
                         child: Stack(
                           alignment: Alignment.center,
                           children: [
-                            CircularProgressIndicator(strokeWidth: 2),
-                            Icon(Icons.stop, size: 13),
+                            CircularProgressIndicator(
+                              strokeWidth: 2.5,
+                              color: Theme.of(context)
+                                  .colorScheme
+                                  .onErrorContainer,
+                            ),
+                            const Icon(Icons.stop, size: 22),
                           ],
                         ),
                       )
@@ -2287,7 +2329,8 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
               ],
             )
           : m.text.isEmpty
-              ? const Text('…')
+              ? _ThinkingIndicator(
+                  stage: _thinkingStage.isEmpty ? 'Thinking…' : _thinkingStage)
               : Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
@@ -2342,6 +2385,71 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
             ],
           ),
         ),
+      ],
+    );
+  }
+}
+
+/// Animated "working…" placeholder shown while the assistant prepares a reply
+/// (searching documents/Wikipedia, then generating). Three pulsing dots plus a
+/// short stage label, so a slow first token doesn't look frozen.
+class _ThinkingIndicator extends StatefulWidget {
+  const _ThinkingIndicator({required this.stage});
+  final String stage;
+
+  @override
+  State<_ThinkingIndicator> createState() => _ThinkingIndicatorState();
+}
+
+class _ThinkingIndicatorState extends State<_ThinkingIndicator>
+    with SingleTickerProviderStateMixin {
+  late final AnimationController _c = AnimationController(
+    vsync: this,
+    duration: const Duration(milliseconds: 1100),
+  )..repeat();
+
+  @override
+  void dispose() {
+    _c.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    return Row(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        AnimatedBuilder(
+          animation: _c,
+          builder: (context, _) => Row(
+            mainAxisSize: MainAxisSize.min,
+            children: List.generate(3, (i) {
+              final t = (_c.value - i * 0.18) % 1.0;
+              final opacity = 0.3 + 0.7 * (t < 0.5 ? t * 2 : (1 - t) * 2);
+              return Padding(
+                padding: const EdgeInsets.symmetric(horizontal: 1.5),
+                child: Opacity(
+                  opacity: opacity.clamp(0.3, 1.0),
+                  child: Container(
+                    width: 6,
+                    height: 6,
+                    decoration: BoxDecoration(
+                      color: scheme.onSurfaceVariant,
+                      shape: BoxShape.circle,
+                    ),
+                  ),
+                ),
+              );
+            }),
+          ),
+        ),
+        const SizedBox(width: 8),
+        Text(widget.stage,
+            style: TextStyle(
+                fontSize: 12.5,
+                color: scheme.onSurfaceVariant,
+                fontStyle: FontStyle.italic)),
       ],
     );
   }
