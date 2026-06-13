@@ -13,6 +13,7 @@ import 'music_service.dart';
 import 'photo_service.dart';
 import 'photos_screen.dart';
 import 'system_voice.dart';
+import 'wikipedia_service.dart';
 import 'voice_service.dart';
 
 /// Lets the user edit the assistant persona, download/select models, and
@@ -59,6 +60,8 @@ class _SettingsScreenState extends State<SettingsScreen> {
   int _skippedBad = 0;
   int _photoCount = 0;
   int _musicCount = 0;
+  bool _wikiEnabled = true;
+  String _wikiPath = '';
   String? _error;
 
   @override
@@ -86,6 +89,8 @@ class _SettingsScreenState extends State<SettingsScreen> {
     _skippedBad = await _docs.skippedCount();
     _photoCount = await _photos.photoCount();
     _musicCount = await _music.trackCount();
+    _wikiEnabled = await loadWikipediaEnabled();
+    _wikiPath = await loadWikipediaZimPath();
     _documents = await _docs.list();
     _corpusLocation = await _docs.locationLabel();
     await _refreshInstalled();
@@ -766,9 +771,75 @@ class _SettingsScreenState extends State<SettingsScreen> {
               style: TextStyle(fontSize: 12, color: Colors.grey),
             ),
           ),
+          _sectionHeader('Knowledge (Offline Wikipedia)'),
+          SwitchListTile(
+            secondary: const Icon(Icons.public),
+            title: const Text('Use Wikipedia to help answer'),
+            subtitle: Text(_wikiPath.isEmpty
+                ? 'No Wikipedia installed yet.'
+                : 'Installed: ${_wikiPath.split('/').last}'),
+            value: _wikiEnabled,
+            onChanged: (v) async {
+              await saveWikipediaEnabled(v);
+              setState(() => _wikiEnabled = v);
+            },
+          ),
+          ListTile(
+            leading: const Icon(Icons.file_open_outlined),
+            title: const Text('Install a Wikipedia file (.zim)'),
+            subtitle: const Text(
+                'Pick a Kiwix .zim you downloaded, or detect one already on '
+                'this device.'),
+            trailing: TextButton(
+              onPressed: _scanForWiki,
+              child: const Text('Detect'),
+            ),
+            onTap: _pickWikiFile,
+          ),
+          const Padding(
+            padding: EdgeInsets.fromLTRB(16, 4, 16, 16),
+            child: Text(
+              'Download a Kiwix Wikipedia archive at kiwix.org/downloads (Simple '
+              'English, no images ≈ 937 MB is a good fit; full English is 48–115 '
+              'GB). Save it to this phone, then install it above. Eva then '
+              'answers general-knowledge questions from it — fully offline — and '
+              'cites the article, which you can open and read here.',
+              style: TextStyle(fontSize: 12, color: Colors.grey),
+            ),
+          ),
         ],
       ),
     );
+  }
+
+  Future<void> _pickWikiFile() async {
+    final ok = await Permission.storage.request();
+    if (!ok.isGranted && !(await Permission.manageExternalStorage.isGranted)) {
+      // proceed anyway — the picker may still work via the system UI
+    }
+    final res = await FilePicker.platform.pickFiles(type: FileType.any);
+    final path = res?.files.single.path;
+    if (path == null) return;
+    if (!path.toLowerCase().endsWith('.zim')) {
+      await _toast('That is not a .zim file.');
+      return;
+    }
+    await saveWikipediaZimPath(path);
+    if (mounted) setState(() => _wikiPath = path);
+    await _toast('Wikipedia installed — Eva can now use it.');
+  }
+
+  Future<void> _scanForWiki() async {
+    await Permission.storage.request();
+    await _toast('Searching this device for a Wikipedia file…');
+    final found = await WikipediaService.instance.scanForZim();
+    if (found == null) {
+      await _toast('No .zim file found. Download one and put it in Downloads.');
+      return;
+    }
+    await saveWikipediaZimPath(found);
+    if (mounted) setState(() => _wikiPath = found);
+    await _toast('Found ${found.split('/').last}.');
   }
 
   Widget _systemVoiceConfig() {

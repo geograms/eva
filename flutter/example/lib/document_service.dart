@@ -685,6 +685,10 @@ String _resolveHref(String base, String href) {
   return out.join('/');
 }
 
+/// Public wrapper over [_htmlToText] for other modules (e.g. the offline
+/// Wikipedia reader) to convert article HTML to readable text.
+String htmlToPlainText(String html) => _htmlToText(html);
+
 /// Strips HTML/XHTML to readable text (drops script/style, turns block tags
 /// into line breaks). Reused for EPUB chapters.
 String _htmlToText(String html) {

@@ -77,6 +77,9 @@ dependencies:
   audio_metadata_reader: ^1.4.1
   # In-app audio playback for the "play <artist/song>" command.
   just_audio: ^0.10.5
+  # In-app reader for offline Wikipedia (ZIM) articles, served from a loopback
+  # HTTP endpoint backed by libzim.
+  webview_flutter: ^4.7.0
 
 dev_dependencies:
   flutter_test:
@@ -107,6 +110,10 @@ flutter:
   assets:
     - assets/eva.png
     - assets/eva_avatar.png
+    # ICU data for libzim full-text search (offline Wikipedia). Produced by
+    # native_zim/build_zim.sh; committed so Flutter asset bundling always finds
+    # it regardless of native-build ordering.
+    - assets/icu/icudt73l.dat
 
   # An image asset can refer to one or more resolution-specific "variants", see
   # https://flutter.dev/to/resolution-aware-images

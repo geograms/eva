@@ -87,6 +87,22 @@ val ensureNativeFfi by tasks.registering(Exec::class) {
     commandLine("bash", script.absolutePath)
 }
 
+// Build (or restore) the offline-Wikipedia native bits (libzimffi.so + the
+// prebuilt libzim.so + libc++_shared.so + ICU data). build_zim.sh downloads the
+// prebuilt libzim once and caches it; it only recompiles the small shim when its
+// source changes. Same guards as the FFI task above.
+val ensureZimFfi by tasks.registering(Exec::class) {
+    val script = rootProject.file("../native_zim/build_zim.sh")
+    onlyIf {
+        script.exists() &&
+            !System.getProperty("os.name").lowercase().contains("windows")
+    }
+    workingDir = rootProject.projectDir
+    environment("ANDROID_HOME", android.sdkDirectory.absolutePath)
+    commandLine("bash", script.absolutePath)
+}
+
 tasks.named("preBuild") {
     dependsOn(ensureNativeFfi)
+    dependsOn(ensureZimFfi)
 }

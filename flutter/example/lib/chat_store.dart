@@ -25,12 +25,14 @@ class Citation {
     this.page,
     this.docId,
     this.snippet,
+    this.wikiPath,
   });
   final String label;
   final String? path;
   final int? page;
   final String? docId; // corpus id, to load the extracted text
   final String? snippet; // the quoted chunk, to locate/highlight in the text
+  final String? wikiPath; // ZIM entry path, to open in the offline-Wikipedia reader
 
   Map<String, dynamic> toJson() => {
         'label': label,
@@ -38,6 +40,7 @@ class Citation {
         'page': page,
         'docId': docId,
         'snippet': snippet,
+        'wikiPath': wikiPath,
       };
   static Citation fromJson(Map<String, dynamic> j) => Citation(
         label: j['label'] as String,
@@ -45,6 +48,7 @@ class Citation {
         page: (j['page'] as num?)?.toInt(),
         docId: j['docId'] as String?,
         snippet: j['snippet'] as String?,
+        wikiPath: j['wikiPath'] as String?,
       );
 }
 

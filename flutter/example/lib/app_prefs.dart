@@ -170,6 +170,33 @@ Future<void> saveMusicScanDone(bool done) async {
   await prefs.setBool(_kMusicScanDoneKey, done);
 }
 
+// ── Offline Wikipedia (libzim) ───────────────────────────────────────────────
+
+const String _kWikipediaZimPathKey = 'wikipedia_zim_path';
+const String _kWikipediaEnabledKey = 'wikipedia_enabled';
+
+/// Absolute path of the installed Wikipedia `.zim`, or empty if none.
+Future<String> loadWikipediaZimPath() async {
+  final prefs = await SharedPreferences.getInstance();
+  return prefs.getString(_kWikipediaZimPathKey) ?? '';
+}
+
+Future<void> saveWikipediaZimPath(String path) async {
+  final prefs = await SharedPreferences.getInstance();
+  await prefs.setString(_kWikipediaZimPathKey, path);
+}
+
+/// Whether Eva may consult the offline Wikipedia to help answer (default on).
+Future<bool> loadWikipediaEnabled() async {
+  final prefs = await SharedPreferences.getInstance();
+  return prefs.getBool(_kWikipediaEnabledKey) ?? true;
+}
+
+Future<void> saveWikipediaEnabled(bool enabled) async {
+  final prefs = await SharedPreferences.getInstance();
+  await prefs.setBool(_kWikipediaEnabledKey, enabled);
+}
+
 // ── Document corpus location ─────────────────────────────────────────────────
 
 const String _kCorpusLocationKey = 'corpus_location';

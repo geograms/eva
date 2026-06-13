@@ -37,6 +37,8 @@ import 'settings_screen.dart';
 import 'system_voice.dart';
 import 'update_check.dart';
 import 'voice_service.dart';
+import 'wikipedia_reader_screen.dart';
+import 'wikipedia_service.dart';
 
 const Color _seedColor = Color(0xFF2E7D32);
 
@@ -114,6 +116,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
   late final MusicService _music = MusicService(_docs);
   MusicIndexController? _musicIndexer;
   late final MusicPlayer _player = MusicPlayer(_music)..addListener(_onPlayer);
+  final WikipediaService _wiki = WikipediaService.instance;
   bool _listening = false;
   VoiceEngine _voiceEngine = VoiceEngine.fast;
   String _voiceLocale = '';
@@ -607,6 +610,8 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
       _startPhotoIndexing();
       _startMusicIndexing();
       _maybeStartCaptioning();
+      // Adopt a side-loaded Wikipedia .zim if one is present (no-op once set).
+      unawaited(_wiki.discoverAndAdopt().catchError((_) => null));
     } catch (e) {
       setState(() {
         _phase = AppPhase.error;
@@ -700,6 +705,9 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     // Allow sending an image on its own with a sensible default question.
     if (text.isEmpty && imagePath == null) return;
     if (_generating) return;
+    // Claim the turn now so the background vision pass can't restart and swap the
+    // caption model back in while we prepare (its gate checks _generating).
+    _generating = true;
     // If the vision pass swapped in the caption model, restore the chat model.
     await _stopCaptioningForChat();
     await _tts.stop(); // don't talk over the next turn
@@ -747,11 +755,21 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
       }
     }
 
-    // When documents are loaded, retrieve relevant passages and ground the
-    // answer on them (RAG). The retrieved excerpts augment the system prompt.
     var systemContent = _systemPrompt;
     List<Citation>? sources;
-    if (_documents.isNotEmpty) {
+
+    // Offline-Wikipedia grounding takes precedence for clearly factual questions
+    // with a confident article match (the user's own documents are personal and
+    // rarely about general-knowledge topics; the title-overlap gate ensures we
+    // only do this when a Wikipedia article genuinely matches the question).
+    ({String context, Citation cite})? wiki;
+    try {
+      wiki = await _wikiContext(text);
+    } catch (_) {}
+
+    // When documents are loaded (and Wikipedia didn't confidently answer),
+    // retrieve relevant passages and ground the answer on them (RAG).
+    if (wiki == null && _documents.isNotEmpty) {
       try {
         await _ensureRag();
         // Yield the embedder to this turn; query whatever is already indexed
@@ -802,6 +820,10 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
               'your documents.');
         }
       }
+    }
+    if (wiki != null) {
+      systemContent = '$systemContent${wiki.context}';
+      sources = [wiki.cite];
     }
     assistant.sources = sources;
 
@@ -1112,6 +1134,47 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     if (mounted) setState(() {});
   }
 
+  // Looks like a question Wikipedia could answer (loose; the confidence gate on
+  // the matched article title is the real filter).
+  static final RegExp _knowledgeCue = RegExp(
+      r'^(who|what|whats|where|when|why|how|which|whose|tell me|explain|'
+      r'define|describe|give me)\b|\bwikipedia\b',
+      caseSensitive: false);
+  bool _looksLikeKnowledgeQuestion(String t) {
+    final s = t.trim();
+    if (s.length < 5) return false;
+    return s.contains('?') || _knowledgeCue.hasMatch(s.toLowerCase());
+  }
+
+  /// Builds Wikipedia grounding for a factual turn: searches the offline ZIM and,
+  /// if a confident article matches, returns its lead text + a citation.
+  Future<({String context, Citation cite})?> _wikiContext(String text) async {
+    if (!_wiki.nativeAvailable) return null;
+    if (!await loadWikipediaEnabled()) return null;
+    if (!_looksLikeKnowledgeQuestion(text)) return null;
+    final hits = await _wiki.search(text, k: 3);
+    if (hits.isEmpty) return null;
+    final top = hits.first;
+    if (!_wiki.isConfident(text, top)) return null;
+    final lead = await _wiki.leadText(top.path, maxChars: 3500);
+    if (lead.trim().length < 40) return null;
+    final buf = StringBuffer()
+      ..writeln('\n\nWikipedia (offline) — article "${top.title}". Use this '
+          'excerpt to answer; cite Wikipedia; if it does not contain the answer, '
+          'say so.\n')
+      ..writeln(lead);
+    // A clean snippet (strip the FTS <b> markers) lets the reader scroll to the
+    // cited passage.
+    final snippet = top.snippet.replaceAll(RegExp(r'<[^>]+>'), '').trim();
+    return (
+      context: buf.toString(),
+      cite: Citation(
+          label: 'Wikipedia: ${top.title}',
+          wikiPath: top.path,
+          snippet: snippet.isEmpty ? null : snippet),
+    );
+  }
+
   // A leading "play" verb (EN/PT) that starts the in-app player.
   static final RegExp _playVerb = RegExp(
       r'^\s*(play|put\s+on|toca(?:r)?|p[õo]e|ouvir|coloca(?:r)?)\b',
@@ -1325,9 +1388,13 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
   Future<void> _stopCaptioningForChat() async {
     if (!_captioning) return;
     _captionStop = true;
+    // Wait for the caption loop to finish its in-flight inference AND restore the
+    // chat model (it sets _captioning=false only after _restoreChatModel). A
+    // single VLM caption can take several seconds, so allow generous time —
+    // otherwise the turn would run on the vision model and answer with garbage.
     var waited = 0;
-    while (_captioning && waited < 200) {
-      await Future<void>.delayed(const Duration(milliseconds: 60));
+    while (_captioning && waited < 600) {
+      await Future<void>.delayed(const Duration(milliseconds: 100));
       waited++;
     }
   }
@@ -2071,6 +2138,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
   /// extracted-text document (opened in-app at the quote).
   bool _canOpen(Citation c) {
     if (_isPdf(c)) return true;
+    if (c.wikiPath != null) return true; // offline-Wikipedia reader
     return c.docId != null; // text viewer loads the extracted text by id
   }
 
@@ -2080,6 +2148,13 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
   /// Opens a citation at the quoted passage: PDFs in the page viewer, every
   /// other document type in the in-app text viewer (scrolled to the quote).
   Future<void> _openCitation(Citation c) async {
+    if (c.wikiPath != null) {
+      await Navigator.of(context).push(MaterialPageRoute(
+        builder: (_) => WikipediaReaderScreen(
+            title: c.label, articlePath: c.wikiPath!, highlight: c.snippet),
+      ));
+      return;
+    }
     if (_isPdf(c)) {
       if (!File(c.path!).existsSync()) {
         if (mounted) {
@@ -2113,6 +2188,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
 
   /// Icon for a citation chip, by document type.
   IconData _citeIcon(Citation c) {
+    if (c.wikiPath != null) return Icons.public;
     final p = (c.path ?? c.label).toLowerCase();
     if (p.endsWith('.pdf')) return Icons.picture_as_pdf_outlined;
     if (p.endsWith('.epub')) return Icons.menu_book_outlined;
