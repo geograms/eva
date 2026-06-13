@@ -71,6 +71,10 @@ dependencies:
   exif: ^3.3.0
   flutter_image_compress: ^2.4.0
   battery_plus: ^7.0.0
+  # Read embedded audio tags (artist/album/title/genre/year) offline, pure Dart,
+  # for the music library index. Pinned to 1.4.1: 1.4.2+ bumped intl to ^0.20.2,
+  # which conflicts with the syncfusion PDF packages (intl <0.20.0).
+  audio_metadata_reader: ^1.4.1
 
 dev_dependencies:
   flutter_test:

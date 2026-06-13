@@ -153,6 +153,23 @@ Future<void> savePhotoScanDone(bool done) async {
   await prefs.setBool(_kPhotoScanDoneKey, done);
 }
 
+// ── Music library indexing ───────────────────────────────────────────────────
+
+const String _kMusicScanDoneKey = 'music_scan_done';
+
+/// Whether the music library has been fully walked at least once. While false,
+/// the background music indexer auto-resumes on launch until every audio file
+/// is catalogued. Reset to force a fresh pass (e.g. to pick up new tracks).
+Future<bool> loadMusicScanDone() async {
+  final prefs = await SharedPreferences.getInstance();
+  return prefs.getBool(_kMusicScanDoneKey) ?? false;
+}
+
+Future<void> saveMusicScanDone(bool done) async {
+  final prefs = await SharedPreferences.getInstance();
+  await prefs.setBool(_kMusicScanDoneKey, done);
+}
+
 // ── Document corpus location ─────────────────────────────────────────────────
 
 const String _kCorpusLocationKey = 'corpus_location';

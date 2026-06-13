@@ -24,6 +24,7 @@ import 'inference_isolate.dart';
 import 'intro_screen.dart';
 import 'model_catalog.dart';
 import 'model_manager.dart';
+import 'music_service.dart';
 import 'pdf_viewer_screen.dart';
 import 'photo_service.dart';
 import 'photo_store.dart';
@@ -107,6 +108,8 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
   final DocumentService _docs = DocumentService();
   late final PhotoService _photos = PhotoService(_docs);
   PhotoIndexController? _photoIndexer;
+  late final MusicService _music = MusicService(_docs);
+  MusicIndexController? _musicIndexer;
   bool _listening = false;
   VoiceEngine _voiceEngine = VoiceEngine.fast;
   String _voiceLocale = '';
@@ -204,6 +207,9 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     _photoIndexer?.removeListener(_onPhotoProgress);
     _photoIndexer?.pause();
     _photoIndexer?.dispose();
+    _musicIndexer?.removeListener(_onMusicProgress);
+    _musicIndexer?.pause();
+    _musicIndexer?.dispose();
     _captionStop = true;
     _batterySub?.cancel();
     _captionTimer?.cancel();
@@ -593,6 +599,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
       // background, no user action required.
       unawaited(_autoIndexPending());
       _startPhotoIndexing();
+      _startMusicIndexing();
       _maybeStartCaptioning();
     } catch (e) {
       setState(() {
@@ -625,12 +632,14 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     if (_corpusLocation != locBefore) {
       await _indexer?.stop();
       await _photoIndexer?.stop(); // photos.sqlite lives in the pack too
+      await _musicIndexer?.stop(); // music.sqlite lives in the pack too
       _rag?.close();
       _rag = null;
       _embedderReady = false;
     }
     // Pick up a requested re-index of new photos / continue the gallery pass.
     _startPhotoIndexing();
+    _startMusicIndexing();
     // Documents added in Settings (e.g. a bulk phone scan) start indexing in
     // the background right away — the chat stays usable meanwhile.
     if (docsNow.difference(docsBefore).isNotEmpty) {
@@ -775,6 +784,13 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
       }
     }
     assistant.sources = sources;
+
+    // Music-library grounding: questions about songs, artists, albums, genres,
+    // or lyrics are answered from the on-device music catalog.
+    try {
+      final mc = await _musicContext(text);
+      if (mc != null) systemContent = '$systemContent$mc';
+    } catch (_) {}
 
     // In assistant mode, keep the reply in the user's own language (the model
     // otherwise sometimes drifts to another language).
@@ -991,7 +1007,9 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     await savePhotoScanDone(false);
     _startPhotoIndexing();
 
-    // Music: (added with the music indexer) — _music.rescan() here.
+    // Music: re-walk for new audio files and fetch any missing lyrics.
+    _startMusicIndexing();
+    unawaited(_musicIndexer?.rescan() ?? Future.value());
   }
 
   /// Starts (or resumes) the continuous background gallery scan, which keeps
@@ -1000,6 +1018,68 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     _photoIndexer ??= PhotoIndexController(_photos)
       ..addListener(_onPhotoProgress);
     unawaited(_photoIndexer!.ensureRunning());
+  }
+
+  /// Starts (or resumes) the continuous background music scan + lyrics pass.
+  void _startMusicIndexing() {
+    _musicIndexer ??= MusicIndexController(_music)
+      ..addListener(_onMusicProgress);
+    unawaited(_musicIndexer!.ensureRunning());
+  }
+
+  void _onMusicProgress() {
+    if (mounted) setState(() {});
+  }
+
+  // Words that signal the user is asking about their music library.
+  static final RegExp _musicIntent = RegExp(
+      r'\b(music|song|songs|track|tracks|artist|artists|band|bands|album|'
+      r'albums|lyric|lyrics|genre|singer|singers|playlist|tune|tunes)\b',
+      caseSensitive: false);
+
+  /// If [text] is a music question and the catalog has matching tracks, returns
+  /// a system-prompt augmentation grounding the answer on the user's library.
+  /// Returns null otherwise (so non-music turns are untouched).
+  Future<String?> _musicContext(String text) async {
+    if (!_musicIntent.hasMatch(text)) return null;
+    final store = await _music.openStore();
+    try {
+      if (store.count == 0) return null;
+      // Prefer a focused full-text match; fall back to a library sample so
+      // broad questions ("what music do I have?") still get grounded.
+      var tracks = store.search(text, limit: 24);
+      final scoped = tracks.isNotEmpty;
+      if (tracks.isEmpty) tracks = store.query(limit: 24);
+      if (tracks.isEmpty) return null;
+
+      final buf = StringBuffer();
+      buf.writeln(
+          "\n\nThe user's on-device music library includes these tracks. Use "
+          'them to answer questions about their music, artists, albums, genres, '
+          'years, and lyrics. If the answer is not here, say you could not find '
+          'it in their library.\n');
+      var lyricsBudget = 3; // include lyric snippets only for the top few hits
+      for (final t in tracks) {
+        final parts = <String>[
+          if (t.artist.isNotEmpty) 'Artist: ${t.artist}',
+          'Title: ${t.title}',
+          if (t.album.isNotEmpty) 'Album: ${t.album}',
+          if (t.genre.isNotEmpty) 'Genre: ${t.genre}',
+          if (t.year > 0) 'Year: ${t.year}',
+        ];
+        buf.writeln('- ${parts.join(', ')}');
+        final lyr = (t.lyrics ?? '').trim();
+        if (scoped && lyricsBudget > 0 && lyr.isNotEmpty) {
+          final snip = lyr.replaceAll(RegExp(r'\s+'), ' ');
+          buf.writeln('  Lyrics: '
+              '${snip.length > 400 ? '${snip.substring(0, 400)}…' : snip}');
+          lyricsBudget--;
+        }
+      }
+      return buf.toString();
+    } finally {
+      store.close();
+    }
   }
 
   void _onPhotoProgress() {
@@ -1454,6 +1534,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
   PreferredSizeWidget? _indexingBanner() {
     final ix = _indexer;
     final px = _photoIndexer;
+    final mx = _musicIndexer;
     final String? label;
     if (_captioning) {
       label = 'Recognising photo contents — $_captionsDone done…';
@@ -1465,6 +1546,10 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
           : 'Indexing "${ix.currentName}" — ${ix.pending} left';
     } else if (px != null && px.isIndexing) {
       label = 'Indexing photos — ${px.total} done…';
+    } else if (mx != null && mx.isIndexing) {
+      label = 'Indexing music — ${mx.total} done…';
+    } else if (mx != null && mx.isFetchingLyrics) {
+      label = 'Fetching lyrics — ${mx.lyricsFound} found…';
     } else {
       return null;
     }

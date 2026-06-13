@@ -9,6 +9,7 @@ import 'document_service.dart';
 import 'documents_screen.dart';
 import 'model_catalog.dart';
 import 'model_manager.dart';
+import 'music_service.dart';
 import 'photo_service.dart';
 import 'photos_screen.dart';
 import 'system_voice.dart';
@@ -38,6 +39,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
   final SystemVoiceService _systemVoice = SystemVoiceService();
   final DocumentService _docs = DocumentService();
   late final PhotoService _photos = PhotoService(_docs);
+  late final MusicService _music = MusicService(_docs);
   List<DocumentInfo> _documents = const [];
   String _corpusLocation = 'App storage (default)';
   List<ModelSpec> _catalog = const [];
@@ -56,6 +58,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
   String _modelsLocation = '';
   int _skippedBad = 0;
   int _photoCount = 0;
+  int _musicCount = 0;
   String? _error;
 
   @override
@@ -82,6 +85,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
     _modelsLocation = await loadModelsLocation();
     _skippedBad = await _docs.skippedCount();
     _photoCount = await _photos.photoCount();
+    _musicCount = await _music.trackCount();
     _documents = await _docs.list();
     _corpusLocation = await _docs.locationLabel();
     await _refreshInstalled();
@@ -176,6 +180,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
       await _refreshDocs();
       _skippedBad = await _docs.skippedCount();
     _photoCount = await _photos.photoCount();
+    _musicCount = await _music.trackCount();
       if (mounted) setState(() {});
       await _toast('Added ${res.added} documents — ${res.failed} had no text '
           '(remembered, won\'t be re-scanned). Indexing continues in the '
@@ -721,6 +726,43 @@ class _SettingsScreenState extends State<SettingsScreen> {
               'gallery is catalogued. Recognising what is inside each photo (so '
               'you can search by content) is a separate on-device pass added '
               'later.',
+              style: TextStyle(fontSize: 12, color: Colors.grey),
+            ),
+          ),
+          _sectionHeader('Music'),
+          ListTile(
+            leading: const Icon(Icons.library_music_outlined),
+            title: const Text('Music library'),
+            subtitle: Text(_musicCount == 0
+                ? 'Scan your audio files to catalog artists, albums and songs.'
+                : '$_musicCount tracks indexed — ask Eva about your artists'),
+          ),
+          ListTile(
+            leading: const Icon(Icons.audiotrack),
+            title: const Text('Index music library'),
+            subtitle: const Text(
+                'Reads artist, album, title and genre tags from your audio '
+                'files, then fetches lyrics online when available. Runs '
+                'continuously in the background. Tap to (re)scan for new tracks.'),
+            onTap: () async {
+              var ok = await Permission.audio.request();
+              if (!ok.isGranted) ok = await Permission.storage.request();
+              if (!ok.isGranted &&
+                  !(await Permission.manageExternalStorage.isGranted)) {
+                await _toast('Storage access is required to index music.');
+                return;
+              }
+              await saveMusicScanDone(false);
+              await _toast('Music indexing will run in the background — '
+                  'progress shows at the top of the chat.');
+            },
+          ),
+          const Padding(
+            padding: EdgeInsets.fromLTRB(16, 4, 16, 16),
+            child: Text(
+              'Lyrics and genre are fetched from a free online service when the '
+              'phone has internet; everything else is read on-device. This data '
+              'lets Eva answer questions about your artists and songs.',
               style: TextStyle(fontSize: 12, color: Colors.grey),
             ),
           ),

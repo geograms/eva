@@ -6,6 +6,8 @@
     <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE"/>
     <!-- Read the photo gallery to index/browse photos (Android 13+). -->
     <uses-permission android:name="android.permission.READ_MEDIA_IMAGES"/>
+    <!-- Read audio files to index the music library (Android 13+). -->
+    <uses-permission android:name="android.permission.READ_MEDIA_AUDIO"/>
     <!-- Required to capture voice for on-device speech-to-text. -->
     <uses-permission android:name="android.permission.RECORD_AUDIO"/>
     <!-- Held so the system can bind Eva's voice-interaction services and Eva can
