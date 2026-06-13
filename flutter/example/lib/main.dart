@@ -722,6 +722,8 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     });
     _persistMessage(user);
     _scrollToBottom();
+    // Drop the keyboard so the reply has the full screen to be read.
+    FocusManager.instance.primaryFocus?.unfocus();
 
     // Finalize dictation, hush TTS, and restore the chat model if the vision
     // pass had swapped in the caption model.
@@ -861,7 +863,10 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
         return msg;
       }),
     ]);
-    final options = '{"max_tokens":$_maxTokens,"temperature":0.7}';
+    // repetition_penalty well above the 1.1 default: this small model otherwise
+    // loops, repeating whole paragraphs. top_p/top_k add sampling diversity.
+    final options = '{"max_tokens":$_maxTokens,"temperature":0.7,'
+        '"top_p":0.92,"top_k":40,"repetition_penalty":1.3}';
 
     final run = _engine.complete(messagesJson, optionsJson: options);
     run.tokens.listen(
@@ -894,6 +899,13 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     _indexer?.resume();
     _maybeStartCaptioning(); // resume the vision pass if idle + charging
     _scrollToBottom();
+  }
+
+  /// Interrupts a slow reply. The in-flight completion returns whatever it has
+  /// so far and flips _generating off, freeing the input for the next message.
+  void _stopGenerating() {
+    if (!_generating) return;
+    _engine.stopGeneration();
   }
 
   Future<void> _newChat() async {
@@ -1820,13 +1832,23 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                 ),
               ),
               const SizedBox(width: 8),
+              // While generating, the button becomes a Stop control (with a
+              // progress ring around it) so the user can interrupt a slow reply
+              // and type something else; otherwise it sends.
               IconButton.filled(
-                onPressed: _generating ? null : _send,
+                tooltip: _generating ? 'Stop' : 'Send',
+                onPressed: _generating ? _stopGenerating : _send,
                 icon: _generating
                     ? const SizedBox(
                         width: 20,
                         height: 20,
-                        child: CircularProgressIndicator(strokeWidth: 2),
+                        child: Stack(
+                          alignment: Alignment.center,
+                          children: [
+                            CircularProgressIndicator(strokeWidth: 2),
+                            Icon(Icons.stop, size: 13),
+                          ],
+                        ),
                       )
                     : const Icon(Icons.send),
               ),

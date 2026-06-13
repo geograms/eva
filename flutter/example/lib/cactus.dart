@@ -643,6 +643,15 @@ void cactusStop(CactusModelT model) {
   _cactusStop(model);
 }
 
+/// Signals stop using the model handle's raw address. Safe to call from another
+/// isolate than the one running generation: `cactus_stop` only flips an atomic
+/// flag the native decode loop checks between tokens. [address] is the
+/// `Pointer.address` of the model handle (0 = no-op).
+void cactusStopAddress(int address) {
+  if (address == 0) return;
+  _cactusStop(Pointer<Void>.fromAddress(address));
+}
+
 /// Runs chat completion. Returns the assistant response.
 String cactusComplete(
   CactusModelT model,

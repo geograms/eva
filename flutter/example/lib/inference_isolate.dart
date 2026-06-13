@@ -26,8 +26,14 @@ class InferenceEngine {
   Future<void> _embedGate = Future<void>.value();
   StreamController<String>? _tokenController;
   Completer<Map<String, dynamic>>? _doneCompleter;
+  // Raw address of the loaded chat model handle, so generation can be stopped
+  // from this (main) isolate while the worker is blocked inside cactus_complete.
+  int _modelAddress = 0;
 
   bool get isBusy => _tokenController != null;
+
+  /// Interrupts an in-flight chat completion (the partial answer is kept).
+  void stopGeneration() => cactus.cactusStopAddress(_modelAddress);
 
   Future<void> start() async {
     _fromWorker.listen(_onMessage);
@@ -44,6 +50,7 @@ class InferenceEngine {
     final m = msg as Map;
     switch (m['type'] as String) {
       case 'init_done':
+        _modelAddress = (m['handle'] as int?) ?? 0;
         _initCompleter?.complete();
         _initCompleter = null;
         break;
@@ -184,7 +191,7 @@ void _workerMain(SendPort toMain) {
             false,
             m['contextSize'] as int,
           );
-          toMain.send({'type': 'init_done'});
+          toMain.send({'type': 'init_done', 'handle': model!.address});
           break;
         case 'reset':
           final handle = model;
