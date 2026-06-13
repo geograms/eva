@@ -886,8 +886,9 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
 
   // ── Documents (RAG) ────────────────────────────────────────────────────────
 
-  /// Lets the user attach a PDF/txt/md document, extract its text, and (re)build
-  /// the retrieval index so Eva can answer questions about it.
+  /// Lets the user attach a document (PDF, Word/PowerPoint/Excel, EPUB, txt/md),
+  /// extract its text, and (re)build the retrieval index so Eva can answer
+  /// questions about it.
   Future<void> _attachDocument() async {
     if (_docBusy || _generating) return;
     final result = await FilePicker.platform.pickFiles(

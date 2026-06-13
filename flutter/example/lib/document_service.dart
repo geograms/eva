@@ -3,6 +3,7 @@ import 'dart:convert';
 import 'dart:io';
 import 'dart:isolate';
 
+import 'package:archive/archive.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:syncfusion_flutter_pdf/pdf.dart';
 
@@ -58,7 +59,14 @@ class BulkImportResult {
 /// BM25) index over that directory. A small `_docs.json` tracks the original
 /// filenames so the UI can list and remove documents.
 class DocumentService {
-  static const List<String> supportedExtensions = ['pdf', 'txt', 'md', 'text'];
+  static const List<String> supportedExtensions = [
+    'pdf', 'txt', 'md', 'text',
+    // Office Open XML + e-books: ZIP+XML containers, extracted in pure Dart.
+    'docx', 'pptx', 'xlsx', 'epub',
+  ];
+
+  /// Extensions handled by unzipping (Office Open XML + EPUB).
+  static const Set<String> _zipDocExtensions = {'docx', 'pptx', 'xlsx', 'epub'};
 
   /// Pack schema version (bump when the on-disk layout changes).
   static const int schemaVersion = 1;
@@ -221,19 +229,26 @@ class DocumentService {
     await _writeManifest(docs.length);
   }
 
-  /// Extracts text from [filePath] (PDF/txt/md), stores it in the corpus, and
-  /// records it. Returns the new document's info. Throws if no text could be
-  /// extracted (e.g. a scanned/image-only PDF).
+  /// Extracts text from [filePath] (PDF, docx/pptx/xlsx, epub, txt/md), stores
+  /// it in the corpus, and records it. Returns the new document's info. Throws
+  /// if no text could be extracted (e.g. a scanned/image-only PDF).
   Future<DocumentInfo> addFile(String filePath,
       {Duration extractTimeout = const Duration(seconds: 45)}) async {
     final name = filePath.split(Platform.pathSeparator).last;
     final lower = name.toLowerCase();
+    final dot = lower.lastIndexOf('.');
+    final ext = dot < 0 ? '' : lower.substring(dot + 1);
     final String text;
-    if (lower.endsWith('.pdf')) {
+    if (ext == 'pdf') {
       final bytes = await File(filePath).readAsBytes();
       // Time-bounded + killable: a single pathological/huge PDF must not stall
       // a bulk import. On timeout the worker isolate is terminated.
       text = await _extractPdfBounded(bytes, extractTimeout);
+    } else if (_zipDocExtensions.contains(ext)) {
+      final bytes = await File(filePath).readAsBytes();
+      // docx/pptx/xlsx/epub are ZIP+XML — unzip + strip tags in a bounded
+      // isolate so a huge/corrupt archive can't stall the import.
+      text = await _extractZipDocBounded(bytes, ext, extractTimeout);
     } else {
       text = await File(filePath).readAsString();
     }
@@ -472,3 +487,240 @@ String _extractPdfText(List<int> bytes) {
   }
   return buf.toString();
 }
+
+// ── Office Open XML + EPUB extraction (pure Dart, via `archive`) ──────────────
+// These formats are all ZIP containers of XML/XHTML. We unzip and strip tags;
+// for WordprocessingML/PresentationML only the text elements (<w:t>, <a:t>)
+// carry character data, so stripping all tags yields just the prose. Runs in a
+// bounded isolate (mirrors the PDF path) so a huge/corrupt archive can't hang.
+
+Future<String> _extractZipDocBounded(
+    List<int> bytes, String kind, Duration limit) async {
+  final port = ReceivePort();
+  final iso =
+      await Isolate.spawn(_zipDocIsolateEntry, [port.sendPort, bytes, kind]);
+  try {
+    final result = await port.first.timeout(limit);
+    return result is String ? result : '';
+  } on TimeoutException {
+    iso.kill(priority: Isolate.immediate);
+    return '';
+  } catch (_) {
+    iso.kill(priority: Isolate.immediate);
+    return '';
+  } finally {
+    port.close();
+  }
+}
+
+void _zipDocIsolateEntry(List<dynamic> args) {
+  final SendPort send = args[0] as SendPort;
+  final List<int> bytes = (args[1] as List).cast<int>();
+  final String kind = args[2] as String;
+  try {
+    send.send(_extractZipDocText(bytes, kind));
+  } catch (_) {
+    send.send('');
+  }
+}
+
+String _extractZipDocText(List<int> bytes, String kind) {
+  final archive = ZipDecoder().decodeBytes(bytes);
+  switch (kind) {
+    case 'docx':
+      return _extractDocx(archive);
+    case 'pptx':
+      return _extractPptx(archive);
+    case 'xlsx':
+      return _extractXlsx(archive);
+    case 'epub':
+      return _extractEpub(archive);
+  }
+  return '';
+}
+
+/// Reads a zip entry by exact name as UTF-8 text, or null if absent.
+String? _zipEntry(Archive a, String name) {
+  for (final f in a.files) {
+    if (f.isFile && f.name == name) {
+      return utf8.decode((f.content as List<int>), allowMalformed: true);
+    }
+  }
+  return null;
+}
+
+String _extractDocx(Archive a) {
+  final xml = _zipEntry(a, 'word/document.xml');
+  if (xml == null) return '';
+  // Convert structural tags to whitespace, then drop the rest. Non-text
+  // WordprocessingML elements have no character data, so what remains is prose.
+  var s = xml
+      .replaceAll(RegExp(r'<w:tab\b[^>]*/?>'), '\t')
+      .replaceAll(RegExp(r'<w:br\b[^>]*/?>'), '\n')
+      .replaceAll('</w:p>', '\n');
+  s = s.replaceAll(RegExp(r'<[^>]+>'), '');
+  return _collapseBlankLines(_decodeXmlEntities(s)).trim();
+}
+
+String _extractPptx(Archive a) {
+  final slides = a.files
+      .where((f) =>
+          f.isFile && RegExp(r'^ppt/slides/slide\d+\.xml$').hasMatch(f.name))
+      .toList()
+    ..sort((x, y) => _slideNum(x.name).compareTo(_slideNum(y.name)));
+  final buf = StringBuffer();
+  var n = 0;
+  for (final f in slides) {
+    final xml = utf8.decode((f.content as List<int>), allowMalformed: true);
+    var s = xml.replaceAll('</a:p>', '\n').replaceAll(RegExp(r'<[^>]+>'), '');
+    s = _collapseBlankLines(_decodeXmlEntities(s)).trim();
+    if (s.isNotEmpty) {
+      buf.writeln('\n[Slide ${++n}]');
+      buf.writeln(s);
+    }
+  }
+  return buf.toString().trim();
+}
+
+int _slideNum(String name) {
+  final m = RegExp(r'slide(\d+)\.xml$').firstMatch(name);
+  return m == null ? 0 : int.parse(m.group(1)!);
+}
+
+String _extractXlsx(Archive a) {
+  // Most spreadsheet text lives in the shared-string table; extracting it gives
+  // every distinct text value (enough for keyword/semantic search).
+  final buf = StringBuffer();
+  final ss = _zipEntry(a, 'xl/sharedStrings.xml');
+  if (ss != null) {
+    for (final m in RegExp(r'<t\b[^>]*>(.*?)</t>', dotAll: true).allMatches(ss)) {
+      final t = _decodeXmlEntities(m.group(1)!).trim();
+      if (t.isNotEmpty) buf.writeln(t);
+    }
+  }
+  // Inline strings (cells with t="inlineStr") live in the sheets themselves.
+  for (final f in a.files) {
+    if (!f.isFile || !RegExp(r'^xl/worksheets/sheet\d+\.xml$').hasMatch(f.name)) {
+      continue;
+    }
+    final xml = utf8.decode((f.content as List<int>), allowMalformed: true);
+    for (final m
+        in RegExp(r'<is>(.*?)</is>', dotAll: true).allMatches(xml)) {
+      final t = _decodeXmlEntities(
+              m.group(1)!.replaceAll(RegExp(r'<[^>]+>'), ''))
+          .trim();
+      if (t.isNotEmpty) buf.writeln(t);
+    }
+  }
+  return buf.toString().trim();
+}
+
+String _extractEpub(Archive a) {
+  // Read content documents in spine (reading) order when we can resolve it.
+  final hrefs = <String>[];
+  final container = _zipEntry(a, 'META-INF/container.xml');
+  final opfPath =
+      container == null ? null : RegExp(r'full-path="([^"]+)"').firstMatch(container)?.group(1);
+  final opf = opfPath == null ? null : _zipEntry(a, opfPath);
+  if (opf != null) {
+    final base =
+        opfPath!.contains('/') ? opfPath.substring(0, opfPath.lastIndexOf('/') + 1) : '';
+    final manifest = <String, String>{}; // id -> resolved href
+    for (final m in RegExp(r'<item\b[^>]*>').allMatches(opf)) {
+      final tag = m.group(0)!;
+      final id = RegExp(r'\bid="([^"]+)"').firstMatch(tag)?.group(1);
+      final href = RegExp(r'\bhref="([^"]+)"').firstMatch(tag)?.group(1);
+      final type = RegExp(r'\bmedia-type="([^"]+)"').firstMatch(tag)?.group(1) ?? '';
+      if (id == null || href == null) continue;
+      if (type.contains('html') ||
+          RegExp(r'\.x?html?$', caseSensitive: false).hasMatch(href)) {
+        manifest[id] = _resolveHref(base, href);
+      }
+    }
+    for (final m in RegExp(r'<itemref\b[^>]*>').allMatches(opf)) {
+      final idref = RegExp(r'\bidref="([^"]+)"').firstMatch(m.group(0)!)?.group(1);
+      final href = idref == null ? null : manifest[idref];
+      if (href != null) hrefs.add(href);
+    }
+  }
+  final buf = StringBuffer();
+  for (final href in hrefs) {
+    final xhtml = _zipEntry(a, href);
+    if (xhtml != null) buf.writeln(_htmlToText(xhtml));
+  }
+  // Fallback: spine missing/unresolvable — concatenate every (x)html entry.
+  if (buf.toString().trim().length < 8) {
+    final files = a.files
+        .where((f) =>
+            f.isFile && RegExp(r'\.x?html?$', caseSensitive: false).hasMatch(f.name))
+        .toList()
+      ..sort((x, y) => x.name.compareTo(y.name));
+    for (final f in files) {
+      buf.writeln(
+          _htmlToText(utf8.decode((f.content as List<int>), allowMalformed: true)));
+    }
+  }
+  return buf.toString().trim();
+}
+
+/// Resolves a manifest href relative to the OPF directory, decoding percent
+/// escapes and collapsing `.`/`..` segments.
+String _resolveHref(String base, String href) {
+  String decoded;
+  try {
+    decoded = Uri.decodeFull(href);
+  } catch (_) {
+    decoded = href;
+  }
+  if (decoded.startsWith('/')) return decoded.substring(1);
+  final out = <String>[];
+  for (final p in '$base$decoded'.split('/')) {
+    if (p.isEmpty || p == '.') continue;
+    if (p == '..') {
+      if (out.isNotEmpty) out.removeLast();
+      continue;
+    }
+    out.add(p);
+  }
+  return out.join('/');
+}
+
+/// Strips HTML/XHTML to readable text (drops script/style, turns block tags
+/// into line breaks). Reused for EPUB chapters.
+String _htmlToText(String html) {
+  var s = html.replaceAll(
+      RegExp(r'<(script|style)\b[^>]*>.*?</\1>',
+          dotAll: true, caseSensitive: false),
+      ' ');
+  s = s.replaceAll(
+      RegExp(r'<\s*/?\s*(p|div|br|h[1-6]|li|tr|section|article|blockquote|pre)\b[^>]*>',
+          caseSensitive: false),
+      '\n');
+  s = s.replaceAll(RegExp(r'<[^>]+>'), '');
+  return _collapseBlankLines(_decodeXmlEntities(s)).trim();
+}
+
+/// Decodes the XML/HTML entities that survive tag stripping.
+String _decodeXmlEntities(String s) {
+  var r = s
+      .replaceAll('&lt;', '<')
+      .replaceAll('&gt;', '>')
+      .replaceAll('&quot;', '"')
+      .replaceAll('&apos;', "'")
+      .replaceAll('&nbsp;', ' ');
+  r = r.replaceAllMapped(RegExp(r'&#x([0-9a-fA-F]+);'), (m) {
+    final c = int.tryParse(m.group(1)!, radix: 16);
+    return c == null ? m.group(0)! : String.fromCharCode(c);
+  });
+  r = r.replaceAllMapped(RegExp(r'&#(\d+);'), (m) {
+    final c = int.tryParse(m.group(1)!);
+    return c == null ? m.group(0)! : String.fromCharCode(c);
+  });
+  return r.replaceAll('&amp;', '&'); // last, so we don't double-decode
+}
+
+/// Normalises whitespace: CRLF→LF, trims trailing spaces, caps blank runs.
+String _collapseBlankLines(String s) => s
+    .replaceAll('\r\n', '\n')
+    .replaceAll(RegExp(r'[ \t]+\n'), '\n')
+    .replaceAll(RegExp(r'\n{3,}'), '\n\n');
