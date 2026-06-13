@@ -14,7 +14,50 @@ import 'music_store.dart';
 class MusicScanResult {
   int added = 0;
   int skippedExisting = 0;
+  int skippedNonMusic = 0;
   int failed = 0;
+}
+
+/// Heuristic: does this audio file look like an actual song (vs a voice note,
+/// ringtone, notification sound, call recording, app SFX…)? Used both to skip
+/// junk during the scan and to purge it from an already-built catalog.
+///
+/// Kept generous so real music is never dropped: anything with an artist or
+/// album tag is always treated as music. Untagged files are judged by where
+/// they live, their length, and messaging/recorder filename patterns.
+bool isLikelyMusic({
+  required String path,
+  required String title,
+  required String artist,
+  required String album,
+  required int durationMs,
+}) {
+  final p = path.toLowerCase();
+  // Locations that never hold songs.
+  const badDirs = [
+    'ringtone', 'notification', '/alarm', 'voice', 'recording', 'recordings',
+    '/call', 'whatsapp', 'telegram', 'signal', 'viber', 'voicemail',
+    '/sounds/', '/sound/', '/ui/', 'grav', // pt: gravações
+  ];
+  if (badDirs.any(p.contains)) return false;
+
+  // A real tag is the strongest signal of music — keep it.
+  if (artist.trim().isNotEmpty || album.trim().isNotEmpty) return true;
+
+  // Untagged: judge by filename + length.
+  final n = title.trim().toLowerCase();
+  final looksLikeClip =
+      RegExp(r'\+?\d[\d\s\-]{5,}').hasMatch(n) || // phone-number-ish
+          RegExp(r'^(aud[-_]|ptt[-_]|rec[-_ ]?\d|vn[-_]|voice|audio[-_ ]?\d|'
+                  r'wa\d|msg|sig[-_]|gravac|gravação)')
+              .hasMatch(n) ||
+          RegExp(r'^\d{8}[-_ ]').hasMatch(n); // 20230102-...
+  if (looksLikeClip) return false;
+
+  // Untagged + short → almost certainly a clip; untagged + long → keep (could
+  // be an untagged rip). Unknown duration (0) is given the benefit of the doubt.
+  if (durationMs > 0 && durationMs < 60000) return false;
+  return true;
 }
 
 /// Indexes the device's audio files into a [MusicStore]: walks music files,
@@ -54,6 +97,24 @@ class MusicService {
     final store = await openStore();
     try {
       return store.count;
+    } finally {
+      store.close();
+    }
+  }
+
+  /// One-time cleanup: removes already-indexed tracks that the music heuristic
+  /// now rejects (e.g. voice notes catalogued before this filter existed).
+  /// Returns the number purged.
+  Future<int> purgeNonMusic() async {
+    final store = await openStore();
+    try {
+      return store.removeNonMusic((t) => isLikelyMusic(
+            path: t.path,
+            title: t.title,
+            artist: t.artist,
+            album: t.album,
+            durationMs: t.durationMs,
+          ));
     } finally {
       store.close();
     }
@@ -128,7 +189,22 @@ class MusicService {
             continue;
           }
           try {
-            store.upsert(_indexOne(e));
+            final info = _indexOne(e);
+            if (!isLikelyMusic(
+              path: info.path,
+              title: info.title,
+              artist: info.artist,
+              album: info.album,
+              durationMs: info.durationMs,
+            )) {
+              // Not a song (voice note, ringtone…). Remember it so we don't
+              // re-read its tags on every rescan.
+              res.skippedNonMusic++;
+              skip.add(e.path);
+              onProgress?.call(scanned, res);
+              continue;
+            }
+            store.upsert(info);
             indexed.add(e.path);
             res.added++;
           } catch (_) {
@@ -279,6 +355,7 @@ class MusicIndexController extends ChangeNotifier {
   int _total = 0;
   int _lyricsFound = 0;
   bool _fetchingLyrics = false;
+  bool _purgedOnce = false;
   Completer<void>? _idle;
 
   bool get isIndexing => _running && !_paused;
@@ -292,6 +369,14 @@ class MusicIndexController extends ChangeNotifier {
   /// keeps fetching lyrics in the background. Safe to call repeatedly.
   Future<void> ensureRunning() async {
     if (_running || _paused) return;
+    // One-time cleanup of non-music catalogued before the filter existed
+    // (voice notes, ringtones…), regardless of whether the scan is "done".
+    if (!_purgedOnce) {
+      _purgedOnce = true;
+      try {
+        if (await _music.purgeNonMusic() > 0) notifyListeners();
+      } catch (_) {}
+    }
     if (await loadMusicScanDone()) {
       // Catalog is complete; still try to fill in any missing lyrics.
       unawaited(_runLyrics());

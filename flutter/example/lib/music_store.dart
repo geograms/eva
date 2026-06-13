@@ -289,6 +289,22 @@ class MusicStore {
         playCount: (r['play_count'] as int?) ?? 0,
       );
 
+  /// Deletes catalogued tracks for which [keep] returns false (used to purge
+  /// non-music that was indexed before the filter existed). Returns the count
+  /// removed.
+  int removeNonMusic(bool Function(TrackInfo t) keep) {
+    final rs = _db.select('SELECT * FROM tracks;');
+    var removed = 0;
+    for (final r in rs) {
+      final t = _row(r);
+      if (keep(t)) continue;
+      _db.execute('DELETE FROM tracks WHERE id=?;', [t.id]);
+      _db.execute('DELETE FROM tracks_fts WHERE rowid=?;', [t.id]);
+      removed++;
+    }
+    return removed;
+  }
+
   void removeMissing(bool Function(String path) exists) {
     final rs = _db.select('SELECT id, path FROM tracks;');
     for (final r in rs) {
