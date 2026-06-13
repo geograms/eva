@@ -145,16 +145,22 @@ class _ChatScreenState extends State<ChatScreen> {
   // Photo content-understanding (vision) pass — runs only while charging+idle.
   final Battery _battery = Battery();
   StreamSubscription<BatteryState>? _batterySub;
+  Timer? _captionTimer;
   bool _charging = false;
   bool _captioning = false; // VLM loaded, captioning photos
   bool _captionStop = false;
   String? _modelBeforeCaption;
   int _captionsDone = 0;
   static const String _kCaptionModelId = 'lfm2-vl-450m-int4';
+  // Terse prompt + small token cap keep each caption fast (the dominant cost is
+  // generation length). Newest photos are captioned first, up to a cap; older
+  // ones are filled in on demand when a query asks for that time range.
   static const String _captionPrompt =
-      'Describe this image in one short sentence, then list 3-6 search keywords '
-      '(objects, scene, colours, and any visible text). If it is a meme or a '
-      'screenshot, say so.';
+      'In under 15 words: main subject, scene, any visible text, and whether it '
+      'is a meme or screenshot.';
+  static const int _kCaptionRecentCap = 2000;
+  DateTime? _captionPriorityFrom; // a queried range to caption on demand
+  DateTime? _captionPriorityTo;
 
   /// Whether the active model can see images (exposes the attach button).
   bool get _visionActive => modelById(_catalog, _activeModelId).isVision;
@@ -190,6 +196,7 @@ class _ChatScreenState extends State<ChatScreen> {
     _photoIndexer?.dispose();
     _captionStop = true;
     _batterySub?.cancel();
+    _captionTimer?.cancel();
     _rag?.close();
     _chats?.close();
     super.dispose();
@@ -953,23 +960,27 @@ class _ChatScreenState extends State<ChatScreen> {
 
   // ── Photo content understanding (vision caption pass) ───────────────────────
 
+  /// On external power = charging, full, or plugged-in-but-full (not draining).
+  bool _onPower(BatteryState s) =>
+      s == BatteryState.charging ||
+      s == BatteryState.full ||
+      s == BatteryState.connectedNotCharging;
+
   /// Watches the charger so captioning only runs while plugged in (gentle on
   /// battery, per the chosen policy).
   Future<void> _setupCaptioning() async {
     try {
-      final s = await _battery.batteryState;
-      _charging = s == BatteryState.charging || s == BatteryState.full;
+      _charging = _onPower(await _battery.batteryState);
       if (_charging) _maybeStartCaptioning(); // already plugged in at launch
     } catch (_) {}
     _batterySub = _battery.onBatteryStateChanged.listen((s) {
-      final charging = s == BatteryState.charging || s == BatteryState.full;
-      if (charging == _charging) return;
-      _charging = charging;
-      if (charging) {
-        _maybeStartCaptioning();
-      } else {
-        _captionStop = true; // unplugged — yield the engine back
-      }
+      _charging = _onPower(s);
+      if (!_charging) _captionStop = true; // unplugged — yield the engine back
+    });
+    // Reliable re-check: triggers (metadata/doc notifications, charge events)
+    // can be sparse during a long single embed, so poll the gate periodically.
+    _captionTimer = Timer.periodic(const Duration(seconds: 15), (_) {
+      if (_charging) _maybeStartCaptioning();
     });
   }
 
@@ -1015,11 +1026,30 @@ class _ChatScreenState extends State<ChatScreen> {
         final store = await _photos.openStore();
         List<PhotoInfo> batch;
         try {
-          batch = store.pendingCaption(limit: 8);
+          // On-demand: caption a queried range first; otherwise caption the
+          // newest photos up to the cap (older ones wait for a query).
+          if (_captionPriorityFrom != null || _captionPriorityTo != null) {
+            batch = store.pendingCaption(
+                from: _captionPriorityFrom, to: _captionPriorityTo, limit: 8);
+            if (batch.isEmpty) {
+              _captionPriorityFrom = null;
+              _captionPriorityTo = null;
+            }
+          } else if (_captionsDone >= _kCaptionRecentCap) {
+            batch = const []; // captioned enough newest photos this session
+          } else {
+            batch = store.pendingCaption(limit: 8);
+          }
         } finally {
           store.close();
         }
-        if (batch.isEmpty) break;
+        if (batch.isEmpty) {
+          // Priority range just cleared — loop once more for general backlog.
+          if (_captionPriorityFrom != null || _captionPriorityTo != null) {
+            continue;
+          }
+          break;
+        }
         for (final p in batch) {
           if (_captionStop || _charging == false || _generating) break;
           final cap = await _captionOne(p, tmp);
@@ -1053,7 +1083,7 @@ class _ChatScreenState extends State<ChatScreen> {
         {'role': 'user', 'content': _captionPrompt, 'images': [tmp.path]}
       ]);
       final run = _engine.complete(messages,
-          optionsJson: '{"max_tokens":80,"temperature":0.3}');
+          optionsJson: '{"max_tokens":32,"temperature":0.2}');
       final buf = StringBuffer();
       run.tokens.listen(buf.write, onError: (_) {});
       final stats = await run.stats;
@@ -1680,6 +1710,13 @@ class _ChatScreenState extends State<ChatScreen> {
           ? store.searchCaptions(q.content,
               from: q.from, to: q.to, type: q.type, limit: 24)
           : store.query(from: q.from, to: q.to, type: q.type, limit: 24);
+      // On-demand: if this is a content query and photos in the asked-about
+      // range still lack captions, prioritise captioning that range next.
+      if (byContent && store.hasUncaptionedInRange(q.from, q.to)) {
+        _captionPriorityFrom = q.from;
+        _captionPriorityTo = q.to;
+        _maybeStartCaptioning();
+      }
       final kind = q.type == PhotoType.screenshot
           ? 'screenshots'
           : q.type == PhotoType.meme

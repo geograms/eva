@@ -72,14 +72,24 @@ class PhotoStore {
     return PhotoStore._(db);
   }
 
-  /// Photos still needing a vision caption, oldest-first (so newest get done
-  /// last? no — newest first feels more useful), capped at [limit].
-  List<PhotoInfo> pendingCaption({int limit = 200}) {
+  /// Photos still needing a vision caption, newest-first, optionally scoped to a
+  /// time range (for on-demand captioning of a queried period).
+  List<PhotoInfo> pendingCaption({DateTime? from, DateTime? to, int limit = 8}) {
+    final where = <String>['captioned = 0'];
+    final args = <Object?>[];
+    if (from != null) {
+      where.add('taken_at >= ?');
+      args.add(from.millisecondsSinceEpoch);
+    }
+    if (to != null) {
+      where.add('taken_at <= ?');
+      args.add(to.millisecondsSinceEpoch);
+    }
     final rs = _db.select(
       'SELECT id, path, taken_at, width, height, size, bucket, type, '
-      'thumb, caption FROM photos WHERE captioned = 0 ORDER BY taken_at DESC '
-      'LIMIT ?;',
-      [limit],
+      'thumb, caption FROM photos WHERE ${where.join(' AND ')} '
+      'ORDER BY taken_at DESC LIMIT ?;',
+      [...args, limit],
     );
     return [for (final r in rs) _row(r)];
   }
@@ -87,6 +97,24 @@ class PhotoStore {
   int get captionPendingCount =>
       _db.select('SELECT COUNT(*) AS n FROM photos WHERE captioned=0;')
           .first['n'] as int;
+
+  /// Whether any photo in [from]..[to] still lacks a caption.
+  bool hasUncaptionedInRange(DateTime? from, DateTime? to) {
+    final where = <String>['captioned = 0'];
+    final args = <Object?>[];
+    if (from != null) {
+      where.add('taken_at >= ?');
+      args.add(from.millisecondsSinceEpoch);
+    }
+    if (to != null) {
+      where.add('taken_at <= ?');
+      args.add(to.millisecondsSinceEpoch);
+    }
+    final n = _db.select(
+        'SELECT COUNT(*) AS n FROM photos WHERE ${where.join(' AND ')} LIMIT 1;',
+        args).first['n'] as int;
+    return n > 0;
+  }
   int get captionedCount =>
       _db.select('SELECT COUNT(*) AS n FROM photos WHERE captioned=1;')
           .first['n'] as int;
