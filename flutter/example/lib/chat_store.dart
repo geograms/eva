@@ -59,11 +59,13 @@ class StoredMessage {
     required this.text,
     this.imagePath,
     this.sources,
+    this.elapsedMs,
   });
   final String role;
   final String text;
   final String? imagePath;
   final List<Citation>? sources;
+  final int? elapsedMs; // generation time for assistant turns
 }
 
 /// SQLite-backed chat history (conversations + messages) so chats survive app
@@ -92,9 +94,16 @@ class ChatStore {
         text TEXT NOT NULL,
         image_path TEXT,
         sources TEXT,
-        created_at TEXT NOT NULL
+        created_at TEXT NOT NULL,
+        elapsed_ms INTEGER
       );
     ''');
+    // Migrate older databases created before answer-timing was tracked.
+    try {
+      db.execute('ALTER TABLE messages ADD COLUMN elapsed_ms INTEGER;');
+    } catch (_) {
+      // column already exists
+    }
     db.execute(
         'CREATE INDEX IF NOT EXISTS idx_messages_conv ON messages(conv_id);');
     return ChatStore._(db);
@@ -141,8 +150,8 @@ class ChatStore {
   void addMessage(int convId, StoredMessage m) {
     final now = DateTime.now().toIso8601String();
     _db.execute(
-      'INSERT INTO messages(conv_id, role, text, image_path, sources, created_at) '
-      'VALUES(?,?,?,?,?,?);',
+      'INSERT INTO messages(conv_id, role, text, image_path, sources, '
+      'created_at, elapsed_ms) VALUES(?,?,?,?,?,?,?);',
       [
         convId,
         m.role,
@@ -152,6 +161,7 @@ class ChatStore {
             ? null
             : jsonEncode([for (final c in m.sources!) c.toJson()]),
         now,
+        m.elapsedMs,
       ],
     );
     _db.execute(
@@ -160,7 +170,7 @@ class ChatStore {
 
   List<StoredMessage> messages(int convId) {
     final rs = _db.select(
-      'SELECT role, text, image_path, sources FROM messages '
+      'SELECT role, text, image_path, sources, elapsed_ms FROM messages '
       'WHERE conv_id=? ORDER BY id;',
       [convId],
     );
@@ -170,6 +180,7 @@ class ChatStore {
           role: r['role'] as String,
           text: r['text'] as String,
           imagePath: r['image_path'] as String?,
+          elapsedMs: r['elapsed_ms'] as int?,
           sources: r['sources'] == null
               ? null
               : [

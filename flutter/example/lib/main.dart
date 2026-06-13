@@ -88,6 +88,8 @@ class ChatMessage {
   List<Citation>? sources;
   // Photo-gallery results to show as a thumbnail grid (not persisted).
   List<PhotoInfo>? photos;
+  // How long this answer took to produce (assistant turns), shown under it.
+  Duration? elapsed;
 }
 
 class ChatScreen extends StatefulWidget {
@@ -271,7 +273,8 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                 ? m.imagePath
                 : null,
             sources: m.sources,
-          )));
+          )..elapsed =
+              m.elapsedMs != null ? Duration(milliseconds: m.elapsedMs!) : null));
     if (mounted) setState(() {});
   }
 
@@ -300,7 +303,8 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
               role: m.role,
               text: m.text,
               imagePath: m.imagePath,
-              sources: m.sources));
+              sources: m.sources,
+              elapsedMs: m.elapsed?.inMilliseconds));
       _convs = chats.listConversations();
     } catch (_) {/* persistence is best-effort */}
   }
@@ -719,6 +723,9 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     if (text.isEmpty && imagePath == null) return;
     if (_generating) return;
     if (text.isEmpty && imagePath != null) text = 'What is in this image?';
+    // Time the whole turn (model swap + retrieval + generation) so we can show
+    // how long the answer took.
+    final turnTimer = Stopwatch()..start();
     // Pin this turn's language from the user's own words (keeps directive and
     // TTS voice consistent; falls back to the previous turn's when unsure).
     _turnLang = _detectLangBase(text) ?? _turnLang;
@@ -927,16 +934,20 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
       if (assistant.text.isEmpty && full != null && full.isNotEmpty) {
         setState(() => assistant.text = full);
       }
+      turnTimer.stop();
       setState(() {
         _generating = false;
         _thinkingStage = '';
+        assistant.elapsed = turnTimer.elapsed;
       });
       // Speak the reply when Eva was invoked as the device assistant.
       if (_assistMode) _speak(assistant.text);
     } catch (_) {
+      turnTimer.stop();
       setState(() {
         _generating = false;
         _thinkingStage = '';
+        assistant.elapsed = turnTimer.elapsed;
       });
     }
     if (assistant.text.isNotEmpty) _persistMessage(assistant);
@@ -2299,6 +2310,22 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
         : '$name · pp. ${pages.join(', ')}';
   }
 
+  /// Human-readable duration, e.g. "2 minutes and 3 seconds", "45 seconds".
+  String _humanDuration(Duration d) {
+    final totalSeconds = (d.inMilliseconds / 1000).round();
+    if (totalSeconds < 1) return 'less than a second';
+    final h = totalSeconds ~/ 3600;
+    final m = (totalSeconds % 3600) ~/ 60;
+    final s = totalSeconds % 60;
+    final parts = <String>[
+      if (h > 0) '$h hour${h == 1 ? '' : 's'}',
+      if (m > 0) '$m minute${m == 1 ? '' : 's'}',
+      if (s > 0) '$s second${s == 1 ? '' : 's'}',
+    ];
+    if (parts.length <= 1) return parts.isEmpty ? 'less than a second' : parts.first;
+    return '${parts.sublist(0, parts.length - 1).join(', ')} and ${parts.last}';
+  }
+
   Widget _bubble(ChatMessage m) {
     final isUser = m.role == 'user';
     final scheme = Theme.of(context).colorScheme;
@@ -2385,6 +2412,17 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                               : null,
                         ),
                     ],
+                  ),
+                ),
+              if (m.elapsed != null && m.text.isNotEmpty)
+                Padding(
+                  padding: const EdgeInsets.only(left: 8, top: 2, bottom: 2),
+                  child: Text(
+                    'Answered in ${_humanDuration(m.elapsed!)}',
+                    style: TextStyle(
+                      fontSize: 11,
+                      color: scheme.onSurfaceVariant.withValues(alpha: 0.7),
+                    ),
                   ),
                 ),
             ],
