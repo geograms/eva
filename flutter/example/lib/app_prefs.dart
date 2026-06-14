@@ -1,3 +1,5 @@
+import 'dart:convert';
+
 import 'package:flutter/material.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
@@ -253,4 +255,117 @@ Future<String> loadCorpusLocation() async {
 Future<void> saveCorpusLocation(String path) async {
   final prefs = await SharedPreferences.getInstance();
   await prefs.setString(_kCorpusLocationKey, path);
+}
+
+// ── Web radio stations ───────────────────────────────────────────────────────
+
+/// An online radio station the user can play (a name + a stream URL).
+class RadioStation {
+  const RadioStation({required this.name, required this.url, this.genre = ''});
+  final String name;
+  final String url; // direct audio stream (http/https), e.g. an Icecast/MP3 URL
+  final String genre;
+
+  Map<String, dynamic> toJson() => {'name': name, 'url': url, 'genre': genre};
+  static RadioStation fromJson(Map<String, dynamic> j) => RadioStation(
+        name: (j['name'] as String?) ?? '',
+        url: (j['url'] as String?) ?? '',
+        genre: (j['genre'] as String?) ?? '',
+      );
+}
+
+/// Example stations seeded on first run so radio works out of the box. All use
+/// HTTPS streams so no cleartext exception is needed.
+const List<RadioStation> kDefaultRadioStations = [
+  RadioStation(
+      name: 'SomaFM Groove Salad',
+      url: 'https://ice1.somafm.com/groovesalad-128-mp3',
+      genre: 'Ambient / downtempo'),
+  RadioStation(
+      name: 'SomaFM Drone Zone',
+      url: 'https://ice1.somafm.com/dronezone-128-mp3',
+      genre: 'Ambient'),
+  RadioStation(
+      name: 'SomaFM Lush',
+      url: 'https://ice1.somafm.com/lush-128-mp3',
+      genre: 'Vocal / chill'),
+  RadioStation(
+      name: 'Radio Paradise (Main Mix)',
+      url: 'https://stream.radioparadise.com/mp3-128',
+      genre: 'Eclectic'),
+  RadioStation(
+      name: 'Radio Paradise (Mellow Mix)',
+      url: 'https://stream.radioparadise.com/mellow-128',
+      genre: 'Mellow'),
+  RadioStation(
+      name: 'FIP',
+      url: 'https://icecast.radiofrance.fr/fip-midfi.mp3',
+      genre: 'Eclectic (France)'),
+];
+
+const String _kRadioStationsKey = 'radio_stations';
+
+/// The saved stations. On first ever load (key absent) returns the examples and
+/// persists them, so the list is pre-filled.
+Future<List<RadioStation>> loadRadioStations() async {
+  final prefs = await SharedPreferences.getInstance();
+  final raw = prefs.getString(_kRadioStationsKey);
+  if (raw == null) {
+    await saveRadioStations(kDefaultRadioStations);
+    return List.of(kDefaultRadioStations);
+  }
+  try {
+    final list = jsonDecode(raw) as List;
+    return [
+      for (final e in list) RadioStation.fromJson(e as Map<String, dynamic>)
+    ];
+  } catch (_) {
+    return List.of(kDefaultRadioStations);
+  }
+}
+
+Future<void> saveRadioStations(List<RadioStation> stations) async {
+  final prefs = await SharedPreferences.getInstance();
+  await prefs.setString(
+      _kRadioStationsKey, jsonEncode([for (final s in stations) s.toJson()]));
+}
+
+// ── Timed reminders ──────────────────────────────────────────────────────────
+
+/// A scheduled reminder, persisted so Settings can list/cancel pending ones and
+/// so the notification id is stable.
+class ReminderItem {
+  const ReminderItem({required this.id, required this.text, required this.whenMs});
+  final int id;
+  final String text;
+  final int whenMs; // epoch millis it fires at
+
+  Map<String, dynamic> toJson() => {'id': id, 'text': text, 'whenMs': whenMs};
+  static ReminderItem fromJson(Map<String, dynamic> j) => ReminderItem(
+        id: (j['id'] as num).toInt(),
+        text: (j['text'] as String?) ?? '',
+        whenMs: (j['whenMs'] as num).toInt(),
+      );
+}
+
+const String _kRemindersKey = 'reminders';
+
+Future<List<ReminderItem>> loadReminders() async {
+  final prefs = await SharedPreferences.getInstance();
+  final raw = prefs.getString(_kRemindersKey);
+  if (raw == null) return [];
+  try {
+    final list = jsonDecode(raw) as List;
+    return [
+      for (final e in list) ReminderItem.fromJson(e as Map<String, dynamic>)
+    ];
+  } catch (_) {
+    return [];
+  }
+}
+
+Future<void> saveReminders(List<ReminderItem> reminders) async {
+  final prefs = await SharedPreferences.getInstance();
+  await prefs.setString(
+      _kRemindersKey, jsonEncode([for (final r in reminders) r.toJson()]));
 }

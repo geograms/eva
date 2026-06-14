@@ -31,11 +31,34 @@ class MusicPlayer extends ChangeNotifier {
   int _index = -1;
   bool _playing = false;
   final Set<int> _counted = {}; // track ids already counted this session-queue
+  String? _radioName; // set while a web radio stream is playing
 
   bool get hasTrack => _index >= 0 && _index < _queue.length;
   bool get isPlaying => _playing;
   int get queueLength => _queue.length;
   TrackInfo? get current => hasTrack ? _queue[_index] : null;
+
+  /// Whether a web radio stream (not a local queue) is loaded.
+  bool get isRadio => _radioName != null;
+  String? get radioName => _radioName;
+
+  /// True when there's anything to show in the now-playing bar.
+  bool get hasMedia => hasTrack || isRadio;
+
+  /// Starts streaming an online radio station. Replaces any current playback.
+  Future<void> playRadio(String name, String url) async {
+    _queue = const [];
+    _index = -1;
+    _counted.clear();
+    _radioName = name;
+    try {
+      await _player.setAudioSource(AudioSource.uri(Uri.parse(url)));
+      await _player.play();
+    } catch (_) {
+      // A bad/unreachable stream shouldn't crash playback control.
+    }
+    notifyListeners();
+  }
 
   /// Position/duration streams for an optional progress UI.
   Stream<Duration> get positionStream => _player.positionStream;
@@ -44,6 +67,7 @@ class MusicPlayer extends ChangeNotifier {
   /// Replaces the queue with [tracks] and starts playing from [startAt].
   Future<void> playQueue(List<TrackInfo> tracks, {int startAt = 0}) async {
     if (tracks.isEmpty) return;
+    _radioName = null;
     _queue = tracks;
     _counted.clear();
     _index = startAt.clamp(0, tracks.length - 1);
@@ -89,6 +113,7 @@ class MusicPlayer extends ChangeNotifier {
     await _player.stop();
     _queue = const [];
     _index = -1;
+    _radioName = null;
     _playing = false;
     notifyListeners();
   }

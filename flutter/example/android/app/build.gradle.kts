@@ -13,6 +13,9 @@ android {
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17
         targetCompatibility = JavaVersion.VERSION_17
+        // flutter_local_notifications needs core-library desugaring for the
+        // java.time APIs it uses when scheduling reminders.
+        isCoreLibraryDesugaringEnabled = true
     }
 
     kotlinOptions {
@@ -59,12 +62,23 @@ android {
         release {
             signingConfig = signingConfigs.findByName("release")
                 ?: signingConfigs.getByName("debug")
+            // R8 shrinking is on; ship our keep rules so flutter_local_notifications'
+            // Gson (de)serialization survives minification.
+            proguardFiles(
+                getDefaultProguardFile("proguard-android.txt"),
+                "proguard-rules.pro",
+            )
         }
     }
 }
 
 flutter {
     source = "../.."
+}
+
+dependencies {
+    // Required by flutter_local_notifications (core-library desugaring).
+    coreLibraryDesugaring("com.android.tools:desugar_jdk_libs:2.1.4")
 }
 
 // Build (or restore from cache) the native FFI library before assembling the

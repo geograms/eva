@@ -39,6 +39,7 @@ import 'photo_service.dart';
 import 'photo_store.dart';
 import 'photos_screen.dart';
 import 'rag_index.dart';
+import 'reminder_service.dart';
 import 'settings_screen.dart';
 import 'system_voice.dart';
 import 'text_util.dart';
@@ -198,6 +199,9 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     WidgetsBinding.instance.addObserver(this);
     _setupAssistant();
     _start();
+    // Prepare the notifications/timezone backend so the first "remind me…" is
+    // instant (best-effort; failures don't block the chat).
+    ReminderService.instance.init().catchError((_) {});
   }
 
   @override
@@ -658,6 +662,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
         builder: (_) => SettingsScreen(
           activeId: _activeModelId,
           manager: _models,
+          player: _player,
         ),
       ),
     );
@@ -771,6 +776,23 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     }
     await _stopCaptioningForChat();
     await _tts.stop();
+
+    // "remind me … in 15 minutes / at 7pm" schedules an OS notification.
+    if (imagePath == null && await _handleReminderCommand(text, assistant)) {
+      setState(() => _generating = false);
+      _persistMessage(assistant);
+      _scrollToBottom();
+      return;
+    }
+
+    // "play radio X" / "play <station>" streams an online station (checked
+    // before music so a station name isn't searched in the local library).
+    if (imagePath == null && await _handleRadioCommand(text, assistant)) {
+      setState(() => _generating = false);
+      _persistMessage(assistant);
+      _scrollToBottom();
+      return;
+    }
 
     // "play <artist/song>" starts the in-app music player directly, no model.
     if (imagePath == null && await _handlePlayCommand(text, assistant)) {
@@ -1319,6 +1341,226 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     return true;
   }
 
+  // ── Web radio ───────────────────────────────────────────────────────────────
+
+  /// Handles "play radio …" / "play [station]" by streaming a saved station.
+  /// Returns true (skipping music + the model) when it matched a station.
+  Future<bool> _handleRadioCommand(String text, ChatMessage assistant) async {
+    final t = text.toLowerCase();
+    final hasPlayVerb = _playVerb.hasMatch(text);
+    final mentionsRadio = RegExp(r'\bradios?\b|\br[áa]dios?\b').hasMatch(t);
+    // Only consider radio when the user said "radio" or used a play verb; a bare
+    // sentence shouldn't accidentally start a stream.
+    if (!mentionsRadio && !hasPlayVerb) return false;
+
+    final stations = await loadRadioStations();
+    if (stations.isEmpty) return false;
+
+    // 1) Direct name match anywhere in the message (e.g. "play Groove Salad").
+    RadioStation? match;
+    for (final s in stations) {
+      if (s.name.isNotEmpty && t.contains(s.name.toLowerCase())) {
+        match = s;
+        break;
+      }
+    }
+    // 2) "play radio <something>" → fuzzy match the trailing words to a station.
+    if (match == null && mentionsRadio) {
+      final after = t.split(RegExp(r'\br[áa]dios?\b')).last.trim();
+      final words = after
+          .split(RegExp(r'\s+'))
+          .where((w) => w.length > 2)
+          .toList();
+      if (words.isNotEmpty) {
+        for (final s in stations) {
+          final name = s.name.toLowerCase();
+          final genre = s.genre.toLowerCase();
+          if (words.any((w) => name.contains(w) || genre.contains(w))) {
+            match = s;
+            break;
+          }
+        }
+      }
+      // Plain "play radio" with no usable name → first station.
+      match ??= stations.first;
+    }
+    if (match == null) return false;
+
+    await _player.playRadio(match.name, match.url);
+    setState(() {
+      assistant.text = '▶ Tuning in to ${match!.name} — live radio.';
+    });
+    return true;
+  }
+
+  // ── Timed reminders ─────────────────────────────────────────────────────────
+
+  // Words that signal a reminder/alarm/timer request (EN + PT).
+  static final RegExp _reminderTrigger = RegExp(
+      r'\b(remind me|reminder|set (an? )?(reminder|alarm|timer)|wake me|'
+      r'alarm|timer|lembra-?me|lembrete|alarme|despertar|temporizador)\b',
+      caseSensitive: false);
+
+  /// Parses a reminder request into the time it should fire and the text to
+  /// show. Returns null if no time could be understood.
+  ({DateTime when, String what})? _parseReminder(String text) {
+    final t = text.toLowerCase();
+    if (!_reminderTrigger.hasMatch(t)) return null;
+
+    final now = DateTime.now();
+    DateTime? when;
+    String? timePhrase; // the matched time substring, removed from "what"
+
+    // Relative: "in 15 minutes", "em 15 minutos", "daqui a 2 horas",
+    // "15 minutes from now", "after 30 min".
+    final relUnit = r'(seconds?|secs?|segundos?|minutes?|mins?|minutos?|'
+        r'hours?|hrs?|horas?|days?|dias?)';
+    final rel = RegExp('\\b(?:in|em|daqui a|after|ap[oó]s)\\s+(\\d+)\\s*$relUnit')
+            .firstMatch(t) ??
+        RegExp('\\b(\\d+)\\s*$relUnit\\s+(?:from now|a partir de agora)\\b')
+            .firstMatch(t);
+    // "in half an hour" / "in an hour" / "in a minute".
+    final relWordy = RegExp(
+            r'\bin\s+(half\s+an?\s+hour|an?\s+hour|a\s+minute|a\s+few\s+minutes)\b')
+        .firstMatch(t);
+
+    if (rel != null) {
+      final n = int.tryParse(rel.group(1)!) ?? 0;
+      final unit = rel.group(2)!;
+      when = now.add(_durationFor(n, unit));
+      timePhrase = rel.group(0);
+    } else if (relWordy != null) {
+      final phrase = relWordy.group(1)!;
+      Duration d;
+      if (phrase.startsWith('half')) {
+        d = const Duration(minutes: 30);
+      } else if (phrase.contains('hour')) {
+        d = const Duration(hours: 1);
+      } else if (phrase.contains('few')) {
+        d = const Duration(minutes: 5);
+      } else {
+        d = const Duration(minutes: 1);
+      }
+      when = now.add(d);
+      timePhrase = relWordy.group(0);
+    } else {
+      // Absolute: "at 7pm", "at 15:30", "às 19h", "às 7:45".
+      final abs = RegExp(
+              r'\b(?:at|às|as|@)\s+(\d{1,2})(?:[:h.](\d{2}))?\s*(am|pm)?\b')
+          .firstMatch(t);
+      if (abs != null) {
+        var hour = int.tryParse(abs.group(1)!) ?? 0;
+        final minute = int.tryParse(abs.group(2) ?? '0') ?? 0;
+        final ampm = abs.group(3);
+        if (ampm == 'pm' && hour < 12) hour += 12;
+        if (ampm == 'am' && hour == 12) hour = 0;
+        if (hour > 23 || minute > 59) return null;
+        var candidate = DateTime(now.year, now.month, now.day, hour, minute);
+        // If that time already passed today, schedule it for tomorrow.
+        if (!candidate.isAfter(now)) {
+          candidate = candidate.add(const Duration(days: 1));
+        }
+        when = candidate;
+        timePhrase = abs.group(0);
+      }
+    }
+
+    if (when == null) return null;
+
+    // Build the "what": strip the trigger, the time phrase and leading
+    // connectors ("to", "that", "para", "de", "para que").
+    var what = text;
+    what = what.replaceAll(_reminderTrigger, ' ');
+    if (timePhrase != null) {
+      what = what.toLowerCase().replaceAll(timePhrase, ' ');
+    }
+    what = what
+        .replaceAll(RegExp(r'^[\s,]*(to|that|para que|para|de|of)\b',
+            caseSensitive: false), ' ')
+        .replaceAll(RegExp(r'\s+'), ' ')
+        .trim();
+    if (what.isEmpty) what = 'Reminder';
+    // Capitalise the first letter for a tidy notification.
+    what = what[0].toUpperCase() + what.substring(1);
+    return (when: when, what: what);
+  }
+
+  Duration _durationFor(int n, String unit) {
+    if (unit.startsWith('sec') || unit.startsWith('seg')) {
+      return Duration(seconds: n);
+    }
+    if (unit.startsWith('hour') || unit.startsWith('hr') || unit.startsWith('hora')) {
+      return Duration(hours: n);
+    }
+    if (unit.startsWith('day') || unit.startsWith('dia')) {
+      return Duration(days: n);
+    }
+    return Duration(minutes: n); // minutes default
+  }
+
+  /// Schedules a reminder when [text] is a reminder request. Returns true (so
+  /// [_send] skips the model) when handled.
+  Future<bool> _handleReminderCommand(String text, ChatMessage assistant) async {
+    final parsed = _parseReminder(text);
+    if (parsed == null) return false;
+
+    final ok = await ReminderService.instance.requestPermissions();
+    if (!ok) {
+      setState(() {
+        assistant.text = 'I can set that, but notifications are turned off. '
+            'Enable them in Settings → Reminders and try again.';
+      });
+      return true;
+    }
+
+    final id = (parsed.when.millisecondsSinceEpoch ~/ 1000) % 2000000000;
+    try {
+      await ReminderService.instance
+          .schedule(parsed.when, 'Eva reminder', parsed.what, id: id);
+      // Persist (and prune past ones) so the record survives a restart.
+      final list = await loadReminders();
+      final nowMs = DateTime.now().millisecondsSinceEpoch;
+      list.removeWhere((r) => r.whenMs < nowMs);
+      list.add(ReminderItem(
+          id: id, text: parsed.what, whenMs: parsed.when.millisecondsSinceEpoch));
+      await saveReminders(list);
+    } catch (_) {
+      setState(() {
+        assistant.text =
+            "I couldn't schedule that reminder just now. Please try again.";
+      });
+      return true;
+    }
+
+    setState(() {
+      assistant.text =
+          '⏰ Reminder set for ${_friendlyWhen(parsed.when)}: ${parsed.what}';
+    });
+    return true;
+  }
+
+  /// A human phrasing of when a reminder fires, e.g. "in 15 minutes (14:30)"
+  /// or "today at 19:00" / "tomorrow at 07:30".
+  String _friendlyWhen(DateTime when) {
+    final now = DateTime.now();
+    final diff = when.difference(now);
+    String hhmm(DateTime d) =>
+        '${d.hour.toString().padLeft(2, '0')}:${d.minute.toString().padLeft(2, '0')}';
+    if (diff.inMinutes < 1) return 'in under a minute (${hhmm(when)})';
+    if (diff.inMinutes < 60) {
+      final m = diff.inMinutes;
+      return 'in $m minute${m == 1 ? '' : 's'} (${hhmm(when)})';
+    }
+    if (diff.inHours < 24 && when.day == now.day) {
+      return 'today at ${hhmm(when)}';
+    }
+    final tomorrow = now.add(const Duration(days: 1));
+    if (when.day == tomorrow.day && when.month == tomorrow.month) {
+      return 'tomorrow at ${hhmm(when)}';
+    }
+    return 'on ${when.day}/${when.month} at ${hhmm(when)}';
+  }
+
   // ── Photo content understanding (vision caption pass) ───────────────────────
 
   /// On external power = charging, full, or plugged-in-but-full (not draining).
@@ -1831,7 +2073,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                   itemBuilder: (context, i) => _bubble(_messages[i]),
                 ),
         ),
-        if (_player.hasTrack) _nowPlayingBar(),
+        if (_player.hasMedia) _nowPlayingBar(),
         const Divider(height: 1),
         if (_pendingImagePath != null) _pendingImagePreview(),
         Padding(
@@ -1918,16 +2160,29 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
   /// Compact now-playing bar with transport controls, shown above the input
   /// whenever a track is loaded in the in-app player.
   Widget _nowPlayingBar() {
-    final t = _player.current;
-    if (t == null) return const SizedBox.shrink();
     final scheme = Theme.of(context).colorScheme;
+    final radio = _player.isRadio;
+    final t = _player.current;
+    if (!radio && t == null) return const SizedBox.shrink();
+    // Title/subtitle differ for a live radio stream vs a local track queue.
+    final title = radio
+        ? (_player.radioName ?? 'Radio')
+        : (t!.title.isNotEmpty ? t.title : t.path.split('/').last);
+    final subtitle = radio
+        ? 'Live radio'
+        : (t!.artist.isNotEmpty
+            ? (_player.queueLength > 1
+                ? '${t.artist} · ${_player.queueLength} in queue'
+                : t.artist)
+            : '${_player.queueLength} in queue');
     return Material(
       color: scheme.secondaryContainer,
       child: Padding(
         padding: const EdgeInsets.fromLTRB(12, 4, 4, 4),
         child: Row(
           children: [
-            Icon(Icons.music_note, size: 18, color: scheme.onSecondaryContainer),
+            Icon(radio ? Icons.radio : Icons.music_note,
+                size: 18, color: scheme.onSecondaryContainer),
             const SizedBox(width: 8),
             Expanded(
               child: Column(
@@ -1935,7 +2190,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
                   Text(
-                    t.title.isNotEmpty ? t.title : t.path.split('/').last,
+                    title,
                     maxLines: 1,
                     overflow: TextOverflow.ellipsis,
                     style: TextStyle(
@@ -1944,11 +2199,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                         color: scheme.onSecondaryContainer),
                   ),
                   Text(
-                    t.artist.isNotEmpty
-                        ? (_player.queueLength > 1
-                            ? '${t.artist} · ${_player.queueLength} in queue'
-                            : t.artist)
-                        : '${_player.queueLength} in queue',
+                    subtitle,
                     maxLines: 1,
                     overflow: TextOverflow.ellipsis,
                     style: TextStyle(
@@ -1958,12 +2209,15 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                 ],
               ),
             ),
-            IconButton(
-              tooltip: 'Previous',
-              visualDensity: VisualDensity.compact,
-              onPressed: () => _player.previous(),
-              icon: Icon(Icons.skip_previous, color: scheme.onSecondaryContainer),
-            ),
+            // Skip controls only make sense for a local queue, not live radio.
+            if (!radio)
+              IconButton(
+                tooltip: 'Previous',
+                visualDensity: VisualDensity.compact,
+                onPressed: () => _player.previous(),
+                icon:
+                    Icon(Icons.skip_previous, color: scheme.onSecondaryContainer),
+              ),
             IconButton(
               tooltip: _player.isPlaying ? 'Pause' : 'Play',
               visualDensity: VisualDensity.compact,
@@ -1971,12 +2225,13 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
               icon: Icon(_player.isPlaying ? Icons.pause : Icons.play_arrow,
                   color: scheme.onSecondaryContainer),
             ),
-            IconButton(
-              tooltip: 'Next',
-              visualDensity: VisualDensity.compact,
-              onPressed: () => _player.next(),
-              icon: Icon(Icons.skip_next, color: scheme.onSecondaryContainer),
-            ),
+            if (!radio)
+              IconButton(
+                tooltip: 'Next',
+                visualDensity: VisualDensity.compact,
+                onPressed: () => _player.next(),
+                icon: Icon(Icons.skip_next, color: scheme.onSecondaryContainer),
+              ),
             IconButton(
               tooltip: 'Stop',
               visualDensity: VisualDensity.compact,

@@ -13,7 +13,10 @@ import 'documents_screen.dart';
 import 'maps/map_service.dart';
 import 'model_catalog.dart';
 import 'model_manager.dart';
+import 'music_player.dart';
 import 'music_service.dart';
+import 'radio_stations_screen.dart';
+import 'reminder_service.dart';
 import 'photo_service.dart';
 import 'photos_screen.dart';
 import 'disk_space.dart';
@@ -31,10 +34,12 @@ class SettingsScreen extends StatefulWidget {
     super.key,
     required this.activeId,
     required this.manager,
+    required this.player,
   });
 
   final ModelManager manager;
   final String activeId;
+  final MusicPlayer player;
 
   @override
   State<SettingsScreen> createState() => _SettingsScreenState();
@@ -73,6 +78,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
   String _mapsFolder = '';
   bool _mapsSatellite = false;
   int _mapCacheBytes = 0;
+  bool _reminderPermission = false;
   String? _error;
 
   @override
@@ -111,6 +117,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
     _mapsEnabled = await loadMapsEnabled();
     _mapsFolder = await loadMapsFolder();
     _mapsSatellite = await loadMapsSatellite();
+    _reminderPermission = await ReminderService.instance.notificationsEnabled();
     _refreshMapCacheSize();
     _documents = await _docs.list();
     _corpusLocation = await _docs.locationLabel();
@@ -789,6 +796,43 @@ class _SettingsScreenState extends State<SettingsScreen> {
               'Lyrics and genre are fetched from a free online service when the '
               'phone has internet; everything else is read on-device. This data '
               'lets Eva answer questions about your artists and songs.',
+              style: TextStyle(fontSize: 12, color: Colors.grey),
+            ),
+          ),
+          ListTile(
+            leading: const Icon(Icons.radio),
+            title: const Text('Radio stations'),
+            subtitle: const Text(
+                'Manage online radio stations to play. Comes with examples; '
+                'add your own stream URLs.'),
+            trailing: const Icon(Icons.chevron_right),
+            onTap: () => Navigator.of(context).push(MaterialPageRoute(
+              builder: (_) => RadioStationsScreen(player: widget.player),
+            )),
+          ),
+          const Divider(),
+          _sectionHeader('Reminders'),
+          SwitchListTile(
+            secondary: const Icon(Icons.notifications_active_outlined),
+            title: const Text('Allow timed reminders'),
+            subtitle: Text(_reminderPermission
+                ? 'Eva can post reminder notifications.'
+                : 'Tap to allow notifications so reminders can alert you.'),
+            value: _reminderPermission,
+            onChanged: (_) async {
+              final ok = await ReminderService.instance.requestPermissions();
+              setState(() => _reminderPermission = ok);
+              await _toast(ok
+                  ? 'Reminders enabled.'
+                  : 'Notifications are blocked — enable them in system settings.');
+            },
+          ),
+          const Padding(
+            padding: EdgeInsets.fromLTRB(16, 0, 16, 16),
+            child: Text(
+              'Ask in chat, e.g. "remind me to call mum in 15 minutes" or '
+              '"set a reminder for 7pm to leave". Reminders fire as system '
+              'notifications even if Eva is closed.',
               style: TextStyle(fontSize: 12, color: Colors.grey),
             ),
           ),
