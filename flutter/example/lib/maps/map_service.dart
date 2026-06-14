@@ -100,5 +100,53 @@ class MapService {
     }
   }
 
+  /// A walking route from ([fromLat],[fromLon]) to ([toLat],[toLon]) as a flat
+  /// [lat,lon,lat,lon,...] polyline. Cache-first (so a route computed once
+  /// replays offline); otherwise queries OSRM and caches it. Null when it can't
+  /// be computed (offline + uncached, or no road/path found).
+  Future<List<double>?> route(
+      double fromLat, double fromLon, double toLat, double toLon,
+      {int nowMs = 0}) async {
+    // Round the origin to ~100 m and the destination to ~10 m so repeated walks
+    // of the same trip reuse one cached route instead of missing every time.
+    String r(double v, int dp) => v.toStringAsFixed(dp);
+    final key = 'foot:${r(fromLat, 3)},${r(fromLon, 3)}->'
+        '${r(toLat, 4)},${r(toLon, 4)}';
+    final cache = await _geoCache();
+    final cached = cache.getRoute(key);
+    if (cached != null) {
+      final list = jsonDecode(cached);
+      if (list is List) return [for (final e in list) (e as num).toDouble()];
+    }
+    if (!await hasNetwork()) return null;
+    try {
+      // OSRM public demo server, walking profile; coords are lon,lat order.
+      final uri = Uri.parse('https://router.project-osrm.org/route/v1/foot/'
+          '$fromLon,$fromLat;$toLon,$toLat?overview=full&geometries=geojson');
+      final resp = await http
+          .get(uri, headers: {'User-Agent': userAgent})
+          .timeout(const Duration(seconds: 15));
+      if (resp.statusCode != 200) return null;
+      final body = jsonDecode(resp.body);
+      if (body is! Map ||
+          body['routes'] is! List ||
+          (body['routes'] as List).isEmpty) {
+        return null;
+      }
+      final coords = (body['routes'] as List).first['geometry']['coordinates'];
+      if (coords is! List || coords.isEmpty) return null;
+      // GeoJSON is [lon,lat]; store as flat [lat,lon,...].
+      final flat = <double>[];
+      for (final c in coords) {
+        flat.add((c[1] as num).toDouble());
+        flat.add((c[0] as num).toDouble());
+      }
+      cache.putRoute(key, jsonEncode(flat), nowMs);
+      return flat;
+    } catch (_) {
+      return null;
+    }
+  }
+
   LatLng latLng(GeoResult r) => LatLng(r.lat, r.lon);
 }

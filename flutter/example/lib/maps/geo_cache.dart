@@ -26,6 +26,16 @@ class GeoCache {
         created_at INTEGER NOT NULL
       );
     ''');
+    // Cached route polylines (flat [lat,lon,...] as JSON), keyed by
+    // profile+rounded origin→destination — so a route computed once replays
+    // offline over the cached tiles.
+    db.execute('''
+      CREATE TABLE IF NOT EXISTS routes(
+        key TEXT PRIMARY KEY,
+        poly TEXT NOT NULL,
+        created_at INTEGER NOT NULL
+      );
+    ''');
     return GeoCache._(db);
   }
 
@@ -42,6 +52,19 @@ class GeoCache {
       'INSERT OR REPLACE INTO geocodes(query, lat, lon, name, created_at) '
       'VALUES(?,?,?,?,?);',
       [query, r.lat, r.lon, r.name, whenMs],
+    );
+  }
+
+  /// Cached route polyline JSON for [key], or null.
+  String? getRoute(String key) {
+    final rs = _db.select('SELECT poly FROM routes WHERE key=?;', [key]);
+    return rs.isEmpty ? null : rs.first['poly'] as String;
+  }
+
+  void putRoute(String key, String polyJson, int whenMs) {
+    _db.execute(
+      'INSERT OR REPLACE INTO routes(key, poly, created_at) VALUES(?,?,?);',
+      [key, polyJson, whenMs],
     );
   }
 

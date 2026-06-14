@@ -5,6 +5,7 @@ import 'dart:io';
 import 'package:battery_plus/battery_plus.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_map/flutter_map.dart';
+import 'package:geolocator/geolocator.dart';
 import 'package:gpt_markdown/gpt_markdown.dart';
 import 'package:latlong2/latlong.dart';
 import 'package:image_picker/image_picker.dart';
@@ -794,8 +795,8 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     // Map/location requests ("show me Lisbon on a map", "where is the Louvre")
     // are answered with an expandable map tile + live GPS dot, not the model.
     if (imagePath == null) {
-      final place = _parseMapQuery(text);
-      if (place != null && await _answerWithMap(place, assistant)) {
+      final mq = _parseMapQuery(text);
+      if (mq != null && await _answerWithMap(mq, assistant)) {
         setState(() => _generating = false);
         _persistMessage(assistant);
         _scrollToBottom();
@@ -2222,8 +2223,9 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
   // ── Map / location chat queries ─────────────────────────────────────────────
 
   /// Detects "show me X on a map / where is X / route to X" (multilingual) and
-  /// returns the place to look up, or null when the message isn't about a place.
-  String? _parseMapQuery(String text) {
+  /// returns the place to look up plus whether a walking route was asked for, or
+  /// null when the message isn't about a place.
+  ({String place, bool route})? _parseMapQuery(String text) {
     final t = text.toLowerCase().trim();
     // Trigger words: the noun "map", or location/route verbs across EN/PT/ES/FR/
     // IT/DE. We only short-circuit to a map when one of these is present.
@@ -2265,26 +2267,85 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
         .toList();
     final query = words.join(' ').trim();
     if (query.isEmpty) return null;
-    return query;
+    return (place: query, route: routeMatch != null);
   }
 
-  /// Geocodes [place] via [MapService] and attaches an expandable map tile to
-  /// [assistant]. Returns false (so the model answers) when maps are disabled or
-  /// the place can't be resolved (e.g. offline and not cached).
-  Future<bool> _answerWithMap(String place, ChatMessage assistant) async {
+  /// Geocodes the requested place via [MapService] and attaches an expandable
+  /// map tile to [assistant]; for a route request it also computes a walking
+  /// path from the current GPS position. Returns false (so the model answers)
+  /// when maps are disabled or the place can't be resolved (offline/unknown).
+  Future<bool> _answerWithMap(
+      ({String place, bool route}) q, ChatMessage assistant) async {
     if (!await loadMapsEnabled()) return false;
     _setThinking('Looking up the map…');
-    final geo = await MapService.instance
-        .geocode(place, nowMs: DateTime.now().millisecondsSinceEpoch);
+    final nowMs = DateTime.now().millisecondsSinceEpoch;
+    final geo = await MapService.instance.geocode(q.place, nowMs: nowMs);
     if (geo == null) return false; // let the model reply (offline/unknown place)
     // A short, readable name: the first part of the geocoder's display name.
     final shortName = geo.name.split(',').first.trim();
+
+    if (q.route) {
+      _setThinking('Finding a walking route…');
+      final origin = await _currentPosition();
+      if (origin != null) {
+        final line = await MapService.instance.route(
+            origin.latitude, origin.longitude, geo.lat, geo.lon,
+            nowMs: nowMs);
+        if (line != null && line.length >= 4) {
+          setState(() {
+            assistant.text = 'Here is a walking route to $shortName. Tap to open '
+                'full-screen — your live position is shown as you move.';
+            assistant.map = MapRef(
+                lat: geo.lat,
+                lon: geo.lon,
+                zoom: 15,
+                label: shortName,
+                routeLatLngs: line);
+          });
+          return true;
+        }
+      }
+      // No GPS or no route: fall back to just showing the destination.
+      setState(() {
+        assistant.text = origin == null
+            ? 'Here is $shortName on the map. I could not get your current '
+                'location to draw a route — enable location, then tap to open.'
+            : 'Here is $shortName on the map. I could not find a walking route '
+                'just now; tap to open with your live location.';
+        assistant.map =
+            MapRef(lat: geo.lat, lon: geo.lon, zoom: 14, label: shortName);
+      });
+      return true;
+    }
+
     setState(() {
       assistant.text = 'Here is $shortName on the map. '
           'Tap it to open full-screen with your live location.';
-      assistant.map = MapRef(lat: geo.lat, lon: geo.lon, zoom: 14, label: shortName);
+      assistant.map =
+          MapRef(lat: geo.lat, lon: geo.lon, zoom: 14, label: shortName);
     });
     return true;
+  }
+
+  /// The device's current position for routing, or null if location is
+  /// unavailable/denied. Best-effort with a short timeout.
+  Future<Position?> _currentPosition() async {
+    try {
+      var perm = await Geolocator.checkPermission();
+      if (perm == LocationPermission.denied) {
+        perm = await Geolocator.requestPermission();
+      }
+      if (perm == LocationPermission.denied ||
+          perm == LocationPermission.deniedForever) {
+        return null;
+      }
+      return await Geolocator.getCurrentPosition(
+        locationSettings:
+            const LocationSettings(accuracy: LocationAccuracy.high),
+      ).timeout(const Duration(seconds: 10));
+    } catch (_) {
+      return null;
+    }
   }
 
   /// A small, non-interactive map preview under an answer; tap to open

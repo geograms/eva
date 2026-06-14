@@ -131,6 +131,13 @@ class _MapViewerScreenState extends State<MapViewerScreen> {
                     initialCenter: _dest,
                     initialZoom: widget.ref.zoom,
                     maxZoom: 19,
+                    // For a route, frame the whole path instead of just the end.
+                    initialCameraFit: _route.length < 2
+                        ? null
+                        : CameraFit.bounds(
+                            bounds: LatLngBounds.fromPoints(_route),
+                            padding: const EdgeInsets.all(48),
+                          ),
                   ),
                   children: [
                     TileLayer(
