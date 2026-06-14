@@ -29,6 +29,7 @@ class _MapViewerScreenState extends State<MapViewerScreen> {
   TileProvider? _streets;
   TileProvider? _satellite;
   bool _satelliteOn = false;
+  bool _saving = false; // prefetching the visible area for offline use
   LatLng? _here; // live position, for the distance readout
   StreamSubscription<Position>? _posSub;
 
@@ -104,6 +105,31 @@ class _MapViewerScreenState extends State<MapViewerScreen> {
     return dirs[(((bearing % 360) + 22.5) ~/ 45) % 8];
   }
 
+  /// Caches the tiles covering the current viewport (a few zoom levels) so this
+  /// area keeps working offline. User-initiated to respect tile-server fair-use.
+  Future<void> _saveArea() async {
+    setState(() => _saving = true);
+    final messenger = ScaffoldMessenger.of(context);
+    try {
+      final bounds = _controller.camera.visibleBounds;
+      final z = _controller.camera.zoom.round();
+      final count = await MapService.instance.prefetchArea(
+        bounds,
+        layerKey: _satelliteOn ? 'satellite' : 'streets',
+        satellite: _satelliteOn,
+        fromZoom: (z - 1).clamp(3, 18),
+        toZoom: (z + 2).clamp(3, 18),
+      );
+      messenger.showSnackBar(SnackBar(
+          content: Text('Saved $count tiles — this area now works offline.')));
+    } catch (_) {
+      messenger.showSnackBar(
+          const SnackBar(content: Text('Could not save this area.')));
+    } finally {
+      if (mounted) setState(() => _saving = false);
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
     final ready = _streets != null && _satellite != null;
@@ -111,6 +137,16 @@ class _MapViewerScreenState extends State<MapViewerScreen> {
       appBar: AppBar(
         title: Text(widget.title, maxLines: 1, overflow: TextOverflow.ellipsis),
         actions: [
+          IconButton(
+            tooltip: _saving ? 'Saving…' : 'Save this area offline',
+            icon: _saving
+                ? const SizedBox(
+                    width: 18,
+                    height: 18,
+                    child: CircularProgressIndicator(strokeWidth: 2))
+                : const Icon(Icons.download_for_offline_outlined),
+            onPressed: _saving ? null : _saveArea,
+          ),
           IconButton(
             tooltip: _satelliteOn ? 'Streets' : 'Satellite',
             icon: Icon(_satelliteOn ? Icons.map_outlined : Icons.satellite_alt),

@@ -1,5 +1,6 @@
 import 'dart:convert';
 import 'dart:io';
+import 'dart:math' as math;
 
 import 'package:flutter_map/flutter_map.dart';
 import 'package:http/http.dart' as http;
@@ -149,4 +150,76 @@ class MapService {
   }
 
   LatLng latLng(GeoResult r) => LatLng(r.lat, r.lon);
+
+  /// Downloads and caches every tile covering [bounds] for [layerKey] across
+  /// zoom levels [fromZoom]..[toZoom] (inclusive), so that area works offline
+  /// afterwards. Capped at [maxTiles] to respect tile-server fair-use and keep
+  /// downloads bounded; returns the number of tiles now cached for the area.
+  /// [satellite] selects ESRI World Imagery (z/y/x) over OSM streets (z/x/y).
+  Future<int> prefetchArea(
+    LatLngBounds bounds, {
+    required String layerKey,
+    required bool satellite,
+    int fromZoom = 13,
+    int toZoom = 16,
+    int maxTiles = 400,
+  }) async {
+    final root = await cacheRoot();
+    final template = satellite ? satelliteUrl : streetUrl;
+    // Enumerate the tiles per zoom, nearest-first is unnecessary; just clamp the
+    // total so a huge viewport at high zoom can't pull thousands of tiles.
+    final coords = <List<int>>[]; // [z, x, y]
+    for (var z = fromZoom; z <= toZoom; z++) {
+      final n = 1 << z;
+      int lonToX(double lon) =>
+          ((lon + 180.0) / 360.0 * n).floor().clamp(0, n - 1);
+      int latToY(double lat) {
+        final r = lat * math.pi / 180.0;
+        return ((1 - math.log(math.tan(r) + 1 / math.cos(r)) / math.pi) /
+                    2 *
+                    n)
+            .floor()
+            .clamp(0, n - 1);
+      }
+
+      final xMin = lonToX(bounds.west);
+      final xMax = lonToX(bounds.east);
+      final yMin = latToY(bounds.north);
+      final yMax = latToY(bounds.south);
+      for (var x = xMin; x <= xMax; x++) {
+        for (var y = yMin; y <= yMax; y++) {
+          coords.add([z, x, y]);
+        }
+      }
+      if (coords.length > maxTiles) break;
+    }
+    if (coords.length > maxTiles) coords.removeRange(maxTiles, coords.length);
+
+    var cached = 0;
+    for (final c in coords) {
+      final z = c[0], x = c[1], y = c[2];
+      final file = File('$root/$layerKey/$z/$x/$y.png');
+      if (await file.exists()) {
+        cached++;
+        continue;
+      }
+      final url = template
+          .replaceAll('{z}', '$z')
+          .replaceAll('{x}', '$x')
+          .replaceAll('{y}', '$y');
+      try {
+        final resp = await http
+            .get(Uri.parse(url), headers: {'User-Agent': userAgent})
+            .timeout(const Duration(seconds: 15));
+        if (resp.statusCode == 200 && resp.bodyBytes.isNotEmpty) {
+          await file.parent.create(recursive: true);
+          await file.writeAsBytes(resp.bodyBytes, flush: false);
+          cached++;
+        }
+      } catch (_) {
+        // best-effort: skip tiles that fail (e.g. transient network)
+      }
+    }
+    return cached;
+  }
 }
