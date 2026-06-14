@@ -1,5 +1,8 @@
+import 'dart:io';
+
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
+import 'package:geolocator/geolocator.dart';
 import 'package:permission_handler/permission_handler.dart';
 import 'package:speech_to_text/speech_to_text.dart' as stt;
 
@@ -7,6 +10,7 @@ import 'app_prefs.dart';
 import 'assistant_channel.dart';
 import 'document_service.dart';
 import 'documents_screen.dart';
+import 'maps/map_service.dart';
 import 'model_catalog.dart';
 import 'model_manager.dart';
 import 'music_service.dart';
@@ -65,6 +69,10 @@ class _SettingsScreenState extends State<SettingsScreen> {
   bool _wikiEnabled = true;
   String _wikiPath = '';
   final WikipediaDownload _wikiDl = WikipediaDownload.instance;
+  bool _mapsEnabled = true;
+  String _mapsFolder = '';
+  bool _mapsSatellite = false;
+  int _mapCacheBytes = 0;
   String? _error;
 
   @override
@@ -100,6 +108,10 @@ class _SettingsScreenState extends State<SettingsScreen> {
     _musicCount = await _music.trackCount();
     _wikiEnabled = await loadWikipediaEnabled();
     _wikiPath = await loadWikipediaZimPath();
+    _mapsEnabled = await loadMapsEnabled();
+    _mapsFolder = await loadMapsFolder();
+    _mapsSatellite = await loadMapsSatellite();
+    _refreshMapCacheSize();
     _documents = await _docs.list();
     _corpusLocation = await _docs.locationLabel();
     await _refreshInstalled();
@@ -846,6 +858,72 @@ class _SettingsScreenState extends State<SettingsScreen> {
               style: TextStyle(fontSize: 12, color: Colors.grey),
             ),
           ),
+          const Divider(),
+          _sectionHeader('Maps (offline cache)'),
+          SwitchListTile(
+            secondary: const Icon(Icons.map_outlined),
+            title: const Text('Show places & paths on a map'),
+            subtitle: const Text(
+                'Answer "where is…" / "show me … on a map" with a map tile.'),
+            value: _mapsEnabled,
+            onChanged: (v) async {
+              await saveMapsEnabled(v);
+              setState(() => _mapsEnabled = v);
+            },
+          ),
+          ListTile(
+            leading: const Icon(Icons.sd_storage_outlined),
+            title: const Text('Map data folder'),
+            subtitle: Text(_mapsFolder.isEmpty
+                ? 'App storage (cleared on uninstall)'
+                : _mapsFolder),
+            trailing: TextButton(
+              onPressed: _chooseMapsFolder,
+              child: const Text('Change'),
+            ),
+          ),
+          SwitchListTile(
+            secondary: const Icon(Icons.satellite_alt),
+            title: const Text('Open maps in satellite view'),
+            subtitle: const Text('Otherwise streets, roads and paths.'),
+            value: _mapsSatellite,
+            onChanged: (v) async {
+              await saveMapsSatellite(v);
+              setState(() => _mapsSatellite = v);
+            },
+          ),
+          ListTile(
+            leading: const Icon(Icons.my_location),
+            title: const Text('Allow location for the live dot'),
+            subtitle: const Text(
+                'So the map can show where you are and the distance to a place.'),
+            trailing: TextButton(
+              onPressed: _requestLocation,
+              child: const Text('Allow'),
+            ),
+          ),
+          ListTile(
+            leading: const Icon(Icons.cleaning_services_outlined),
+            title: const Text('Clear cached map tiles'),
+            subtitle: Text(_mapCacheBytes > 0
+                ? '${formatBytes(_mapCacheBytes)} cached — clearing also refreshes '
+                    'stale maps (re-fetched next time online).'
+                : 'Nothing cached yet. Tiles you view are saved here for offline use.'),
+            trailing: TextButton(
+              onPressed: _mapCacheBytes > 0 ? _clearMapCache : null,
+              child: const Text('Clear'),
+            ),
+          ),
+          const Padding(
+            padding: EdgeInsets.fromLTRB(16, 4, 16, 16),
+            child: Text(
+              'Maps are cached as you use them — no upfront country downloads. '
+              'Areas, places and routes you have already viewed keep working '
+              'offline from this folder; brand-new places need internet the first '
+              'time. Point the folder at one that already has tiles to reuse them.',
+              style: TextStyle(fontSize: 12, color: Colors.grey),
+            ),
+          ),
         ],
       ),
     );
@@ -906,6 +984,73 @@ class _SettingsScreenState extends State<SettingsScreen> {
     await saveWikipediaZimPath(found);
     if (mounted) setState(() => _wikiPath = found);
     await _toast('Found ${found.split('/').last}.');
+  }
+
+  /// Chooses the folder where map tiles/geocodes cache. Pointing at a folder
+  /// that already holds a cache reuses it offline (no re-fetch).
+  Future<void> _chooseMapsFolder() async {
+    var status = await Permission.manageExternalStorage.status;
+    if (!status.isGranted) {
+      status = await Permission.manageExternalStorage.request();
+    }
+    if (!status.isGranted) {
+      await _toast('Storage permission is required to use a custom folder.');
+      return;
+    }
+    final dir = await FilePicker.platform.getDirectoryPath();
+    if (dir == null) return;
+    await saveMapsFolder(dir);
+    setState(() => _mapsFolder = dir);
+    _refreshMapCacheSize();
+    await _toast('Maps will cache to this folder (reused offline from here).');
+  }
+
+  Future<void> _requestLocation() async {
+    var perm = await Geolocator.checkPermission();
+    if (perm == LocationPermission.denied) {
+      perm = await Geolocator.requestPermission();
+    }
+    if (perm == LocationPermission.deniedForever) {
+      await _toast('Location is blocked. Enable it in system settings for the '
+          'live dot.');
+    } else if (perm == LocationPermission.denied) {
+      await _toast('Location permission not granted.');
+    } else {
+      await _toast('Location enabled — the map can show your live position.');
+    }
+  }
+
+  /// Sums the cached tile/geo files on disk (best-effort, async).
+  Future<void> _refreshMapCacheSize() async {
+    try {
+      final root = await MapService.instance.cacheRoot();
+      final dir = Directory(root);
+      var total = 0;
+      if (await dir.exists()) {
+        await for (final e in dir.list(recursive: true, followLinks: false)) {
+          if (e is File) {
+            try {
+              total += await e.length();
+            } catch (_) {}
+          }
+        }
+      }
+      if (mounted) setState(() => _mapCacheBytes = total);
+    } catch (_) {}
+  }
+
+  Future<void> _clearMapCache() async {
+    final ok = await _confirm('Clear cached maps',
+        'Delete all cached map tiles and looked-up places? They will be '
+        're-fetched next time you view them online.');
+    if (ok != true) return;
+    try {
+      final root = await MapService.instance.cacheRoot();
+      final dir = Directory(root);
+      if (await dir.exists()) await dir.delete(recursive: true);
+    } catch (_) {}
+    await _refreshMapCacheSize();
+    await _toast('Cached maps cleared.');
   }
 
   Widget _systemVoiceConfig() {

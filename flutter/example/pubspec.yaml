@@ -80,6 +80,13 @@ dependencies:
   # In-app reader for offline Wikipedia (ZIM) articles, served from a loopback
   # HTTP endpoint backed by libzim.
   webview_flutter: ^4.7.0
+  # Maps: render map tiles (cached on demand to the chosen folder), with the
+  # device's live GPS location. Satellite/streets are online layers that get
+  # cached so visited areas work offline.
+  flutter_map: ^7.0.2
+  latlong2: ^0.9.1
+  geolocator: ^13.0.2
+  flutter_map_location_marker: ^9.1.1
 
 dev_dependencies:
   flutter_test:

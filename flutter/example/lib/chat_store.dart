@@ -60,12 +60,14 @@ class StoredMessage {
     this.imagePath,
     this.sources,
     this.elapsedMs,
+    this.mapJson,
   });
   final String role;
   final String text;
   final String? imagePath;
   final List<Citation>? sources;
   final int? elapsedMs; // generation time for assistant turns
+  final String? mapJson; // attached map tile (MapRef as JSON), if any
 }
 
 /// SQLite-backed chat history (conversations + messages) so chats survive app
@@ -95,12 +97,19 @@ class ChatStore {
         image_path TEXT,
         sources TEXT,
         created_at TEXT NOT NULL,
-        elapsed_ms INTEGER
+        elapsed_ms INTEGER,
+        map_json TEXT
       );
     ''');
     // Migrate older databases created before answer-timing was tracked.
     try {
       db.execute('ALTER TABLE messages ADD COLUMN elapsed_ms INTEGER;');
+    } catch (_) {
+      // column already exists
+    }
+    // Migrate older databases created before map tiles were attachable.
+    try {
+      db.execute('ALTER TABLE messages ADD COLUMN map_json TEXT;');
     } catch (_) {
       // column already exists
     }
@@ -151,7 +160,7 @@ class ChatStore {
     final now = DateTime.now().toIso8601String();
     _db.execute(
       'INSERT INTO messages(conv_id, role, text, image_path, sources, '
-      'created_at, elapsed_ms) VALUES(?,?,?,?,?,?,?);',
+      'created_at, elapsed_ms, map_json) VALUES(?,?,?,?,?,?,?,?);',
       [
         convId,
         m.role,
@@ -162,6 +171,7 @@ class ChatStore {
             : jsonEncode([for (final c in m.sources!) c.toJson()]),
         now,
         m.elapsedMs,
+        m.mapJson,
       ],
     );
     _db.execute(
@@ -170,7 +180,7 @@ class ChatStore {
 
   List<StoredMessage> messages(int convId) {
     final rs = _db.select(
-      'SELECT role, text, image_path, sources, elapsed_ms FROM messages '
+      'SELECT role, text, image_path, sources, elapsed_ms, map_json FROM messages '
       'WHERE conv_id=? ORDER BY id;',
       [convId],
     );
@@ -181,6 +191,7 @@ class ChatStore {
           text: r['text'] as String,
           imagePath: r['image_path'] as String?,
           elapsedMs: r['elapsed_ms'] as int?,
+          mapJson: r['map_json'] as String?,
           sources: r['sources'] == null
               ? null
               : [

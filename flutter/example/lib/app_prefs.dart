@@ -170,6 +170,47 @@ Future<void> saveMusicScanDone(bool done) async {
   await prefs.setBool(_kMusicScanDoneKey, done);
 }
 
+// ── Maps (cache-on-demand) ───────────────────────────────────────────────────
+
+const String _kMapsEnabledKey = 'maps_enabled';
+const String _kMapsFolderKey = 'maps_folder';
+const String _kMapsSatelliteKey = 'maps_satellite';
+
+/// Whether Eva may answer location/route questions with a map (default on).
+Future<bool> loadMapsEnabled() async {
+  final prefs = await SharedPreferences.getInstance();
+  return prefs.getBool(_kMapsEnabledKey) ?? true;
+}
+
+Future<void> saveMapsEnabled(bool enabled) async {
+  final prefs = await SharedPreferences.getInstance();
+  await prefs.setBool(_kMapsEnabledKey, enabled);
+}
+
+/// Folder where map tiles + geocode/route results are cached. Empty = app
+/// storage. Visited areas served from here when offline; point it at a folder
+/// that already has the cache to reuse it.
+Future<String> loadMapsFolder() async {
+  final prefs = await SharedPreferences.getInstance();
+  return prefs.getString(_kMapsFolderKey) ?? '';
+}
+
+Future<void> saveMapsFolder(String path) async {
+  final prefs = await SharedPreferences.getInstance();
+  await prefs.setString(_kMapsFolderKey, path);
+}
+
+/// Whether the map opens on the satellite layer (vs streets). Default streets.
+Future<bool> loadMapsSatellite() async {
+  final prefs = await SharedPreferences.getInstance();
+  return prefs.getBool(_kMapsSatelliteKey) ?? false;
+}
+
+Future<void> saveMapsSatellite(bool on) async {
+  final prefs = await SharedPreferences.getInstance();
+  await prefs.setBool(_kMapsSatelliteKey, on);
+}
+
 // ── Offline Wikipedia (libzim) ───────────────────────────────────────────────
 
 const String _kWikipediaZimPathKey = 'wikipedia_zim_path';

@@ -10,6 +10,9 @@
     <uses-permission android:name="android.permission.READ_MEDIA_AUDIO"/>
     <!-- Required to capture voice for on-device speech-to-text. -->
     <uses-permission android:name="android.permission.RECORD_AUDIO"/>
+    <!-- Show the user's live location on the offline map. -->
+    <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION"/>
+    <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION"/>
     <!-- Held so the system can bind Eva's voice-interaction services and Eva can
          be chosen as the default "Digital assistant app". -->
     <uses-permission android:name="android.permission.BIND_VOICE_INTERACTION"/>

@@ -4,7 +4,9 @@ import 'dart:io';
 
 import 'package:battery_plus/battery_plus.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter_map/flutter_map.dart';
 import 'package:gpt_markdown/gpt_markdown.dart';
+import 'package:latlong2/latlong.dart';
 import 'package:image_picker/image_picker.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
@@ -22,6 +24,9 @@ import 'chat_store.dart';
 import 'document_service.dart';
 import 'inference_isolate.dart';
 import 'intro_screen.dart';
+import 'map_viewer_screen.dart';
+import 'maps/map_ref.dart';
+import 'maps/map_service.dart';
 import 'model_catalog.dart';
 import 'model_manager.dart';
 import 'music_player.dart';
@@ -88,6 +93,8 @@ class ChatMessage {
   List<Citation>? sources;
   // Photo-gallery results to show as a thumbnail grid (not persisted).
   List<PhotoInfo>? photos;
+  // A map/location to show as an expandable tile under the answer.
+  MapRef? map;
   // How long this answer took to produce (assistant turns), shown under it.
   Duration? elapsed;
 }
@@ -273,8 +280,13 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                 ? m.imagePath
                 : null,
             sources: m.sources,
-          )..elapsed =
-              m.elapsedMs != null ? Duration(milliseconds: m.elapsedMs!) : null));
+          )
+            ..elapsed =
+                m.elapsedMs != null ? Duration(milliseconds: m.elapsedMs!) : null
+            ..map = m.mapJson == null
+                ? null
+                : MapRef.fromJson(
+                    jsonDecode(m.mapJson!) as Map<String, dynamic>)));
     if (mounted) setState(() {});
   }
 
@@ -304,7 +316,8 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
               text: m.text,
               imagePath: m.imagePath,
               sources: m.sources,
-              elapsedMs: m.elapsed?.inMilliseconds));
+              elapsedMs: m.elapsed?.inMilliseconds,
+              mapJson: m.map == null ? null : jsonEncode(m.map!.toJson())));
       _convs = chats.listConversations();
     } catch (_) {/* persistence is best-effort */}
   }
@@ -771,6 +784,18 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     if (imagePath == null) {
       final pq = _parsePhotoQuery(text);
       if (pq != null && await _answerWithPhotos(pq, assistant)) {
+        setState(() => _generating = false);
+        _persistMessage(assistant);
+        _scrollToBottom();
+        return;
+      }
+    }
+
+    // Map/location requests ("show me Lisbon on a map", "where is the Louvre")
+    // are answered with an expandable map tile + live GPS dot, not the model.
+    if (imagePath == null) {
+      final place = _parseMapQuery(text);
+      if (place != null && await _answerWithMap(place, assistant)) {
         setState(() => _generating = false);
         _persistMessage(assistant);
         _scrollToBottom();
@@ -2194,6 +2219,82 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     );
   }
 
+  // ── Map / location chat queries ─────────────────────────────────────────────
+
+  /// Detects "show me X on a map / where is X / route to X" (multilingual) and
+  /// returns the place to look up, or null when the message isn't about a place.
+  String? _parseMapQuery(String text) {
+    final t = text.toLowerCase().trim();
+    // Trigger words: the noun "map", or location/route verbs across EN/PT/ES/FR/
+    // IT/DE. We only short-circuit to a map when one of these is present.
+    const mapNouns = [
+      'map', 'maps', 'mapa', 'mapas', 'carte', 'cartes', 'karte', 'mappa'
+    ];
+    final hasMapNoun = mapNouns.any((w) => RegExp('\\b$w\\b').hasMatch(t));
+    // "where is X", "onde fica/está X", "dónde está X", "où est X", "wo ist X".
+    final whereMatch = RegExp(
+            r'\b(?:where(?:\x27s| is| are)?|onde (?:fica|está|fica o|fica a|esta)|'
+            r'd[oó]nde (?:est[aá]|queda)|o[uù] (?:est|se trouve)|wo (?:ist|liegt|sind))\b')
+        .firstMatch(t);
+    // "route/directions/navigate to X", "rota/caminho até X", "ruta a X", etc.
+    final routeMatch = RegExp(
+            r'\b(?:route|directions?|navigate|way|path|rota|caminho|trajeto|'
+            r'ruta|itin[ée]raire|weg|route nach)\b')
+        .firstMatch(t);
+    if (!hasMapNoun && whereMatch == null && routeMatch == null) return null;
+
+    // Pull the place out of the phrase. Strip the trigger/filler words; whatever
+    // significant words remain (place names, POI types) are the geocoder query.
+    const filler = {
+      'show', 'me', 'my', 'the', 'a', 'an', 'on', 'in', 'at', 'of', 'to',
+      'is', 'are', 'where', 'wheres', 'find', 'locate', 'please', 'can', 'you',
+      'get', 'go', 'how', 'do', 'i', 'from', 'here', 'near', 'nearest', 'nearby',
+      'route', 'directions', 'direction', 'navigate', 'way', 'path', 'and',
+      'mostra', 'onde', 'fica', 'está', 'esta', 'rota',
+      'caminho', 'trajeto', 'perto', 'aqui', 'para', 'até', 'ate', 'o', 'os',
+      'da', 'das', 'dos', 'um', 'uma', 'no', 'na',
+      'dónde', 'donde', 'queda', 'ruta', 'cerca', 'cómo', 'como', 'llegar',
+      'où', 'ou', 'est', 'se', 'trouve', 'itinéraire', 'itineraire',
+      'wo', 'ist', 'liegt', 'weg', 'nach', 'dove',
+      ...mapNouns,
+    };
+    final words = RegExp(r'[\p{L}\p{N}]+', unicode: true)
+        .allMatches(t)
+        .map((m) => m.group(0)!)
+        .where((w) => !filler.contains(w))
+        .toList();
+    final query = words.join(' ').trim();
+    if (query.isEmpty) return null;
+    return query;
+  }
+
+  /// Geocodes [place] via [MapService] and attaches an expandable map tile to
+  /// [assistant]. Returns false (so the model answers) when maps are disabled or
+  /// the place can't be resolved (e.g. offline and not cached).
+  Future<bool> _answerWithMap(String place, ChatMessage assistant) async {
+    if (!await loadMapsEnabled()) return false;
+    _setThinking('Looking up the map…');
+    final geo = await MapService.instance
+        .geocode(place, nowMs: DateTime.now().millisecondsSinceEpoch);
+    if (geo == null) return false; // let the model reply (offline/unknown place)
+    // A short, readable name: the first part of the geocoder's display name.
+    final shortName = geo.name.split(',').first.trim();
+    setState(() {
+      assistant.text = 'Here is $shortName on the map. '
+          'Tap it to open full-screen with your live location.';
+      assistant.map = MapRef(lat: geo.lat, lon: geo.lon, zoom: 14, label: shortName);
+    });
+    return true;
+  }
+
+  /// A small, non-interactive map preview under an answer; tap to open
+  /// full-screen with the live GPS dot (like the photo grid / document tiles).
+  void _openMap(MapRef ref) {
+    Navigator.of(context).push(MaterialPageRoute(
+      builder: (_) => MapViewerScreen(title: ref.label ?? 'Map', ref: ref),
+    ));
+  }
+
   /// A citation is openable when it points at a PDF on disk, or at any other
   /// extracted-text document (opened in-app at the quote).
   bool _canOpen(Citation c) {
@@ -2372,6 +2473,8 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                     ),
                     if (m.photos != null && m.photos!.isNotEmpty)
                       _photoGrid(m.photos!),
+                    if (m.map != null)
+                      _MapTilePreview(ref: m.map!, onTap: () => _openMap(m.map!)),
                   ],
                 ),
     );
@@ -2544,6 +2647,109 @@ class _SourceChip extends StatelessWidget {
                     color: scheme.onSurfaceVariant.withValues(alpha: 0.6)),
               ],
             ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+/// A small, non-interactive map preview shown under an answer. Tapping opens the
+/// full-screen [MapViewerScreen]. The street tile provider is loaded async (it
+/// needs the cache folder), so until ready we show a neutral placeholder.
+class _MapTilePreview extends StatefulWidget {
+  const _MapTilePreview({required this.ref, required this.onTap});
+
+  final MapRef ref;
+  final VoidCallback onTap;
+
+  @override
+  State<_MapTilePreview> createState() => _MapTilePreviewState();
+}
+
+class _MapTilePreviewState extends State<_MapTilePreview> {
+  TileProvider? _tiles;
+
+  @override
+  void initState() {
+    super.initState();
+    _load();
+  }
+
+  Future<void> _load() async {
+    final tp = await MapService.instance.tileProvider('streets');
+    if (mounted) setState(() => _tiles = tp);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    final dest = LatLng(widget.ref.lat, widget.ref.lon);
+    return Padding(
+      padding: const EdgeInsets.only(top: 8),
+      child: ClipRRect(
+        borderRadius: BorderRadius.circular(12),
+        child: GestureDetector(
+          onTap: widget.onTap,
+          child: SizedBox(
+            height: 160,
+            child: Stack(
+              children: [
+                Positioned.fill(
+                  child: _tiles == null
+                      ? Container(color: scheme.surfaceContainerHigh)
+                      : FlutterMap(
+                          options: MapOptions(
+                            initialCenter: dest,
+                            initialZoom: widget.ref.zoom,
+                            // Non-interactive: it's a preview; tap opens the map.
+                            interactionOptions: const InteractionOptions(
+                                flags: InteractiveFlag.none),
+                          ),
+                          children: [
+                            TileLayer(
+                              urlTemplate: MapService.streetUrl,
+                              tileProvider: _tiles!,
+                              maxNativeZoom: 19,
+                              userAgentPackageName: 'radio.geogram.eva',
+                              errorTileCallback: (tile, error, stack) {},
+                            ),
+                            MarkerLayer(markers: [
+                              Marker(
+                                point: dest,
+                                width: 36,
+                                height: 36,
+                                alignment: Alignment.topCenter,
+                                child: const Icon(Icons.location_on,
+                                    color: Colors.red, size: 36),
+                              ),
+                            ]),
+                          ],
+                        ),
+                ),
+                // "Open full-screen" affordance.
+                Positioned(
+                  right: 8,
+                  bottom: 8,
+                  child: Material(
+                    color: scheme.surface.withValues(alpha: 0.85),
+                    borderRadius: BorderRadius.circular(20),
+                    child: Padding(
+                      padding: const EdgeInsets.symmetric(
+                          horizontal: 10, vertical: 6),
+                      child: Row(mainAxisSize: MainAxisSize.min, children: [
+                        Icon(Icons.fullscreen,
+                            size: 16, color: scheme.onSurface),
+                        const SizedBox(width: 4),
+                        Text('Open map',
+                            style: TextStyle(
+                                fontSize: 12, color: scheme.onSurface)),
+                      ]),
+                    ),
+                  ),
+                ),
+              ],
+            ),
           ),
         ),
       ),
