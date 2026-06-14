@@ -2752,12 +2752,18 @@ class _MapTilePreviewState extends State<_MapTilePreview> {
         borderRadius: BorderRadius.circular(12),
         child: GestureDetector(
           onTap: widget.onTap,
+          // Opaque so the tap is caught across the whole tile even though the
+          // map below ignores pointers (deferToChild would otherwise miss it).
+          behavior: HitTestBehavior.opaque,
           child: SizedBox(
             height: 160,
             child: Stack(
               children: [
                 Positioned.fill(
-                  child: _tiles == null
+                  // IgnorePointer so FlutterMap doesn't swallow the tap — the
+                  // parent GestureDetector handles it and opens the full map.
+                  child: IgnorePointer(
+                    child: _tiles == null
                       ? Container(color: scheme.surfaceContainerHigh)
                       : FlutterMap(
                           options: MapOptions(
@@ -2787,6 +2793,7 @@ class _MapTilePreviewState extends State<_MapTilePreview> {
                             ]),
                           ],
                         ),
+                  ),
                 ),
                 // "Open full-screen" affordance.
                 Positioned(
