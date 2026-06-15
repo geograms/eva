@@ -24,6 +24,8 @@ class PhotoInfo {
     this.thumb,
     this.caption,
     this.tags = const [],
+    this.lat,
+    this.lon,
   });
   final int id;
   final String path;
@@ -36,6 +38,10 @@ class PhotoInfo {
   final Uint8List? thumb; // cached JPEG thumbnail
   final String? caption; // filled by the later ML pass
   final List<String> tags; // user-added labels for categorisation
+  final double? lat; // GPS latitude from EXIF, if present
+  final double? lon; // GPS longitude from EXIF, if present
+
+  bool get hasLocation => lat != null && lon != null;
 }
 
 /// SQLite-backed photo metadata + cached thumbnails. Lives in the corpus pack so
@@ -61,12 +67,24 @@ class PhotoStore {
         thumb BLOB,                  -- cached JPEG thumbnail
         caption TEXT,                -- filled by the vision pass (later)
         captioned INTEGER NOT NULL DEFAULT 0,
-        tags TEXT NOT NULL DEFAULT ''  -- comma-separated user tags
+        tags TEXT NOT NULL DEFAULT '',  -- comma-separated user tags
+        lat REAL,                       -- GPS latitude (EXIF)
+        lon REAL,                       -- GPS longitude (EXIF)
+        loc_checked INTEGER NOT NULL DEFAULT 0  -- EXIF GPS already read?
       );
     ''');
-    // Migrate databases created before user tags existed.
+    // Migrate databases created before user tags / GPS existed.
     try {
       db.execute("ALTER TABLE photos ADD COLUMN tags TEXT NOT NULL DEFAULT '';");
+    } catch (_) {/* column already exists */}
+    try {
+      db.execute('ALTER TABLE photos ADD COLUMN lat REAL;');
+    } catch (_) {/* column already exists */}
+    try {
+      db.execute('ALTER TABLE photos ADD COLUMN lon REAL;');
+    } catch (_) {/* column already exists */}
+    try {
+      db.execute('ALTER TABLE photos ADD COLUMN loc_checked INTEGER NOT NULL DEFAULT 0;');
     } catch (_) {/* column already exists */}
     db.execute('CREATE INDEX IF NOT EXISTS idx_photos_taken ON photos(taken_at);');
     db.execute('CREATE INDEX IF NOT EXISTS idx_photos_type ON photos(type);');
@@ -94,7 +112,7 @@ class PhotoStore {
     }
     final rs = _db.select(
       'SELECT id, path, taken_at, width, height, size, bucket, type, '
-      'thumb, caption, tags FROM photos WHERE ${where.join(' AND ')} '
+      'thumb, caption, tags, lat, lon FROM photos WHERE ${where.join(' AND ')} '
       'ORDER BY taken_at DESC LIMIT ?;',
       [...args, limit],
     );
@@ -164,7 +182,7 @@ class PhotoStore {
     try {
       final rs = _db.select(
         'SELECT p.id, p.path, p.taken_at, p.width, p.height, p.size, p.bucket, '
-        'p.type, p.thumb, p.caption, p.tags FROM captions_fts f '
+        'p.type, p.thumb, p.caption, p.tags, p.lat, p.lon FROM captions_fts f '
         'JOIN photos p ON p.id = f.rowid '
         'WHERE captions_fts MATCH ?'
         '${extra.isEmpty ? '' : ' AND ${extra.join(' AND ')}'} '
@@ -189,8 +207,8 @@ class PhotoStore {
   void upsert(PhotoInfo p) {
     _db.execute(
       'INSERT OR REPLACE INTO photos'
-      '(path, taken_at, width, height, size, bucket, type, thumb) '
-      'VALUES(?,?,?,?,?,?,?,?);',
+      '(path, taken_at, width, height, size, bucket, type, thumb, lat, lon, loc_checked) '
+      'VALUES(?,?,?,?,?,?,?,?,?,?,1);',
       [
         p.path,
         p.takenAt.millisecondsSinceEpoch,
@@ -200,6 +218,8 @@ class PhotoStore {
         p.bucket,
         p.type.name,
         p.thumb,
+        p.lat,
+        p.lon,
       ],
     );
   }
@@ -227,8 +247,8 @@ class PhotoStore {
       args.add(type.name);
     }
     final cols = withThumb
-        ? 'id, path, taken_at, width, height, size, bucket, type, thumb, caption, tags'
-        : 'id, path, taken_at, width, height, size, bucket, type, NULL AS thumb, caption, tags';
+        ? 'id, path, taken_at, width, height, size, bucket, type, thumb, caption, tags, lat, lon'
+        : 'id, path, taken_at, width, height, size, bucket, type, NULL AS thumb, caption, tags, lat, lon';
     final sql = 'SELECT $cols FROM photos'
         '${where.isEmpty ? '' : ' WHERE ${where.join(' AND ')}'}'
         ' ORDER BY taken_at DESC LIMIT ?;';
@@ -248,6 +268,8 @@ class PhotoStore {
         thumb: r['thumb'] as Uint8List?,
         caption: r['caption'] as String?,
         tags: _splitTags(r['tags'] as String?),
+        lat: (r['lat'] as num?)?.toDouble(),
+        lon: (r['lon'] as num?)?.toDouble(),
       );
 
   static List<String> _splitTags(String? raw) => (raw ?? '')
@@ -280,13 +302,42 @@ class PhotoStore {
   List<PhotoInfo> byTag(String tag, {int limit = 500}) {
     final rs = _db.select(
       'SELECT id, path, taken_at, width, height, size, bucket, type, thumb, '
-      'caption, tags FROM photos WHERE tags LIKE ? '
+      'caption, tags, lat, lon FROM photos WHERE tags LIKE ? '
       'ORDER BY taken_at DESC LIMIT ?;',
       ['%$tag%', limit],
     );
     // LIKE is loose; keep only exact tag membership.
     return [for (final r in rs) _row(r)].where((p) => p.tags.contains(tag)).toList();
   }
+
+  /// Records the EXIF GPS for a photo (null lat/lon = no location found), and
+  /// marks it checked so it isn't re-read on the next scan.
+  void setLocation(int id, double? lat, double? lon) {
+    _db.execute('UPDATE photos SET lat=?, lon=?, loc_checked=1 WHERE id=?;',
+        [lat, lon, id]);
+  }
+
+  /// Indexed photos whose EXIF GPS hasn't been read yet (for backfill).
+  List<({int id, String path})> needingLocation({int limit = 300}) {
+    final rs = _db.select(
+        'SELECT id, path FROM photos WHERE loc_checked=0 LIMIT ?;', [limit]);
+    return [for (final r in rs) (id: r['id'] as int, path: r['path'] as String)];
+  }
+
+  /// Geotagged photos, newest first.
+  List<PhotoInfo> located({int limit = 500}) {
+    final rs = _db.select(
+      'SELECT id, path, taken_at, width, height, size, bucket, type, thumb, '
+      'caption, tags, lat, lon FROM photos WHERE lat IS NOT NULL '
+      'ORDER BY taken_at DESC LIMIT ?;',
+      [limit],
+    );
+    return [for (final r in rs) _row(r)];
+  }
+
+  int get locatedCount =>
+      _db.select('SELECT COUNT(*) AS n FROM photos WHERE lat IS NOT NULL;')
+          .first['n'] as int;
 
   /// Gallery search across the LLM caption AND user tags (case-insensitive
   /// substring), newest first. Simpler than FTS so it also covers tags.
@@ -295,7 +346,7 @@ class PhotoStore {
     if (q.isEmpty) return const [];
     final rs = _db.select(
       'SELECT id, path, taken_at, width, height, size, bucket, type, thumb, '
-      'caption, tags FROM photos '
+      'caption, tags, lat, lon FROM photos '
       'WHERE LOWER(caption) LIKE ? OR LOWER(tags) LIKE ? '
       'ORDER BY taken_at DESC LIMIT ?;',
       ['%$q%', '%$q%', limit],

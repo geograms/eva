@@ -417,6 +417,45 @@ Future<void> saveReminders(List<ReminderItem> reminders) async {
       _kRemindersKey, jsonEncode([for (final r in reminders) r.toJson()]));
 }
 
+// ── Reading positions (resume where you left off) ────────────────────────────
+
+const String _kDocPagesKey = 'doc_pages'; // {docKey: pageNumber}
+const String _kDocScrollKey = 'doc_scroll'; // {docKey: 0..1 scroll fraction}
+
+Future<Map<String, dynamic>> _loadMap(String key) async {
+  final prefs = await SharedPreferences.getInstance();
+  final raw = prefs.getString(key);
+  if (raw == null) return {};
+  try {
+    return (jsonDecode(raw) as Map).cast<String, dynamic>();
+  } catch (_) {
+    return {};
+  }
+}
+
+Future<void> _putMapValue(String key, String field, Object value) async {
+  final prefs = await SharedPreferences.getInstance();
+  final map = await _loadMap(key);
+  map[field] = value;
+  await prefs.setString(key, jsonEncode(map));
+}
+
+/// Last-read page for a PDF (1-based), or null if none saved.
+Future<int?> loadDocPage(String docKey) async =>
+    (await _loadMap(_kDocPagesKey))[docKey] as int?;
+
+Future<void> saveDocPage(String docKey, int page) =>
+    _putMapValue(_kDocPagesKey, docKey, page);
+
+/// Last scroll fraction (0..1) for a text document, or null if none saved.
+Future<double?> loadDocScroll(String docKey) async {
+  final v = (await _loadMap(_kDocScrollKey))[docKey];
+  return (v as num?)?.toDouble();
+}
+
+Future<void> saveDocScroll(String docKey, double fraction) =>
+    _putMapValue(_kDocScrollKey, docKey, fraction);
+
 // ── Storage migration ────────────────────────────────────────────────────────
 
 /// The absolute directories where Eva's data currently lives (models, offline

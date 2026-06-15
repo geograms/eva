@@ -236,6 +236,26 @@ class MusicStore {
     return [for (final r in rs) _row(r)];
   }
 
+  /// Distinct source folders with track counts, most tracks first.
+  List<({String name, int count})> folders({int limit = 200}) {
+    final rs = _db.select(
+      "SELECT bucket AS name, COUNT(*) AS n FROM tracks WHERE bucket != '' "
+      'GROUP BY bucket ORDER BY n DESC, name LIMIT ?;',
+      [limit],
+    );
+    return [for (final r in rs) (name: r['name'] as String, count: r['n'] as int)];
+  }
+
+  /// Tracks in a source folder, album/track order.
+  List<TrackInfo> byFolder(String bucket, {int limit = 1000}) {
+    final rs = _db.select(
+      'SELECT * FROM tracks WHERE bucket = ? '
+      'ORDER BY album, track_no, title LIMIT ?;',
+      [bucket, limit],
+    );
+    return [for (final r in rs) _row(r)];
+  }
+
   /// All tracks by an artist (case-insensitive substring), album/track order.
   List<TrackInfo> byArtist(String artist, {int limit = 100}) {
     final rs = _db.select(

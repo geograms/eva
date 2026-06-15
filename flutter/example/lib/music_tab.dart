@@ -23,6 +23,7 @@ class _MusicTabState extends State<MusicTab> {
   List<TrackInfo> _top = const [];
   List<({String name, int count})> _artists = const [];
   List<({String name, int count})> _genres = const [];
+  List<({String name, int count})> _folders = const [];
   List<TrackInfo> _searchResults = const [];
   bool _loading = true;
 
@@ -40,6 +41,7 @@ class _MusicTabState extends State<MusicTab> {
       _top = store.topPlayed(limit: 30);
       _artists = store.artists(limit: 60);
       _genres = store.genres(limit: 40);
+      _folders = store.folders(limit: 100);
       _loading = false;
     });
   }
@@ -66,6 +68,17 @@ class _MusicTabState extends State<MusicTab> {
   Future<void> _playList(List<TrackInfo> tracks, {int startAt = 0}) async {
     if (tracks.isEmpty) return;
     await widget.player.playQueue(tracks, startAt: startAt);
+  }
+
+  void _openFolder(String folder) {
+    final tracks = _store?.byFolder(folder) ?? const [];
+    Navigator.of(context).push(MaterialPageRoute(
+      builder: (_) => _FolderScreen(
+        title: folder,
+        tracks: tracks,
+        player: widget.player,
+      ),
+    ));
   }
 
   @override
@@ -125,6 +138,17 @@ class _MusicTabState extends State<MusicTab> {
                     else
                       for (var i = 0; i < _top.length; i++)
                         _trackTile(_top[i], () => _playList(_top, startAt: i)),
+                    if (_folders.isNotEmpty) ...[
+                      _header('Folders'),
+                      for (final f in _folders)
+                        ListTile(
+                          leading: const Icon(Icons.folder_outlined),
+                          title: Text(f.name),
+                          subtitle: Text('${f.count} track${f.count == 1 ? '' : 's'}'),
+                          trailing: const Icon(Icons.chevron_right),
+                          onTap: () => _openFolder(f.name),
+                        ),
+                    ],
                     if (_genres.isNotEmpty) ...[
                       _header('Genres'),
                       Padding(
@@ -250,6 +274,82 @@ class _MusicTabState extends State<MusicTab> {
             ),
           ],
         ),
+      ),
+    );
+  }
+}
+
+/// A folder's tracks, with a "Play all" and per-track play. Listens to the
+/// player so the currently-playing track is highlighted.
+class _FolderScreen extends StatefulWidget {
+  const _FolderScreen({
+    required this.title,
+    required this.tracks,
+    required this.player,
+  });
+
+  final String title;
+  final List<TrackInfo> tracks;
+  final MusicPlayer player;
+
+  @override
+  State<_FolderScreen> createState() => _FolderScreenState();
+}
+
+class _FolderScreenState extends State<_FolderScreen> {
+  @override
+  void initState() {
+    super.initState();
+    widget.player.addListener(_onPlayer);
+  }
+
+  void _onPlayer() {
+    if (mounted) setState(() {});
+  }
+
+  @override
+  void dispose() {
+    widget.player.removeListener(_onPlayer);
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    return Scaffold(
+      appBar: AppBar(
+        title: Text(widget.title, maxLines: 1, overflow: TextOverflow.ellipsis),
+        actions: [
+          IconButton(
+            tooltip: 'Play all',
+            icon: const Icon(Icons.play_circle_fill),
+            onPressed: widget.tracks.isEmpty
+                ? null
+                : () => widget.player.playQueue(widget.tracks),
+          ),
+        ],
+      ),
+      body: ListView.builder(
+        itemCount: widget.tracks.length,
+        itemBuilder: (context, i) {
+          final t = widget.tracks[i];
+          final playing =
+              widget.player.current?.id == t.id && !widget.player.isRadio;
+          return ListTile(
+            dense: true,
+            leading: Icon(playing ? Icons.equalizer : Icons.music_note,
+                color: playing ? scheme.primary : null),
+            title: Text(t.title.isNotEmpty ? t.title : t.path.split('/').last,
+                maxLines: 1, overflow: TextOverflow.ellipsis),
+            subtitle: Text(
+              [if (t.artist.isNotEmpty) t.artist, if (t.album.isNotEmpty) t.album]
+                  .join(' · '),
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+            ),
+            onTap: () => widget.player.playQueue(widget.tracks, startAt: i),
+          );
+        },
       ),
     );
   }

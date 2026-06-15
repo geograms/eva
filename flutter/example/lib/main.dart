@@ -111,7 +111,8 @@ class ChatScreen extends StatefulWidget {
   State<ChatScreen> createState() => _ChatScreenState();
 }
 
-class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
+class _ChatScreenState extends State<ChatScreen>
+    with WidgetsBindingObserver, TickerProviderStateMixin {
   final ModelManager _models = ModelManager();
   final InferenceEngine _engine = InferenceEngine();
   final TextEditingController _input = TextEditingController();
@@ -127,6 +128,8 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
   final SystemVoiceService _systemVoice = SystemVoiceService();
   final DocumentService _docs = DocumentService();
   int _tab = 0; // 0 chat · 1 images · 2 music · 3 docs
+  late final TabController _tabController =
+      TabController(length: 4, vsync: this)..addListener(_onTabChanged);
   late final PhotoService _photos = PhotoService(_docs);
   PhotoIndexController? _photoIndexer;
   late final MusicService _music = MusicService(_docs);
@@ -234,8 +237,15 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     await _bootstrap();
   }
 
+  void _onTabChanged() {
+    if (_tab != _tabController.index) {
+      setState(() => _tab = _tabController.index);
+    }
+  }
+
   @override
   void dispose() {
+    _tabController.dispose();
     _input.dispose();
     _scroll.dispose();
     _voice.dispose();
@@ -1979,11 +1989,10 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
       );
     }
 
-    const titles = ['Eva', 'Images', 'Music', 'Docs'];
     return Scaffold(
       drawer: _tab == 0 ? _buildDrawer() : null,
       appBar: AppBar(
-        title: Text(titles[_tab]),
+        title: const Text('Eva'),
         actions: [
           if (_tab == 0)
             IconButton(
@@ -1997,6 +2006,17 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
             icon: const Icon(Icons.tune),
           ),
         ],
+        // The section tabs sit under the title (not at the bottom, where they
+        // crowded the message input).
+        bottom: TabBar(
+          controller: _tabController,
+          tabs: const [
+            Tab(icon: Icon(Icons.chat_bubble_outline), text: 'Chat'),
+            Tab(icon: Icon(Icons.photo_library_outlined), text: 'Images'),
+            Tab(icon: Icon(Icons.library_music_outlined), text: 'Music'),
+            Tab(icon: Icon(Icons.menu_book_outlined), text: 'Docs'),
+          ],
+        ),
       ),
       body: IndexedStack(
         index: _tab,
@@ -2005,28 +2025,6 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
           ImagesTab(photos: _photos),
           MusicTab(music: _music, player: _player),
           DocsTab(docs: _docs),
-        ],
-      ),
-      bottomNavigationBar: NavigationBar(
-        selectedIndex: _tab,
-        onDestinationSelected: (i) => setState(() => _tab = i),
-        destinations: const [
-          NavigationDestination(
-              icon: Icon(Icons.chat_bubble_outline),
-              selectedIcon: Icon(Icons.chat_bubble),
-              label: 'Chat'),
-          NavigationDestination(
-              icon: Icon(Icons.photo_library_outlined),
-              selectedIcon: Icon(Icons.photo_library),
-              label: 'Images'),
-          NavigationDestination(
-              icon: Icon(Icons.library_music_outlined),
-              selectedIcon: Icon(Icons.library_music),
-              label: 'Music'),
-          NavigationDestination(
-              icon: Icon(Icons.menu_book_outlined),
-              selectedIcon: Icon(Icons.menu_book),
-              label: 'Docs'),
         ],
       ),
     );

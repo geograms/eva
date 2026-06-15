@@ -1,5 +1,7 @@
 import 'package:flutter/material.dart';
 
+import 'app_prefs.dart';
+
 /// Shows a document's extracted text, scrolled to and highlighting the cited
 /// passage — the non-PDF equivalent of opening a PDF at its page. Used for
 /// Word/PowerPoint/Excel/EPUB/text citations, which have no native paginated
@@ -13,11 +15,15 @@ class DocTextViewerScreen extends StatefulWidget {
     required this.title,
     required this.fullText,
     required this.snippet,
+    this.resumeKey,
   });
 
   final String title;
   final String fullText;
   final String snippet;
+  // When set (and there's no quote to jump to), remembers and resumes the
+  // scroll position so reading picks up where it was left.
+  final String? resumeKey;
 
   @override
   State<DocTextViewerScreen> createState() => _DocTextViewerScreenState();
@@ -27,6 +33,7 @@ class _DocTextViewerScreenState extends State<DocTextViewerScreen> {
   static const int _window = 8000; // chars of context on each side of the quote
 
   final GlobalKey _highlightKey = GlobalKey();
+  final ScrollController _scroll = ScrollController();
   late final _Located _loc;
 
   @override
@@ -41,7 +48,31 @@ class _DocTextViewerScreenState extends State<DocTextViewerScreen> {
               alignment: 0.12, duration: const Duration(milliseconds: 350));
         }
       });
+    } else if (widget.resumeKey != null) {
+      // No quote to jump to: resume the last scroll position and keep it saved.
+      WidgetsBinding.instance.addPostFrameCallback((_) => _restoreScroll());
+      _scroll.addListener(_saveScroll);
     }
+  }
+
+  Future<void> _restoreScroll() async {
+    final frac = await loadDocScroll(widget.resumeKey!);
+    if (frac == null || !mounted || !_scroll.hasClients) return;
+    final max = _scroll.position.maxScrollExtent;
+    if (max > 0) _scroll.jumpTo((frac * max).clamp(0, max));
+  }
+
+  void _saveScroll() {
+    if (!_scroll.hasClients) return;
+    final max = _scroll.position.maxScrollExtent;
+    if (max <= 0) return;
+    saveDocScroll(widget.resumeKey!, (_scroll.offset / max).clamp(0.0, 1.0));
+  }
+
+  @override
+  void dispose() {
+    _scroll.dispose();
+    super.dispose();
   }
 
   /// Finds the quote in [text] with a whitespace-tolerant match on its leading
@@ -134,6 +165,7 @@ class _DocTextViewerScreenState extends State<DocTextViewerScreen> {
             ),
           Expanded(
             child: SingleChildScrollView(
+              controller: _scroll,
               padding: const EdgeInsets.all(16),
               child: SelectableText.rich(
                 TextSpan(

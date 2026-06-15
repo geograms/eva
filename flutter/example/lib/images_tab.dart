@@ -2,6 +2,8 @@ import 'dart:io';
 
 import 'package:flutter/material.dart';
 
+import 'map_viewer_screen.dart';
+import 'maps/map_ref.dart';
 import 'photo_service.dart';
 import 'photo_store.dart';
 import 'photos_screen.dart' show PhotoViewScreen;
@@ -23,9 +25,11 @@ class _ImagesTabState extends State<ImagesTab> {
   final TextEditingController _search = TextEditingController();
   List<PhotoInfo> _results = const [];
   List<({String tag, int count})> _tags = const [];
-  // Active filter: a PhotoType, a tag string, or null for "all".
+  // Active filter: a PhotoType, a tag string, "located", or null for "all".
   PhotoType? _typeFilter;
   String? _tagFilter;
+  bool _locatedOnly = false;
+  int _locatedCount = 0;
   bool _loading = true;
 
   @override
@@ -46,6 +50,8 @@ class _ImagesTabState extends State<ImagesTab> {
     List<PhotoInfo> rows;
     if (q.isNotEmpty) {
       rows = store.searchAll(q, limit: 400);
+    } else if (_locatedOnly) {
+      rows = store.located(limit: 500);
     } else if (_tagFilter != null) {
       rows = store.byTag(_tagFilter!, limit: 500);
     } else {
@@ -54,6 +60,7 @@ class _ImagesTabState extends State<ImagesTab> {
     setState(() {
       _results = rows;
       _tags = store.tagCounts();
+      _locatedCount = store.locatedCount;
       _loading = false;
     });
   }
@@ -113,22 +120,34 @@ class _ImagesTabState extends State<ImagesTab> {
             scrollDirection: Axis.horizontal,
             padding: const EdgeInsets.symmetric(horizontal: 12),
             children: [
-              _chip('All', _typeFilter == null && _tagFilter == null, () {
+              _chip('All', _typeFilter == null && _tagFilter == null && !_locatedOnly, () {
                 setState(() {
                   _typeFilter = null;
                   _tagFilter = null;
+                  _locatedOnly = false;
                 });
                 _reload();
               }),
+              if (_locatedCount > 0)
+                _chip('📍 Located ($_locatedCount)', _locatedOnly, () {
+                  setState(() {
+                    _locatedOnly = true;
+                    _typeFilter = null;
+                    _tagFilter = null;
+                    _search.clear();
+                  });
+                  _reload();
+                }),
               for (final t in const [
                 ('Photos', PhotoType.photo),
                 ('Screenshots', PhotoType.screenshot),
                 ('Memes', PhotoType.meme),
               ])
-                _chip(t.$1, _typeFilter == t.$2 && _search.text.isEmpty, () {
+                _chip(t.$1, _typeFilter == t.$2 && _search.text.isEmpty && !_locatedOnly, () {
                   setState(() {
                     _typeFilter = t.$2;
                     _tagFilter = null;
+                    _locatedOnly = false;
                     _search.clear();
                   });
                   _reload();
@@ -138,6 +157,7 @@ class _ImagesTabState extends State<ImagesTab> {
                   setState(() {
                     _tagFilter = tag.tag;
                     _typeFilter = null;
+                    _locatedOnly = false;
                     _search.clear();
                   });
                   _reload();
@@ -287,6 +307,20 @@ class _PhotoDetailState extends State<_PhotoDetail> {
               padding: const EdgeInsets.all(14),
               child: Text('“${p.caption}”',
                   style: const TextStyle(fontStyle: FontStyle.italic)),
+            ),
+          if (p.hasLocation)
+            ListTile(
+              leading: const Icon(Icons.place_outlined),
+              title: Text(
+                  '${p.lat!.toStringAsFixed(5)}, ${p.lon!.toStringAsFixed(5)}'),
+              subtitle: const Text('Taken here'),
+              trailing: const Icon(Icons.map_outlined),
+              onTap: () => Navigator.of(context).push(MaterialPageRoute(
+                builder: (_) => MapViewerScreen(
+                  title: 'Photo location',
+                  ref: MapRef(lat: p.lat!, lon: p.lon!, zoom: 15, label: 'Photo'),
+                ),
+              )),
             ),
           Padding(
             padding: const EdgeInsets.fromLTRB(14, 6, 14, 4),

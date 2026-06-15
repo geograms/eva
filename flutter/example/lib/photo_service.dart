@@ -122,6 +122,9 @@ class PhotoService {
         }
         await Future<void>.delayed(Duration.zero); // keep the UI responsive
       }
+      // Backfill EXIF GPS for photos indexed before location support (bounded
+      // per run; the loc_checked flag stops re-reading the same files).
+      await backfillLocations(store, max: 200);
     } finally {
       store.close();
       if (skip.length != skip0) await _saveSkip(skip);
@@ -143,6 +146,7 @@ class PhotoService {
 
     DateTime taken;
     int w = 0, h = 0;
+    double? lat, lon;
     try {
       final tags = await readExifFromBytes(bytes);
       taken = _exifDate(tags) ?? (await f.lastModified());
@@ -152,6 +156,9 @@ class PhotoService {
       h = _exifInt(tags, 'EXIF ExifImageLength') ??
           _exifInt(tags, 'Image ImageLength') ??
           0;
+      final gps = _exifGps(tags);
+      lat = gps?.$1;
+      lon = gps?.$2;
     } catch (_) {
       taken = await f.lastModified();
     }
@@ -167,7 +174,64 @@ class PhotoService {
       bucket: bucket,
       type: _classify(f.path, bucket),
       thumb: thumb,
+      lat: lat,
+      lon: lon,
     );
+  }
+
+  /// Reads EXIF GPS (degrees/minutes/seconds + N/S/E/W ref) into decimal
+  /// (lat, lon), or null when the photo isn't geotagged.
+  (double, double)? _exifGps(Map<String, IfdTag> tags) {
+    final lat = _gpsDecimal(
+        tags['GPS GPSLatitude']?.printable, tags['GPS GPSLatitudeRef']?.printable);
+    final lon = _gpsDecimal(tags['GPS GPSLongitude']?.printable,
+        tags['GPS GPSLongitudeRef']?.printable);
+    if (lat == null || lon == null) return null;
+    return (lat, lon);
+  }
+
+  double? _gpsDecimal(String? dms, String? ref) {
+    if (dms == null) return null;
+    final parts = dms
+        .replaceAll('[', '')
+        .replaceAll(']', '')
+        .split(',')
+        .map((s) => s.trim())
+        .toList();
+    if (parts.length < 3) return null;
+    double? frac(String s) {
+      if (s.contains('/')) {
+        final a = s.split('/');
+        final n = double.tryParse(a[0]);
+        final d = double.tryParse(a[1]);
+        return (n == null || d == null || d == 0) ? null : n / d;
+      }
+      return double.tryParse(s);
+    }
+
+    final d = frac(parts[0]), m = frac(parts[1]), s = frac(parts[2]);
+    if (d == null || m == null || s == null) return null;
+    final dec = d + m / 60 + s / 3600;
+    final r = (ref ?? '').toUpperCase();
+    return (r == 'S' || r == 'W') ? -dec : dec;
+  }
+
+  /// Reads EXIF GPS for indexed photos that haven't been checked yet (existing
+  /// libraries indexed before GPS support). Bounded per call; converges over
+  /// scans. Returns how many were newly geotagged.
+  Future<int> backfillLocations(PhotoStore store, {int max = 300}) async {
+    var found = 0;
+    for (final p in store.needingLocation(limit: max)) {
+      try {
+        final tags = await readExifFromBytes(await File(p.path).readAsBytes());
+        final gps = _exifGps(tags);
+        store.setLocation(p.id, gps?.$1, gps?.$2);
+        if (gps != null) found++;
+      } catch (_) {
+        store.setLocation(p.id, null, null); // mark checked so we skip next time
+      }
+    }
+    return found;
   }
 
   String _bucket(String path) {

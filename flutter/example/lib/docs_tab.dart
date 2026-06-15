@@ -106,7 +106,7 @@ class _DocsTabState extends State<DocsTab> {
     final path = d.sourcePath;
     if (_ext(d.name) == 'pdf' && path != null && File(path).existsSync()) {
       await Navigator.of(context).push(MaterialPageRoute(
-        builder: (_) => PdfViewerScreen(path: path, title: d.name),
+        builder: (_) => PdfViewerScreen(path: path, title: d.name, resumeKey: d.id),
       ));
       return;
     }
@@ -118,7 +118,8 @@ class _DocsTabState extends State<DocsTab> {
       return;
     }
     await Navigator.of(context).push(MaterialPageRoute(
-      builder: (_) => DocTextViewerScreen(title: d.name, fullText: text, snippet: ''),
+      builder: (_) => DocTextViewerScreen(
+          title: d.name, fullText: text, snippet: '', resumeKey: d.id),
     ));
   }
 
