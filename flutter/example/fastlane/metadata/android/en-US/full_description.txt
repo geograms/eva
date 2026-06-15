@@ -1,0 +1,29 @@
+Eva is a fully offline AI assistant for Android. The language model, speech
+recognition, text-to-speech, document search, maps, music and Wikipedia all run
+on the phone. No account, no cloud, nothing leaves the device. Internet is only
+used for optional on-demand downloads (a model, a Wikipedia edition, a map tile,
+a radio stream) — never for your data.
+
+Features:
+
+* Chat with selectable on-device models (downloaded on demand or sideloaded).
+  Answers are grounded in your documents, the offline Wikipedia, and the model's
+  own knowledge, with citations you can open at the passage.
+* Use Eva as the phone's digital assistant; talk to it with offline speech-to-text
+  and spoken replies. Attach a photo and ask about it with a vision model.
+* Offline maps & navigation: show places on a map with your live GPS dot, draw a
+  walking route, and cache areas for offline use.
+* A full offline music player: browse by folder (grouped into genres by the
+  model), artist and favourites; queue, shuffle, save playlists; background
+  playback with lock-screen controls.
+* An e-reader: read the offline Wikipedia (search, random, recently viewed),
+  browse your documents grouped into categories by the model, and resume PDFs at
+  the last page.
+* A photo gallery you can search by on-device caption and your own tags, with
+  GPS-located photos shown on the map.
+* Online radio, and timed reminders that fire as notifications.
+* A guided first-run setup to choose what to download per topic, with progress
+  and resumable downloads; one storage folder (e.g. an SD card) for all data.
+
+Eva runs on the Cactus inference engine and reads the offline Wikipedia from a
+Kiwix ZIM via libzim.

@@ -1,0 +1,53 @@
+# DRAFT F-Droid metadata recipe for fdroiddata (gitlab.com/fdroid/fdroiddata).
+# This is a starting point — it will NOT pass `fdroid build`/`fdroid lint` until
+# the blockers in README.md are resolved (free license, no Syncfusion, no
+# build-time libzim download, incrementing versionCode). See README.md.
+
+Categories:
+  - Science & Education
+  - Internet
+# NOTE: the current repo LICENSE is the Cactus source-available, non-commercial
+# license — NOT FSF/OSI free. F-Droid.org requires a free license here; this
+# value is a placeholder pending relicensing.
+License: LicenseRef-Cactus-Source-Available
+AuthorName: Geogram
+AuthorWebSite: https://github.com/geograms
+SourceCode: https://github.com/geograms/eva
+IssueTracker: https://github.com/geograms/eva/issues
+Changelog: https://github.com/geograms/eva/releases
+
+AntiFeatures:
+  - NonFreeNet      # downloads models / Wikipedia / lyrics / radio at runtime
+  - NonFreeAssets   # the downloadable language models are not free assets
+
+RepoType: git
+Repo: https://github.com/geograms/eva.git
+
+Builds:
+  - versionName: '2.3'
+    versionCode: 1     # TODO: must strictly increase per release (derive from tag)
+    commit: v2.3
+    subdir: flutter/example
+    sudo:
+      - apt-get update
+      - apt-get install -y clang cmake ninja-build pkg-config
+    srclibs:
+      - flutter@stable
+    rm:
+      # Remove the proprietary Syncfusion PDF viewer before building (must be
+      # replaced with a FOSS renderer for this to actually compile).
+      - flutter/example/lib/pdf_viewer_screen.dart
+    prebuild:
+      - $$flutter$$/bin/flutter config --no-analytics
+      - $$flutter$$/bin/flutter pub get
+    build:
+      # The offline-Wikipedia native build downloads a prebuilt libzim — F-Droid
+      # builds offline, so this must be reworked to build from source or be
+      # disabled for the F-Droid flavor.
+      - $$flutter$$/bin/flutter build apk --release --target-platform android-arm64
+    output: build/app/outputs/flutter-apk/app-release.apk
+
+AutoUpdateMode: Version
+UpdateCheckMode: Tags ^v[0-9.]+$
+CurrentVersion: '2.3'
+CurrentVersionCode: 1

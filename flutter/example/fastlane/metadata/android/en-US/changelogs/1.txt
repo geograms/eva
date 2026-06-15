@@ -1,0 +1,9 @@
+First-run setup wizard: choose which models, the document-search model, and
+which offline Wikipedia editions to download per topic; pick a storage folder
+(reusing anything already on it); per-item and overall download progress; and
+downloads that resume if interrupted.
+
+Also includes: offline maps & navigation, a full music player with playlists and
+background/lock-screen playback, the Wikipedia reader with search-as-you-type,
+documents and music grouped into categories by the model, a photo gallery with
+tags and GPS, online radio, and timed reminders.
