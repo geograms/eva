@@ -26,6 +26,9 @@ import 'chat_store.dart';
 import 'doc_meta.dart';
 import 'docs_tab.dart';
 import 'document_service.dart';
+import 'download_service.dart';
+import 'index_coordinator.dart';
+import 'index_metrics.dart';
 import 'images_tab.dart';
 import 'inference_isolate.dart';
 import 'music_tab.dart';
@@ -60,6 +63,9 @@ const Color _seedColor = Color(0xFF2E7D32);
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
+  // Lets the download foreground service (keeps downloads alive when the app is
+  // backgrounded / the phone is suspended) talk to the plugin.
+  DownloadService.initCommunicationPort();
   // Enable background playback + a lock-screen / notification media control.
   // Best-effort: a failure here must never block the app from starting.
   try {
@@ -198,7 +204,12 @@ class _ChatScreenState extends State<ChatScreen>
   bool _appActive = true; // app is in the foreground (chat in active use)
   bool _captioning = false; // VLM loaded, captioning photos
   bool _captionStop = false;
+  bool _forceCaption = false; // "Index now" override of the charging gate
   String? _modelBeforeCaption;
+  // Unified Indexer panel: coordinates the three indexers + captioning, records
+  // timing metrics, and holds a foreground service while anything is working.
+  IndexMetrics? _indexMetrics;
+  IndexCoordinator? _indexCoordinator;
   int _captionsDone = 0;
   bool _categorizing = false; // chat model labelling documents in the background
   bool _categorizeStop = false;
@@ -280,6 +291,8 @@ class _ChatScreenState extends State<ChatScreen>
     _voice.dispose();
     _systemVoice.dispose();
     _tts.stop();
+    // Dispose the coordinator first: it holds listeners on the controllers below.
+    _indexCoordinator?.dispose();
     _indexer?.removeListener(_onIndexerProgress);
     _indexer?.dispose();
     _photoIndexer?.removeListener(_onPhotoProgress);
@@ -649,6 +662,7 @@ class _ChatScreenState extends State<ChatScreen>
     await _openChatStore();
     unawaited(_setupCaptioning());
     _setupPeriodicRescan();
+    await _setupIndexCoordinator();
     _systemPrompt = await loadSystemPrompt();
     _maxTokens = await loadMaxTokens();
     _voiceEngine = await loadVoiceEngine();
@@ -675,13 +689,21 @@ class _ChatScreenState extends State<ChatScreen>
       _progress = null;
     });
     try {
-      final path = await _models.ensureInstalled(spec, (phase, progress) {
-        if (!mounted) return;
-        setState(() {
-          _statusText = phase;
-          _progress = progress;
-        });
-      });
+      // Hold a foreground service so this first download survives the user
+      // switching apps or the phone sleeping mid-download.
+      final path = await DownloadService.run(
+        'Downloading ${spec.name}',
+        () => _models.ensureInstalled(spec, (phase, progress) {
+          if (!mounted) return;
+          setState(() {
+            _statusText = phase;
+            _progress = progress;
+          });
+          DownloadService.update(progress == null
+              ? phase
+              : '$phase ${(progress * 100).round()}%');
+        }),
+      );
       await _loadModel(path);
       // Fully automatic: resume/continue indexing any document backlog in the
       // background, no user action required.
@@ -706,6 +728,7 @@ class _ChatScreenState extends State<ChatScreen>
           activeId: _activeModelId,
           manager: _models,
           player: _player,
+          indexCoordinator: _indexCoordinator,
         ),
       ),
     );
@@ -1175,6 +1198,7 @@ class _ChatScreenState extends State<ChatScreen>
     _indexer!.bind(_rag!);
     _indexer!.resume();
     unawaited(_indexer!.run());
+    _indexCoordinator?.kick();
   }
 
 
@@ -1222,6 +1246,7 @@ class _ChatScreenState extends State<ChatScreen>
     _photoIndexer ??= PhotoIndexController(_photos)
       ..addListener(_onPhotoProgress);
     unawaited(_photoIndexer!.ensureRunning());
+    _indexCoordinator?.kick();
   }
 
   /// Starts (or resumes) the continuous background music scan + lyrics pass.
@@ -1229,10 +1254,46 @@ class _ChatScreenState extends State<ChatScreen>
     _musicIndexer ??= MusicIndexController(_music)
       ..addListener(_onMusicProgress);
     unawaited(_musicIndexer!.ensureRunning());
+    _indexCoordinator?.kick();
   }
 
   void _onMusicProgress() {
     if (mounted) setState(() {});
+  }
+
+  /// Builds the unified Indexer coordinator. The indexer controllers are created
+  /// lazily, so it reads them through getters and is kicked when work starts.
+  Future<void> _setupIndexCoordinator() async {
+    _indexMetrics = await IndexMetrics.load();
+    _indexCoordinator = IndexCoordinator(
+      metrics: _indexMetrics!,
+      docIndexer: () => _indexer,
+      musicIndexer: () => _musicIndexer,
+      photoIndexer: () => _photoIndexer,
+      bridge: CaptionBridge(
+        isCaptioning: () => _captioning,
+        isCharging: () => _charging,
+        captionCounts: _captionCounts,
+        captionNow: _captionNow,
+        pauseCaptioning: () => _captionStop = true,
+      ),
+    );
+  }
+
+  Future<({int pending, int done})> _captionCounts() async {
+    final store = await _photos.openStore();
+    try {
+      return (pending: store.captionPendingCount, done: store.captionedCount);
+    } finally {
+      store.close();
+    }
+  }
+
+  /// Force a captioning pass now, bypassing the charging gate (used by the
+  /// Indexer panel's "Index now"). Cleared once the pass finishes.
+  Future<void> _captionNow() async {
+    _forceCaption = true;
+    _maybeStartCaptioning();
   }
 
   // Words that signal the user is asking about their music library.
@@ -1643,17 +1704,20 @@ class _ChatScreenState extends State<ChatScreen>
     // indexing uses the separate embedder slot, so the two run concurrently.
     if (_captioning ||
         _phase != AppPhase.ready ||
-        !_charging ||
         _generating ||
         _preparingDocs ||
-        _appActive) {
+        (!_forceCaption && (!_charging || _appActive))) {
       return;
     }
     unawaited(_runCaptioning());
   }
 
   Future<void> _runCaptioning() async {
-    if (_captioning || !_charging || _generating || _appActive) return;
+    if (_captioning ||
+        _generating ||
+        (!_forceCaption && (!_charging || _appActive))) {
+      return;
+    }
     // Anything to do?
     final probe = await _photos.openStore();
     int pending;
@@ -1668,6 +1732,7 @@ class _ChatScreenState extends State<ChatScreen>
     _captionStop = false;
     _modelBeforeCaption = _activeModelId;
     if (mounted) setState(() {});
+    _indexCoordinator?.kick();
     // Pause only the metadata photo indexer (it writes photos.sqlite too);
     // document indexing keeps running on the separate embedder slot.
     await _photoIndexer?.stop();
@@ -1676,7 +1741,9 @@ class _ChatScreenState extends State<ChatScreen>
       final vlm = modelById(_catalog, _kCaptionModelId);
       final dir = await _models.ensureInstalled(vlm, (_, _) {});
       await _engine.initModel(dir); // swaps the chat model out
-      while (!_captionStop && _charging && !_generating && !_appActive) {
+      while (!_captionStop &&
+          !_generating &&
+          (_forceCaption || (_charging && !_appActive))) {
         final store = await _photos.openStore();
         List<PhotoInfo> batch;
         try {
@@ -1705,7 +1772,9 @@ class _ChatScreenState extends State<ChatScreen>
           break;
         }
         for (final p in batch) {
-          if (_captionStop || _charging == false || _generating || _appActive) {
+          if (_captionStop ||
+              _generating ||
+              (!_forceCaption && (_charging == false || _appActive))) {
             break;
           }
           final cap = await _captionOne(p, tmp);
@@ -1725,6 +1794,7 @@ class _ChatScreenState extends State<ChatScreen>
     } finally {
       await _restoreChatModel();
       _captioning = false;
+      _forceCaption = false;
       if (mounted) setState(() {});
       // Resume the metadata photo indexer we paused.
       _startPhotoIndexing();

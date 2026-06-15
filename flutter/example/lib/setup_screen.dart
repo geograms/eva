@@ -5,6 +5,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 
 import 'app_prefs.dart';
 import 'disk_space.dart' show formatBytes;
+import 'download_service.dart';
 import 'model_catalog.dart';
 import 'model_manager.dart';
 import 'wikipedia_download.dart';
@@ -161,17 +162,42 @@ class _SetupScreenState extends State<SetupScreen> {
       _allDone = false;
     });
 
-    for (final item in _plan) {
-      if (!mounted) return;
-      setState(() {
-        item.status = 'Downloading';
-        item.progress = null;
-      });
-      final ok = await _downloadItem(item);
-      if (!mounted) return;
-      setState(() => item.status = ok ? 'Installed' : 'Failed');
+    await _runItems(_plan);
+  }
+
+  /// Re-attempts only the items that failed. Both download paths keep their
+  /// `.part` file and resume via HTTP Range, so a retry continues where it
+  /// stopped rather than starting over.
+  Future<void> _retryFailed() async {
+    final failed = _plan.where((i) => i.status == 'Failed').toList();
+    if (failed.isEmpty) return;
+    setState(() => _allDone = false);
+    await _runItems(failed);
+  }
+
+  /// Downloads [items] one by one, updating per-item status; marks the run done
+  /// when finished (whether or not every item succeeded). A foreground service
+  /// is held for the whole run so downloads keep going when the app is
+  /// backgrounded or the phone is suspended.
+  Future<void> _runItems(List<_PlanItem> items) async {
+    await DownloadService.begin('Setting up Eva');
+    try {
+      for (final item in items) {
+        if (!mounted) return;
+        setState(() {
+          item.status = 'Downloading';
+          item.progress = null;
+        });
+        final done = _plan.where((i) => i.status == 'Installed').length;
+        DownloadService.update('${item.name} · $done of ${_plan.length} ready');
+        final ok = await _downloadItem(item);
+        if (!mounted) return;
+        setState(() => item.status = ok ? 'Installed' : 'Failed');
+      }
+      if (mounted) setState(() => _allDone = true);
+    } finally {
+      await DownloadService.end();
     }
-    if (mounted) setState(() => _allDone = true);
   }
 
   Future<bool> _downloadItem(_PlanItem item) async {
@@ -387,15 +413,54 @@ class _SetupScreenState extends State<SetupScreen> {
         ),
         Padding(
           padding: const EdgeInsets.all(12),
-          child: SizedBox(
-            width: double.infinity,
-            child: FilledButton(
-              onPressed: _allDone ? _finish : null,
-              child: Text(_allDone ? 'Continue' : 'Downloading…'),
-            ),
-          ),
+          child: _downloadActions(),
         ),
       ],
+    );
+  }
+
+  /// Bottom-bar buttons for the downloading view. While downloading the button
+  /// is disabled; when finished with failures it offers a retry beside
+  /// "Continue anyway"; when all succeed it's a single "Continue".
+  Widget _downloadActions() {
+    final failed = _plan.where((i) => i.status == 'Failed').length;
+    if (_allDone && failed > 0) {
+      return Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Text(
+            '$failed download${failed == 1 ? '' : 's'} failed — check your '
+            'connection and try again. Anything already downloaded is kept.',
+            style: const TextStyle(fontSize: 13, color: Colors.red),
+          ),
+          const SizedBox(height: 8),
+          Row(
+            children: [
+              Expanded(
+                child: OutlinedButton.icon(
+                  onPressed: _retryFailed,
+                  icon: const Icon(Icons.refresh),
+                  label: const Text('Retry failed'),
+                ),
+              ),
+              const SizedBox(width: 8),
+              Expanded(
+                child: FilledButton(
+                  onPressed: _finish,
+                  child: const Text('Continue anyway'),
+                ),
+              ),
+            ],
+          ),
+        ],
+      );
+    }
+    return SizedBox(
+      width: double.infinity,
+      child: FilledButton(
+        onPressed: _allDone ? _finish : null,
+        child: Text(_allDone ? 'Continue' : 'Downloading…'),
+      ),
     );
   }
 }

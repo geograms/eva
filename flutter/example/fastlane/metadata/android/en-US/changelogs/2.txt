@@ -1,0 +1,9 @@
+New "Indexer" panel (Settings → Indexer): one place to see and coordinate all
+background indexing — documents, music and photos. Shows per-topic progress,
+total time spent and an estimate of time remaining, makes clear when storage
+access is still needed, and lets you pause/resume each topic, pause everything,
+or "index now".
+
+Downloads and indexing now keep running when you switch apps or the screen is
+off, via a background service — large model / Wikipedia downloads no longer
+stall when the phone sleeps, and a failed download can be retried.

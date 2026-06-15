@@ -9,6 +9,9 @@ import 'package:speech_to_text/speech_to_text.dart' as stt;
 import 'app_prefs.dart';
 import 'assistant_channel.dart';
 import 'document_service.dart';
+import 'download_service.dart';
+import 'index_coordinator.dart';
+import 'indexer_screen.dart';
 import 'documents_screen.dart';
 import 'maps/map_service.dart';
 import 'model_catalog.dart';
@@ -36,11 +39,13 @@ class SettingsScreen extends StatefulWidget {
     required this.activeId,
     required this.manager,
     required this.player,
+    this.indexCoordinator,
   });
 
   final ModelManager manager;
   final String activeId;
   final MusicPlayer player;
+  final IndexCoordinator? indexCoordinator;
 
   @override
   State<SettingsScreen> createState() => _SettingsScreenState();
@@ -352,9 +357,16 @@ class _SettingsScreenState extends State<SettingsScreen> {
       _error = null;
     });
     try {
-      await widget.manager.ensureInstalled(spec, (phase, progress) {
-        if (mounted) setState(() => _downloadProgress = progress);
-      });
+      // Keep the download alive if the user leaves the app / the phone sleeps.
+      await DownloadService.run(
+        'Downloading ${spec.name}',
+        () => widget.manager.ensureInstalled(spec, (phase, progress) {
+          if (mounted) setState(() => _downloadProgress = progress);
+          DownloadService.update(progress == null
+              ? phase
+              : '${spec.name} · ${(progress * 100).round()}%');
+        }),
+      );
       _installed.add(spec.id);
     } catch (e) {
       setState(() => _error = 'Download failed: $e');
@@ -423,6 +435,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
     (key: 'models', title: 'Language model', icon: Icons.memory, subtitle: 'Choose or download the AI model'),
     (key: 'voice', title: 'Voice', icon: Icons.mic_none, subtitle: 'Speech-to-text engine & language'),
     (key: 'assistant', title: 'Phone assistant', icon: Icons.assistant_outlined, subtitle: 'Use Eva as the device assistant'),
+    (key: 'indexer', title: 'Indexer', icon: Icons.sync, subtitle: 'documents · music · photos — progress & control'),
     (key: 'documents', title: 'Documents', icon: Icons.folder_copy_outlined, subtitle: 'Index & search your files'),
     (key: 'photos', title: 'Photos', icon: Icons.photo_library_outlined, subtitle: 'Index & browse your gallery'),
     (key: 'music', title: 'Music', icon: Icons.library_music_outlined, subtitle: 'Index your audio library'),
@@ -441,21 +454,27 @@ class _SettingsScreenState extends State<SettingsScreen> {
         body: ListView(
           children: [
             for (final c in _categories)
-              ListTile(
-                leading: Icon(c.icon),
-                title: Text(c.title),
-                subtitle: Text(c.subtitle),
-                trailing: const Icon(Icons.chevron_right),
-                onTap: () {
-                  if (c.key == 'radio') {
-                    Navigator.of(context).push(MaterialPageRoute(
-                      builder: (_) => RadioStationsScreen(player: widget.player),
-                    ));
-                  } else {
-                    setState(() => _panel = c.key);
-                  }
-                },
-              ),
+              if (!(c.key == 'indexer' && widget.indexCoordinator == null))
+                ListTile(
+                  leading: Icon(c.icon),
+                  title: Text(c.title),
+                  subtitle: Text(c.subtitle),
+                  trailing: const Icon(Icons.chevron_right),
+                  onTap: () {
+                    if (c.key == 'radio') {
+                      Navigator.of(context).push(MaterialPageRoute(
+                        builder: (_) => RadioStationsScreen(player: widget.player),
+                      ));
+                    } else if (c.key == 'indexer') {
+                      Navigator.of(context).push(MaterialPageRoute(
+                        builder: (_) =>
+                            IndexerScreen(coordinator: widget.indexCoordinator!),
+                      ));
+                    } else {
+                      setState(() => _panel = c.key);
+                    }
+                  },
+                ),
           ],
         ),
       );
@@ -1002,7 +1021,14 @@ class _SettingsScreenState extends State<SettingsScreen> {
       return;
     }
     setState(() => _wikiDownloadingEdition = edition);
-    final ok = await _wikiDl.start(check);
+    void onProgress() => DownloadService.update(
+        '${edition.label} · ${(_wikiDl.progress * 100).round()}%');
+    _wikiDl.addListener(onProgress);
+    final ok = await DownloadService.run(
+      'Downloading ${edition.label}',
+      () => _wikiDl.start(check),
+    );
+    _wikiDl.removeListener(onProgress);
     if (!mounted) return;
     setState(() => _wikiDownloadingEdition = null);
     if (ok) {
