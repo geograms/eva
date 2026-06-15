@@ -246,6 +246,44 @@ class MusicStore {
     return [for (final r in rs) (name: r['name'] as String, count: r['n'] as int)];
   }
 
+  /// Folders grouped under their genre: each genre (root) lists the source
+  /// folders that contain tracks of that genre. Genres ordered by track count;
+  /// folders within each by count. Tracks without a genre fall under ''.
+  List<({String genre, String label, List<({String folder, int count})> folders})>
+      genreFolderTree() {
+    final rs = _db.select(
+      "SELECT genre, bucket, COUNT(*) AS n FROM tracks WHERE bucket != '' "
+      'GROUP BY genre, bucket;',
+    );
+    final groups = <String, List<({String folder, int count})>>{};
+    final totals = <String, int>{};
+    for (final r in rs) {
+      final g = (r['genre'] as String).trim();
+      (groups[g] ??= []).add((folder: r['bucket'] as String, count: r['n'] as int));
+      totals[g] = (totals[g] ?? 0) + (r['n'] as int);
+    }
+    final genres = groups.keys.toList()
+      ..sort((a, b) => totals[b]!.compareTo(totals[a]!));
+    return [
+      for (final g in genres)
+        (
+          genre: g,
+          label: g.isEmpty ? 'Unknown genre' : g,
+          folders: groups[g]!..sort((a, b) => b.count.compareTo(a.count)),
+        )
+    ];
+  }
+
+  /// Tracks in a specific genre + source folder, album/track order.
+  List<TrackInfo> byGenreFolder(String genre, String bucket, {int limit = 1000}) {
+    final rs = _db.select(
+      'SELECT * FROM tracks WHERE genre = ? AND bucket = ? '
+      'ORDER BY album, track_no, title LIMIT ?;',
+      [genre, bucket, limit],
+    );
+    return [for (final r in rs) _row(r)];
+  }
+
   /// Tracks in a source folder, album/track order.
   List<TrackInfo> byFolder(String bucket, {int limit = 1000}) {
     final rs = _db.select(

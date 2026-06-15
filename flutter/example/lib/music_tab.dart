@@ -4,9 +4,9 @@ import 'music_player.dart';
 import 'music_service.dart';
 import 'music_store.dart';
 
-/// Music home: favourites (most played), browse by artist and genre, and
-/// search — tapping plays through the shared [MusicPlayer]. A lightweight
-/// Spotify-style front-end over the existing music index.
+/// Music home: a search field plus three sub-tabs — Favourites (most played),
+/// Folders (grouped by genre → folder), and Artists — so no single list gets
+/// too long. Plays through the shared [MusicPlayer].
 class MusicTab extends StatefulWidget {
   const MusicTab({super.key, required this.music, required this.player});
 
@@ -17,13 +17,14 @@ class MusicTab extends StatefulWidget {
   State<MusicTab> createState() => _MusicTabState();
 }
 
-class _MusicTabState extends State<MusicTab> {
+class _MusicTabState extends State<MusicTab> with TickerProviderStateMixin {
   MusicStore? _store;
+  late final TabController _subTab = TabController(length: 3, vsync: this);
   final TextEditingController _search = TextEditingController();
   List<TrackInfo> _top = const [];
   List<({String name, int count})> _artists = const [];
-  List<({String name, int count})> _genres = const [];
-  List<({String name, int count})> _folders = const [];
+  List<({String genre, String label, List<({String folder, int count})> folders})>
+      _tree = const [];
   List<TrackInfo> _searchResults = const [];
   bool _loading = true;
 
@@ -38,10 +39,9 @@ class _MusicTabState extends State<MusicTab> {
     _store = await widget.music.openStore();
     final store = _store!;
     setState(() {
-      _top = store.topPlayed(limit: 30);
-      _artists = store.artists(limit: 60);
-      _genres = store.genres(limit: 40);
-      _folders = store.folders(limit: 100);
+      _top = store.topPlayed(limit: 60);
+      _artists = store.artists(limit: 200);
+      _tree = store.genreFolderTree();
       _loading = false;
     });
   }
@@ -53,6 +53,7 @@ class _MusicTabState extends State<MusicTab> {
   @override
   void dispose() {
     widget.player.removeListener(_onPlayer);
+    _subTab.dispose();
     _search.dispose();
     _store?.close();
     super.dispose();
@@ -70,11 +71,10 @@ class _MusicTabState extends State<MusicTab> {
     await widget.player.playQueue(tracks, startAt: startAt);
   }
 
-  void _openFolder(String folder) {
-    final tracks = _store?.byFolder(folder) ?? const [];
+  void _openTracks(String title, List<TrackInfo> tracks) {
     Navigator.of(context).push(MaterialPageRoute(
-      builder: (_) => _FolderScreen(
-        title: folder,
+      builder: (_) => _TrackListScreen(
+        title: title,
         tracks: tracks,
         player: widget.player,
       ),
@@ -123,89 +123,114 @@ class _MusicTabState extends State<MusicTab> {
           ),
         ),
         if (widget.player.hasMedia) _transport(),
-        Expanded(
-          child: searching
-              ? _trackList(_searchResults)
-              : ListView(
-                  children: [
-                    _header('Favourites · most played'),
-                    if (_top.isEmpty)
-                      const Padding(
-                        padding: EdgeInsets.all(16),
-                        child: Text('Play some songs and they\'ll show here.',
-                            style: TextStyle(color: Colors.grey)),
-                      )
-                    else
-                      for (var i = 0; i < _top.length; i++)
-                        _trackTile(_top[i], () => _playList(_top, startAt: i)),
-                    if (_folders.isNotEmpty) ...[
-                      _header('Folders'),
-                      for (final f in _folders)
-                        ListTile(
-                          leading: const Icon(Icons.folder_outlined),
-                          title: Text(f.name),
-                          subtitle: Text('${f.count} track${f.count == 1 ? '' : 's'}'),
-                          trailing: const Icon(Icons.chevron_right),
-                          onTap: () => _openFolder(f.name),
-                        ),
-                    ],
-                    if (_genres.isNotEmpty) ...[
-                      _header('Genres'),
-                      Padding(
-                        padding: const EdgeInsets.symmetric(horizontal: 12),
-                        child: Wrap(
-                          spacing: 8,
-                          runSpacing: 4,
-                          children: [
-                            for (final g in _genres)
-                              ActionChip(
-                                label: Text('${g.name} (${g.count})'),
-                                onPressed: () =>
-                                    _playList(_store!.byGenre(g.name)),
-                              ),
-                          ],
-                        ),
-                      ),
-                    ],
-                    if (_artists.isNotEmpty) ...[
-                      _header('Artists'),
-                      for (final a in _artists)
-                        ListTile(
-                          leading: const Icon(Icons.person_outline),
-                          title: Text(a.name),
-                          subtitle: Text('${a.count} track${a.count == 1 ? '' : 's'}'),
-                          trailing: IconButton(
-                            icon: const Icon(Icons.play_arrow),
-                            onPressed: () => _playList(_store!.byArtist(a.name)),
-                          ),
-                          onTap: () => _playList(_store!.byArtist(a.name)),
-                        ),
-                    ],
-                    const SizedBox(height: 24),
-                  ],
-                ),
-        ),
+        if (searching)
+          Expanded(child: _trackList(_searchResults))
+        else ...[
+          TabBar(
+            controller: _subTab,
+            tabs: const [
+              Tab(text: 'Favourites'),
+              Tab(text: 'Folders'),
+              Tab(text: 'Artists'),
+            ],
+          ),
+          Expanded(
+            child: TabBarView(
+              controller: _subTab,
+              children: [
+                _favouritesPage(),
+                _foldersPage(),
+                _artistsPage(),
+              ],
+            ),
+          ),
+        ],
       ],
     );
   }
 
-  Widget _header(String text) => Padding(
-        padding: const EdgeInsets.fromLTRB(16, 16, 16, 6),
-        child: Text(text,
-            style: TextStyle(
-                fontWeight: FontWeight.bold,
-                color: Theme.of(context).colorScheme.primary)),
+  Widget _favouritesPage() {
+    if (_top.isEmpty) {
+      return const Center(
+        child: Padding(
+          padding: EdgeInsets.all(24),
+          child: Text('Play some songs and your favourites will show here.',
+              textAlign: TextAlign.center, style: TextStyle(color: Colors.grey)),
+        ),
       );
+    }
+    return ListView.builder(
+      itemCount: _top.length,
+      itemBuilder: (context, i) => _trackTile(_top[i], () => _playList(_top, startAt: i)),
+    );
+  }
+
+  Widget _artistsPage() {
+    if (_artists.isEmpty) {
+      return const Center(child: Text('No tagged artists.'));
+    }
+    return ListView.builder(
+      itemCount: _artists.length,
+      itemBuilder: (context, i) {
+        final a = _artists[i];
+        return ListTile(
+          leading: const Icon(Icons.person_outline),
+          title: Text(a.name),
+          subtitle: Text('${a.count} track${a.count == 1 ? '' : 's'}'),
+          trailing: IconButton(
+            icon: const Icon(Icons.play_arrow),
+            onPressed: () => _playList(_store!.byArtist(a.name)),
+          ),
+          onTap: () => _openTracks(a.name, _store!.byArtist(a.name, limit: 500)),
+        );
+      },
+    );
+  }
+
+  /// Folders grouped under their genre (genre = root, folders inside).
+  Widget _foldersPage() {
+    if (_tree.isEmpty) {
+      return const Center(
+        child: Padding(
+          padding: EdgeInsets.all(24),
+          child: Text('No folders found. Music files need a containing folder.',
+              textAlign: TextAlign.center, style: TextStyle(color: Colors.grey)),
+        ),
+      );
+    }
+    return ListView.builder(
+      itemCount: _tree.length,
+      itemBuilder: (context, i) {
+        final g = _tree[i];
+        final total = g.folders.fold<int>(0, (s, f) => s + f.count);
+        return ExpansionTile(
+          leading: const Icon(Icons.library_music_outlined),
+          title: Text(g.label),
+          subtitle: Text(
+              '${g.folders.length} folder${g.folders.length == 1 ? '' : 's'} · $total tracks'),
+          childrenPadding: const EdgeInsets.only(left: 16),
+          children: [
+            for (final f in g.folders)
+              ListTile(
+                leading: const Icon(Icons.folder_outlined),
+                title: Text(f.folder),
+                subtitle: Text('${f.count} track${f.count == 1 ? '' : 's'}'),
+                trailing: const Icon(Icons.chevron_right),
+                onTap: () => _openTracks(
+                    f.folder, _store!.byGenreFolder(g.genre, f.folder)),
+              ),
+          ],
+        );
+      },
+    );
+  }
 
   Widget _trackList(List<TrackInfo> tracks) {
-    if (tracks.isEmpty) {
-      return const Center(child: Text('No matches.'));
-    }
-    return ListView(
-      children: [
-        for (var i = 0; i < tracks.length; i++)
+    if (tracks.isEmpty) return const Center(child: Text('No matches.'));
+    return ListView.builder(
+      itemCount: tracks.length,
+      itemBuilder: (context, i) =>
           _trackTile(tracks[i], () => _playList(tracks, startAt: i)),
-      ],
     );
   }
 
@@ -279,10 +304,9 @@ class _MusicTabState extends State<MusicTab> {
   }
 }
 
-/// A folder's tracks, with a "Play all" and per-track play. Listens to the
-/// player so the currently-playing track is highlighted.
-class _FolderScreen extends StatefulWidget {
-  const _FolderScreen({
+/// A list of tracks (a folder or an artist), with Play-all and per-track play.
+class _TrackListScreen extends StatefulWidget {
+  const _TrackListScreen({
     required this.title,
     required this.tracks,
     required this.player,
@@ -293,10 +317,10 @@ class _FolderScreen extends StatefulWidget {
   final MusicPlayer player;
 
   @override
-  State<_FolderScreen> createState() => _FolderScreenState();
+  State<_TrackListScreen> createState() => _TrackListScreenState();
 }
 
-class _FolderScreenState extends State<_FolderScreen> {
+class _TrackListScreenState extends State<_TrackListScreen> {
   @override
   void initState() {
     super.initState();
