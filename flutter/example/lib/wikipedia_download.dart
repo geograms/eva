@@ -128,20 +128,31 @@ class WikipediaDownload extends ChangeNotifier {
     final client = http.Client();
     final tmp = File('${check.destPath}.part');
     try {
-      final resp =
-          await client.send(http.Request('GET', Uri.parse(check.url)));
-      if (resp.statusCode != 200) {
+      // Resume from a previous partial download via an HTTP Range request.
+      var existing = await tmp.exists() ? await tmp.length() : 0;
+      final req = http.Request('GET', Uri.parse(check.url));
+      if (existing > 0) req.headers['range'] = 'bytes=$existing-';
+      final resp = await client.send(req);
+
+      IOSink sink;
+      if (resp.statusCode == 206) {
+        total = _contentRangeTotal(resp.headers['content-range']) ??
+            (existing + (resp.contentLength ?? check.needBytes));
+        sink = tmp.openWrite(mode: FileMode.append);
+      } else if (resp.statusCode == 200) {
+        existing = 0; // server ignored the range — restart cleanly
+        total = resp.contentLength ?? check.needBytes;
+        sink = tmp.openWrite();
+      } else {
         error = 'Download failed (${resp.statusCode}).';
         return false;
       }
-      total = resp.contentLength ?? check.needBytes;
-      final sink = tmp.openWrite();
+      received = existing;
       var sinceNotify = 0;
       try {
         await for (final chunk in resp.stream) {
           if (_cancel) {
-            await sink.close();
-            await tmp.delete().catchError((_) => tmp);
+            // Keep the partial file so the download can resume later.
             error = null;
             return false;
           }
@@ -154,14 +165,14 @@ class WikipediaDownload extends ChangeNotifier {
           }
         }
       } finally {
-        await sink.close();
+        await sink.close(); // flush; the partial survives for resume
       }
       await tmp.rename(check.destPath);
       await saveWikipediaZimPath(check.destPath);
       return true;
     } catch (e) {
+      // Keep the .part for resume; report the error.
       error = 'Download error: $e';
-      await tmp.delete().catchError((_) => tmp);
       return false;
     } finally {
       client.close();
@@ -170,7 +181,40 @@ class WikipediaDownload extends ChangeNotifier {
     }
   }
 
+  static int? _contentRangeTotal(String? header) {
+    if (header == null) return null;
+    final slash = header.lastIndexOf('/');
+    if (slash < 0) return null;
+    return int.tryParse(header.substring(slash + 1).trim());
+  }
+
   void cancel() => _cancel = true;
+
+  /// Whether a file for [edition] already exists in the destination folder (so
+  /// the setup can show it as installed and skip it). Reuses anything already on
+  /// the chosen storage folder / card.
+  Future<bool> isInstalled(WikiEdition edition) async {
+    try {
+      final dir = await _destDir();
+      final re = RegExp(edition.filePattern);
+      for (final e in dir.listSync()) {
+        if (e is File && re.hasMatch(e.path.split('/').last)) return true;
+      }
+    } catch (_) {}
+    return false;
+  }
+
+  /// Resolves [edition] to a space-check and downloads it (resumable). Sets it as
+  /// the active Wikipedia on success. Returns true when installed.
+  Future<bool> download(WikiEdition edition) async {
+    final c = await check(edition);
+    if (c == null) {
+      error = 'Could not reach the download server.';
+      notifyListeners();
+      return false;
+    }
+    return start(c);
+  }
 
   Future<Directory> _destDir() async {
     // Prefer the user's chosen models location (may be an SD card); else app

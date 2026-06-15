@@ -48,6 +48,7 @@ import 'photos_screen.dart';
 import 'rag_index.dart';
 import 'reminder_service.dart';
 import 'settings_screen.dart';
+import 'setup_screen.dart';
 import 'system_voice.dart';
 import 'text_util.dart';
 import 'update_check.dart';
@@ -99,7 +100,7 @@ class EvaApp extends StatelessWidget {
   }
 }
 
-enum AppPhase { intro, preparing, downloading, loadingModel, ready, error }
+enum AppPhase { intro, setup, preparing, downloading, loadingModel, ready, error }
 
 class ChatMessage {
   ChatMessage(this.role, this.text, {this.imagePath, this.sources, this.photos});
@@ -251,6 +252,12 @@ class _ChatScreenState extends State<ChatScreen>
   Future<void> _start() async {
     if (!await loadIntroSeen()) {
       setState(() => _phase = AppPhase.intro);
+      return;
+    }
+    // First run (or an interrupted setup): let the user choose & download
+    // models / Wikipedia, resuming any partial downloads.
+    if (!await loadSetupDone()) {
+      setState(() => _phase = AppPhase.setup);
       return;
     }
     await _bootstrap();
@@ -2230,10 +2237,16 @@ class _ChatScreenState extends State<ChatScreen>
   @override
   Widget build(BuildContext context) {
     if (_phase == AppPhase.intro) {
-      return IntroScreen(onDone: () {
-        setState(() => _phase = AppPhase.preparing);
-        _bootstrap();
-      });
+      return IntroScreen(onDone: () => setState(() => _phase = AppPhase.setup));
+    }
+    if (_phase == AppPhase.setup) {
+      return SetupScreen(
+        manager: _models,
+        onDone: () {
+          setState(() => _phase = AppPhase.preparing);
+          _bootstrap();
+        },
+      );
     }
     if (_phase != AppPhase.ready) {
       return Scaffold(

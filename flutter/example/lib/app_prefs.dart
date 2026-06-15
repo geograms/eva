@@ -123,6 +123,41 @@ Future<void> saveIntroSeen() async {
   await prefs.setBool(_kIntroSeenKey, true);
 }
 
+// The first-run setup wizard (choose & download models / Wikipedia). Persisted
+// so an interrupted setup can resume on the next launch.
+const String _kSetupDoneKey = 'setup_done';
+const String _kSetupPlanKey = 'setup_plan';
+
+/// Whether the first-run download setup has been completed (or skipped).
+Future<bool> loadSetupDone() async {
+  final prefs = await SharedPreferences.getInstance();
+  return prefs.getBool(_kSetupDoneKey) ?? false;
+}
+
+Future<void> saveSetupDone(bool done) async {
+  final prefs = await SharedPreferences.getInstance();
+  await prefs.setBool(_kSetupDoneKey, done);
+}
+
+/// The chosen download plan: which model ids, the embedder, and which Wikipedia
+/// edition labels to fetch. Kept so a killed/interrupted setup resumes the same
+/// selection on relaunch.
+Future<Map<String, dynamic>> loadSetupPlan() async {
+  final prefs = await SharedPreferences.getInstance();
+  final raw = prefs.getString(_kSetupPlanKey);
+  if (raw == null) return {};
+  try {
+    return (jsonDecode(raw) as Map).cast<String, dynamic>();
+  } catch (_) {
+    return {};
+  }
+}
+
+Future<void> saveSetupPlan(Map<String, dynamic> plan) async {
+  final prefs = await SharedPreferences.getInstance();
+  await prefs.setString(_kSetupPlanKey, jsonEncode(plan));
+}
+
 // ── Unified storage location ─────────────────────────────────────────────────
 //
 // One folder holds all of Eva's data: models, the offline Wikipedia, the
