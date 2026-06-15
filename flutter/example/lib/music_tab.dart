@@ -4,6 +4,7 @@ import 'music_meta.dart';
 import 'music_player.dart';
 import 'music_service.dart';
 import 'music_store.dart';
+import 'player_screen.dart';
 
 /// Music home: a search field plus three sub-tabs — Favourites (most played),
 /// Folders (grouped by genre → folder), and Artists — so no single list gets
@@ -81,6 +82,20 @@ class _MusicTabState extends State<MusicTab> with TickerProviderStateMixin {
   Future<void> _playList(List<TrackInfo> tracks, {int startAt = 0}) async {
     if (tracks.isEmpty) return;
     await widget.player.playQueue(tracks, startAt: startAt);
+  }
+
+  void _addToQueue(TrackInfo t) {
+    widget.player.addToQueue([t]);
+    ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+      content: Text('Added "${t.title.isNotEmpty ? t.title : t.path.split('/').last}" to the playlist'),
+      duration: const Duration(seconds: 1),
+    ));
+  }
+
+  void _openPlayer() {
+    Navigator.of(context).push(MaterialPageRoute(
+      builder: (_) => PlayerScreen(player: widget.player, music: widget.music),
+    ));
   }
 
   void _openTracks(String title, List<TrackInfo> tracks) {
@@ -309,6 +324,12 @@ class _MusicTabState extends State<MusicTab> with TickerProviderStateMixin {
         maxLines: 1,
         overflow: TextOverflow.ellipsis,
       ),
+      trailing: IconButton(
+        tooltip: 'Add to playlist',
+        visualDensity: VisualDensity.compact,
+        icon: const Icon(Icons.add),
+        onPressed: () => _addToQueue(t),
+      ),
       onTap: onPlay,
     );
   }
@@ -326,13 +347,22 @@ class _MusicTabState extends State<MusicTab> with TickerProviderStateMixin {
         padding: const EdgeInsets.fromLTRB(12, 6, 4, 6),
         child: Row(
           children: [
-            Icon(Icons.music_note, color: scheme.onSecondaryContainer, size: 18),
-            const SizedBox(width: 8),
             Expanded(
-              child: Text(title,
-                  maxLines: 1,
-                  overflow: TextOverflow.ellipsis,
-                  style: TextStyle(color: scheme.onSecondaryContainer)),
+              child: GestureDetector(
+                behavior: HitTestBehavior.opaque,
+                onTap: _openPlayer,
+                child: Row(children: [
+                  Icon(Icons.music_note, color: scheme.onSecondaryContainer, size: 18),
+                  const SizedBox(width: 8),
+                  Expanded(
+                    child: Text(title,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: TextStyle(color: scheme.onSecondaryContainer)),
+                  ),
+                  const Icon(Icons.open_in_full, size: 14),
+                ]),
+              ),
             ),
             IconButton(
               visualDensity: VisualDensity.compact,
@@ -403,6 +433,19 @@ class _TrackListScreenState extends State<_TrackListScreen> {
         title: Text(widget.title, maxLines: 1, overflow: TextOverflow.ellipsis),
         actions: [
           IconButton(
+            tooltip: 'Add all to playlist',
+            icon: const Icon(Icons.playlist_add),
+            onPressed: widget.tracks.isEmpty
+                ? null
+                : () {
+                    widget.player.addToQueue(widget.tracks);
+                    ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+                      content: Text('Added ${widget.tracks.length} tracks to the playlist'),
+                      duration: const Duration(seconds: 1),
+                    ));
+                  },
+          ),
+          IconButton(
             tooltip: 'Play all',
             icon: const Icon(Icons.play_circle_fill),
             onPressed: widget.tracks.isEmpty
@@ -428,6 +471,12 @@ class _TrackListScreenState extends State<_TrackListScreen> {
                   .join(' · '),
               maxLines: 1,
               overflow: TextOverflow.ellipsis,
+            ),
+            trailing: IconButton(
+              tooltip: 'Add to playlist',
+              visualDensity: VisualDensity.compact,
+              icon: const Icon(Icons.add),
+              onPressed: () => widget.player.addToQueue([t]),
             ),
             onTap: () => widget.player.playQueue(widget.tracks, startAt: i),
           );

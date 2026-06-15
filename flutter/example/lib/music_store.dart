@@ -352,6 +352,17 @@ class MusicStore {
     return const [];
   }
 
+  /// Resolves a saved playlist's file paths back to tracks, in the given order
+  /// (paths no longer in the library are skipped).
+  List<TrackInfo> tracksByPaths(List<String> paths) {
+    final out = <TrackInfo>[];
+    for (final p in paths) {
+      final rs = _db.select('SELECT * FROM tracks WHERE path = ? LIMIT 1;', [p]);
+      if (rs.isNotEmpty) out.add(_row(rs.first));
+    }
+    return out;
+  }
+
   /// Recent/representative tracks for browsing.
   List<TrackInfo> query({int limit = 500}) {
     final rs = _db.select(

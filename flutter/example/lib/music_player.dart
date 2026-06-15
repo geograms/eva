@@ -28,9 +28,10 @@ class MusicPlayer extends ChangeNotifier {
   final MusicService _music;
   final AudioPlayer _player = AudioPlayer();
 
-  List<TrackInfo> _queue = const [];
+  List<TrackInfo> _queue = [];
   int _index = -1;
   bool _playing = false;
+  bool _shuffle = false;
   final Set<int> _counted = {}; // track ids already counted this session-queue
   String? _radioName; // set while a web radio stream is playing
 
@@ -38,6 +39,21 @@ class MusicPlayer extends ChangeNotifier {
   bool get isPlaying => _playing;
   int get queueLength => _queue.length;
   TrackInfo? get current => hasTrack ? _queue[_index] : null;
+  int get index => _index;
+  bool get shuffleEnabled => _shuffle;
+
+  /// The current playlist (read-only view).
+  List<TrackInfo> get queue => List.unmodifiable(_queue);
+
+  AudioSource _sourceFor(TrackInfo t) => AudioSource.uri(
+        Uri.file(t.path),
+        tag: MediaItem(
+          id: t.id.toString(),
+          title: t.title.isNotEmpty ? t.title : t.path.split('/').last,
+          artist: t.artist.isNotEmpty ? t.artist : 'Unknown artist',
+          album: t.album.isNotEmpty ? t.album : null,
+        ),
+      );
 
   /// Whether a web radio stream (not a local queue) is loaded.
   bool get isRadio => _radioName != null;
@@ -69,33 +85,86 @@ class MusicPlayer extends ChangeNotifier {
 
   /// Position/duration streams for an optional progress UI.
   Stream<Duration> get positionStream => _player.positionStream;
+  Stream<Duration?> get durationStream => _player.durationStream;
   Duration? get duration => _player.duration;
+  Future<void> seek(Duration d) => _player.seek(d);
 
   /// Replaces the queue with [tracks] and starts playing from [startAt].
   Future<void> playQueue(List<TrackInfo> tracks, {int startAt = 0}) async {
     if (tracks.isEmpty) return;
     _radioName = null;
-    _queue = tracks;
+    _queue = List.of(tracks);
     _counted.clear();
     _index = startAt.clamp(0, tracks.length - 1);
-    final sources = [
-      for (final t in tracks)
-        AudioSource.uri(
-          Uri.file(t.path),
-          tag: MediaItem(
-            id: t.id.toString(),
-            title: t.title.isNotEmpty ? t.title : t.path.split('/').last,
-            artist: t.artist.isNotEmpty ? t.artist : 'Unknown artist',
-            album: t.album.isNotEmpty ? t.album : null,
-          ),
-        ),
-    ];
     try {
-      await _player.setAudioSources(sources, initialIndex: _index);
+      await _player.setAudioSources([for (final t in _queue) _sourceFor(t)],
+          initialIndex: _index);
       await _player.play();
     } catch (_) {
       // A missing/unsupported file shouldn't crash playback control.
     }
+    notifyListeners();
+  }
+
+  /// Appends [tracks] to the current playlist (the "+" action). Starts a new
+  /// queue if nothing is playing. Preserves the current track + position.
+  Future<void> addToQueue(List<TrackInfo> tracks) async {
+    if (tracks.isEmpty) return;
+    if (_queue.isEmpty || isRadio) {
+      await playQueue(tracks);
+      return;
+    }
+    final pos = _player.position;
+    final wasPlaying = _player.playing;
+    _queue = [..._queue, ...tracks];
+    try {
+      await _player.setAudioSources([for (final t in _queue) _sourceFor(t)],
+          initialIndex: _index, initialPosition: pos);
+      if (wasPlaying) unawaited(_player.play());
+    } catch (_) {}
+    notifyListeners();
+  }
+
+  /// Removes the track at [i] from the playlist, keeping playback going.
+  Future<void> removeFromQueue(int i) async {
+    if (i < 0 || i >= _queue.length) return;
+    final removingCurrent = i == _index;
+    final pos = removingCurrent ? Duration.zero : _player.position;
+    final wasPlaying = _player.playing;
+    _queue = [..._queue]..removeAt(i);
+    if (_queue.isEmpty) {
+      await stop();
+      return;
+    }
+    if (i < _index) {
+      _index--;
+    } else if (i == _index) {
+      _index = _index.clamp(0, _queue.length - 1);
+    }
+    try {
+      await _player.setAudioSources([for (final t in _queue) _sourceFor(t)],
+          initialIndex: _index, initialPosition: pos);
+      if (wasPlaying) unawaited(_player.play());
+    } catch (_) {}
+    notifyListeners();
+  }
+
+  /// Jumps to track [i] in the playlist and plays it.
+  Future<void> playAt(int i) async {
+    if (i < 0 || i >= _queue.length) return;
+    try {
+      await _player.seek(Duration.zero, index: i);
+      await _player.play();
+    } catch (_) {}
+  }
+
+  /// Toggles shuffle (random) playback order.
+  Future<void> toggleShuffle() async {
+    _shuffle = !_shuffle;
+    try {
+      if (_shuffle) await _player.shuffle();
+      await _player.setShuffleModeEnabled(_shuffle);
+    } catch (_) {}
     notifyListeners();
   }
 

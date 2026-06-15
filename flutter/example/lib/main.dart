@@ -42,6 +42,7 @@ import 'music_store.dart';
 import 'doc_text_viewer_screen.dart';
 import 'pdf_viewer_screen.dart';
 import 'photo_service.dart';
+import 'player_screen.dart';
 import 'photo_store.dart';
 import 'photos_screen.dart';
 import 'rag_index.dart';
@@ -2447,6 +2448,12 @@ class _ChatScreenState extends State<ChatScreen>
 
   /// Compact now-playing bar with transport controls, shown above the input
   /// whenever a track is loaded in the in-app player.
+  void _openPlayer() {
+    Navigator.of(context).push(MaterialPageRoute(
+      builder: (_) => PlayerScreen(player: _player, music: _music),
+    ));
+  }
+
   Widget _nowPlayingBar() {
     final scheme = Theme.of(context).colorScheme;
     final radio = _player.isRadio;
@@ -2469,32 +2476,43 @@ class _ChatScreenState extends State<ChatScreen>
         padding: const EdgeInsets.fromLTRB(12, 4, 4, 4),
         child: Row(
           children: [
-            Icon(radio ? Icons.radio : Icons.music_note,
-                size: 18, color: scheme.onSecondaryContainer),
-            const SizedBox(width: 8),
             Expanded(
-              child: Column(
-                mainAxisSize: MainAxisSize.min,
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Text(
-                    title,
-                    maxLines: 1,
-                    overflow: TextOverflow.ellipsis,
-                    style: TextStyle(
-                        fontSize: 13,
-                        fontWeight: FontWeight.w600,
-                        color: scheme.onSecondaryContainer),
-                  ),
-                  Text(
-                    subtitle,
-                    maxLines: 1,
-                    overflow: TextOverflow.ellipsis,
-                    style: TextStyle(
-                        fontSize: 11,
-                        color: scheme.onSecondaryContainer.withValues(alpha: 0.8)),
-                  ),
-                ],
+              child: GestureDetector(
+                behavior: HitTestBehavior.opaque,
+                onTap: _openPlayer,
+                child: Row(
+                  children: [
+                    Icon(radio ? Icons.radio : Icons.music_note,
+                        size: 18, color: scheme.onSecondaryContainer),
+                    const SizedBox(width: 8),
+                    Expanded(
+                      child: Column(
+                        mainAxisSize: MainAxisSize.min,
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Text(
+                            title,
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                            style: TextStyle(
+                                fontSize: 13,
+                                fontWeight: FontWeight.w600,
+                                color: scheme.onSecondaryContainer),
+                          ),
+                          Text(
+                            subtitle,
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                            style: TextStyle(
+                                fontSize: 11,
+                                color: scheme.onSecondaryContainer
+                                    .withValues(alpha: 0.8)),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ],
+                ),
               ),
             ),
             // Skip controls only make sense for a local queue, not live radio.

@@ -146,6 +146,15 @@ class WikipediaService {
     return hits;
   }
 
+  /// Title suggestions for as-you-type search. Backed by the ZIM's suggestion
+  /// index, which Kiwix builds weighted by article popularity (an incoming-link
+  /// proxy), so the most-linked / most-probable matches rank first.
+  Future<List<ZimHit>> suggest(String query, {int k = 20}) async {
+    if (query.trim().isEmpty) return const [];
+    if (!await ensureOpen()) return const [];
+    return _ffi!.suggest(_handle!, query, k: k);
+  }
+
   /// A pseudo-random article for "surprise me" browsing: suggests titles for a
   /// few random common letters and picks one. Returns null if nothing is found.
   Future<ZimHit?> randomArticle() async {

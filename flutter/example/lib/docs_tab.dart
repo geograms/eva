@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:io';
 
 import 'package:flutter/material.dart';
@@ -37,6 +38,8 @@ class _DocsTabState extends State<DocsTab> with TickerProviderStateMixin {
   List<ZimHit> _wikiHits = const [];
   bool _wikiSearching = false;
   bool _wikiSearched = false;
+  Timer? _wikiDebounce;
+  int _wikiSearchSeq = 0; // drop stale async results
 
   @override
   void initState() {
@@ -70,6 +73,7 @@ class _DocsTabState extends State<DocsTab> with TickerProviderStateMixin {
   @override
   void dispose() {
     docCategorizeProgress.removeListener(_onCatProgress);
+    _wikiDebounce?.cancel();
     _wikiSearchCtl.dispose();
     _subTab.dispose();
     super.dispose();
@@ -203,7 +207,7 @@ class _DocsTabState extends State<DocsTab> with TickerProviderStateMixin {
           child: TextField(
             controller: _wikiSearchCtl,
             textInputAction: TextInputAction.search,
-            onChanged: (_) => setState(() {}), // reflect clear button
+            onChanged: _onWikiQueryChanged,
             onSubmitted: (_) => _runWikiSearch(),
             decoration: InputDecoration(
               isDense: true,
@@ -322,13 +326,34 @@ class _DocsTabState extends State<DocsTab> with TickerProviderStateMixin {
     return t.isEmpty ? null : t;
   }
 
+  /// As-you-type: debounce, then fetch ranked title suggestions.
+  void _onWikiQueryChanged(String text) {
+    setState(() {}); // reflect clear button
+    _wikiDebounce?.cancel();
+    final q = text.trim();
+    if (q.isEmpty) {
+      setState(() {
+        _wikiHits = const [];
+        _wikiSearched = false;
+        _wikiSearching = false;
+      });
+      return;
+    }
+    _wikiDebounce = Timer(const Duration(milliseconds: 250), _runWikiSearch);
+  }
+
   Future<void> _runWikiSearch() async {
     final q = _wikiSearchCtl.text.trim();
     if (q.isEmpty) return;
+    final seq = ++_wikiSearchSeq;
     setState(() => _wikiSearching = true);
-    await Future<void>.delayed(const Duration(milliseconds: 50)); // paint spinner
-    final hits = await _wiki.search(q, k: 30);
-    if (!mounted) return;
+    await Future<void>.delayed(const Duration(milliseconds: 30)); // paint spinner
+    // Title suggestions: fast, and ranked by the ZIM's popularity-weighted
+    // suggestion index (most-linked matches first). Fall back to full-text
+    // search if suggestions come back empty.
+    var hits = await _wiki.suggest(q, k: 30);
+    if (hits.isEmpty) hits = await _wiki.search(q, k: 30);
+    if (!mounted || seq != _wikiSearchSeq) return; // a newer query superseded us
     setState(() {
       _wikiHits = hits;
       _wikiSearching = false;
