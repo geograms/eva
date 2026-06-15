@@ -1,0 +1,21 @@
+# Zapstore publishing config (https://zapstore.dev/docs/publish).
+# Eva is published to Zapstore via the `zsp` CLI: the APK is taken from this
+# repo's GitHub releases (eva-android-arm64-v8a.apk) and the metadata from the
+# Fastlane listing under flutter/example/fastlane/metadata/android/en-US/.
+#
+# Before publishing, set `pubkey` to your Nostr npub, then run:
+#   SIGN_WITH=nsec1...  zsp publish            (or: zsp publish --wizard)
+# See docs/zapstore/README.md for the full steps.
+
+repository: https://github.com/geograms/eva
+
+# Your Nostr public key (npub…). Required to publish; the relay verifies it
+# matches this file before whitelisting you.
+pubkey: REPLACE_WITH_YOUR_NPUB
+
+# Where the APK comes from (defaults to this repo's GitHub releases).
+release_source: https://github.com/geograms/eva
+
+# Pull app metadata (name, description, icon, screenshots) automatically.
+metadata_sources:
+  - github
