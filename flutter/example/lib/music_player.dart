@@ -51,9 +51,12 @@ class MusicPlayer extends ChangeNotifier {
     _index = -1;
     _counted.clear();
     _radioName = name;
+    notifyListeners(); // reflect the station name immediately
     try {
       await _player.setAudioSource(AudioSource.uri(Uri.parse(url)));
-      await _player.play();
+      // A live stream never "finishes", so play()'s Future would not complete —
+      // fire it without awaiting so callers aren't blocked.
+      unawaited(_player.play());
     } catch (_) {
       // A bad/unreachable stream shouldn't crash playback control.
     }

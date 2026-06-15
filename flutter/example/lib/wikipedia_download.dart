@@ -42,12 +42,39 @@ class WikipediaDownload extends ChangeNotifier {
 
   static const _listingUrl = 'https://download.kiwix.org/zim/wikipedia/';
 
+  static const int _gb = 1024 * 1024 * 1024;
+  static const int _mb = 1024 * 1024;
+
   // Simple English, no images — the recommended phone-sized edition.
   static const simpleNopic = WikiEdition(
     'Simple English (no images)',
     r'wikipedia_en_simple_all_nopic_\d{4}-\d{2}\.zim',
-    980 * 1024 * 1024, // ~937 MB; updated from HEAD when available
+    980 * _mb, // ~937 MB; updated from HEAD when available
   );
+
+  /// Curated downloadable editions, smallest first. Sizes are estimates
+  /// refined from a HEAD request before each download; the free-space check
+  /// gates anything that won't fit. Anything else can still be sideloaded via
+  /// "install a .zim you already have".
+  static const editions = <WikiEdition>[
+    simpleNopic,
+    WikiEdition('Simple English (with images)',
+        r'wikipedia_en_simple_all_maxi_\d{4}-\d{2}\.zim', 3 * _gb),
+    WikiEdition('English — essentials (top ~50k, with images)',
+        r'wikipedia_en_100_maxi_\d{4}-\d{2}\.zim', 350 * _mb),
+    WikiEdition('English — medicine (with images)',
+        r'wikipedia_en_medicine_maxi_\d{4}-\d{2}\.zim', 2 * _gb),
+    WikiEdition('English — full (no images)',
+        r'wikipedia_en_all_nopic_\d{4}-\d{2}\.zim', 55 * _gb),
+    WikiEdition('Portuguese — full (no images)',
+        r'wikipedia_pt_all_nopic_\d{4}-\d{2}\.zim', 14 * _gb),
+    WikiEdition('Spanish — full (no images)',
+        r'wikipedia_es_all_nopic_\d{4}-\d{2}\.zim', 19 * _gb),
+    WikiEdition('French — full (no images)',
+        r'wikipedia_fr_all_nopic_\d{4}-\d{2}\.zim', 25 * _gb),
+    WikiEdition('German — full (no images)',
+        r'wikipedia_de_all_nopic_\d{4}-\d{2}\.zim', 27 * _gb),
+  ];
 
   bool _busy = false;
   bool _cancel = false;

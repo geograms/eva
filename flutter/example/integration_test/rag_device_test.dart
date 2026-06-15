@@ -13,13 +13,13 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:integration_test/integration_test.dart';
 import 'package:path_provider/path_provider.dart';
 
-import 'package:cactus_example/app_prefs.dart';
-import 'package:cactus_example/background_indexer.dart';
-import 'package:cactus_example/document_service.dart';
-import 'package:cactus_example/inference_isolate.dart';
-import 'package:cactus_example/model_catalog.dart';
-import 'package:cactus_example/model_manager.dart';
-import 'package:cactus_example/rag_index.dart';
+import 'package:eva/app_prefs.dart';
+import 'package:eva/background_indexer.dart';
+import 'package:eva/document_service.dart';
+import 'package:eva/inference_isolate.dart';
+import 'package:eva/model_catalog.dart';
+import 'package:eva/model_manager.dart';
+import 'package:eva/rag_index.dart';
 
 // A document whose chunks comfortably exceed a tiny shard capacity, so indexing
 // it forces several shards (the new sharded layout).

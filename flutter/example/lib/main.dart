@@ -1386,6 +1386,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     }
     if (match == null) return false;
 
+    await incrementRadioPlay(match.url); // count it so favourites surface
     await _player.playRadio(match.name, match.url);
     setState(() {
       assistant.text = '▶ Tuning in to ${match!.name} — live radio.';

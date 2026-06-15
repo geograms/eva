@@ -183,15 +183,15 @@ jobs:
           set -euo pipefail
           mkdir -p dist
           cp flutter/example/build/app/outputs/flutter-apk/app-release.apk \
-             dist/cactus-android-arm64-v8a.apk
-          ( cd dist && sha256sum cactus-android-arm64-v8a.apk > cactus-android-arm64-v8a.apk.sha256 )
+             dist/eva-android-arm64-v8a.apk
+          ( cd dist && sha256sum eva-android-arm64-v8a.apk > eva-android-arm64-v8a.apk.sha256 )
           ls -lh dist
 
       - name: Upload workflow artifact
         uses: actions/upload-artifact@v4
         with:
-          name: cactus-android-apk
-          path: dist/cactus-android-arm64-v8a.apk*
+          name: eva-android-apk
+          path: dist/eva-android-arm64-v8a.apk*
           if-no-files-found: error
 
       - name: Publish APK to GitHub release
@@ -205,7 +205,7 @@ jobs:
               --notes "Automated Eva Android build." || true
           fi
           gh release upload "$TAG" \
-            dist/cactus-android-arm64-v8a.apk \
-            dist/cactus-android-arm64-v8a.apk.sha256 \
+            dist/eva-android-arm64-v8a.apk \
+            dist/eva-android-arm64-v8a.apk.sha256 \
             --clobber
           echo "Uploaded APK to release $TAG"

@@ -3,7 +3,7 @@
 # folder (as Eva.apk), ready to install or share.
 
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-URL="https://github.com/geograms/eva/releases/latest/download/cactus-android-arm64-v8a.apk"
+URL="https://github.com/geograms/eva/releases/latest/download/eva-android-arm64-v8a.apk"
 OUT="$DIR/Eva.apk"
 
 echo "Downloading the latest Eva APK..."

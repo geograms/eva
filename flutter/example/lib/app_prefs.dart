@@ -1,6 +1,8 @@
 import 'dart:convert';
+import 'dart:io';
 
 import 'package:flutter/material.dart';
+import 'package:path_provider/path_provider.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 /// Default persona: a friendly woman named Eva who elaborates on request.
@@ -121,15 +123,32 @@ Future<void> saveIntroSeen() async {
   await prefs.setBool(_kIntroSeenKey, true);
 }
 
-// ── Models storage location ──────────────────────────────────────────────────
+// ── Unified storage location ─────────────────────────────────────────────────
+//
+// One folder holds all of Eva's data: models, the offline Wikipedia, the
+// document corpus and the map cache, each in its own subfolder. The per-area
+// getters below derive from this root when it's set (and fall back to the older
+// per-area prefs / app-private defaults otherwise), so consumers don't change.
 
+const String _kStorageRootKey = 'storage_root';
 const String _kModelsLocationKey = 'models_location';
 
-/// Absolute path of the folder where model bundles are stored. Empty means the
-/// app's private storage. Pointing this at an SD card / shared folder lets the
-/// (large) model downloads survive a reinstall and be reused — no re-download.
+/// The chosen unified storage folder, or empty for app-private storage.
+Future<String> loadStorageRoot() async {
+  final prefs = await SharedPreferences.getInstance();
+  return prefs.getString(_kStorageRootKey) ?? '';
+}
+
+Future<void> saveStorageRoot(String path) async {
+  final prefs = await SharedPreferences.getInstance();
+  await prefs.setString(_kStorageRootKey, path);
+}
+
+/// Folder model bundles live under (`<this>/models`). Prefers the unified root.
 Future<String> loadModelsLocation() async {
   final prefs = await SharedPreferences.getInstance();
+  final root = prefs.getString(_kStorageRootKey) ?? '';
+  if (root.isNotEmpty) return root;
   return prefs.getString(_kModelsLocationKey) ?? '';
 }
 
@@ -194,6 +213,8 @@ Future<void> saveMapsEnabled(bool enabled) async {
 /// that already has the cache to reuse it.
 Future<String> loadMapsFolder() async {
   final prefs = await SharedPreferences.getInstance();
+  final root = prefs.getString(_kStorageRootKey) ?? '';
+  if (root.isNotEmpty) return root;
   return prefs.getString(_kMapsFolderKey) ?? '';
 }
 
@@ -249,6 +270,8 @@ const String _kCorpusLocationKey = 'corpus_location';
 /// so the indexed archive survives a reinstall.
 Future<String> loadCorpusLocation() async {
   final prefs = await SharedPreferences.getInstance();
+  final root = prefs.getString(_kStorageRootKey) ?? '';
+  if (root.isNotEmpty) return '$root/corpus';
   return prefs.getString(_kCorpusLocationKey) ?? '';
 }
 
@@ -261,16 +284,28 @@ Future<void> saveCorpusLocation(String path) async {
 
 /// An online radio station the user can play (a name + a stream URL).
 class RadioStation {
-  const RadioStation({required this.name, required this.url, this.genre = ''});
+  const RadioStation(
+      {required this.name, required this.url, this.genre = '', this.playCount = 0});
   final String name;
   final String url; // direct audio stream (http/https), e.g. an Icecast/MP3 URL
   final String genre;
+  final int playCount; // times tuned in, so favourites can float to the top
 
-  Map<String, dynamic> toJson() => {'name': name, 'url': url, 'genre': genre};
+  RadioStation copyWith({String? name, String? url, String? genre, int? playCount}) =>
+      RadioStation(
+        name: name ?? this.name,
+        url: url ?? this.url,
+        genre: genre ?? this.genre,
+        playCount: playCount ?? this.playCount,
+      );
+
+  Map<String, dynamic> toJson() =>
+      {'name': name, 'url': url, 'genre': genre, 'playCount': playCount};
   static RadioStation fromJson(Map<String, dynamic> j) => RadioStation(
         name: (j['name'] as String?) ?? '',
         url: (j['url'] as String?) ?? '',
         genre: (j['genre'] as String?) ?? '',
+        playCount: (j['playCount'] as num?)?.toInt() ?? 0,
       );
 }
 
@@ -330,6 +365,18 @@ Future<void> saveRadioStations(List<RadioStation> stations) async {
       _kRadioStationsKey, jsonEncode([for (final s in stations) s.toJson()]));
 }
 
+/// Increments the play count for the station with [url] and persists it, so
+/// most-played stations can be surfaced first. Returns the updated list.
+Future<List<RadioStation>> incrementRadioPlay(String url) async {
+  final stations = await loadRadioStations();
+  final updated = [
+    for (final s in stations)
+      s.url == url ? s.copyWith(playCount: s.playCount + 1) : s
+  ];
+  await saveRadioStations(updated);
+  return updated;
+}
+
 // ── Timed reminders ──────────────────────────────────────────────────────────
 
 /// A scheduled reminder, persisted so Settings can list/cancel pending ones and
@@ -368,4 +415,115 @@ Future<void> saveReminders(List<ReminderItem> reminders) async {
   final prefs = await SharedPreferences.getInstance();
   await prefs.setString(
       _kRemindersKey, jsonEncode([for (final r in reminders) r.toJson()]));
+}
+
+// ── Storage migration ────────────────────────────────────────────────────────
+
+/// The absolute directories where Eva's data currently lives (models, offline
+/// Wikipedia, document corpus, map cache), derived the same way the consumers
+/// derive them. Keyed by area.
+Future<Map<String, String>> currentDataDirs() async {
+  final prefs = await SharedPreferences.getInstance();
+  final root = prefs.getString(_kStorageRootKey) ?? '';
+  final appDocs = (await getApplicationDocumentsDirectory()).path;
+  final ext = await getExternalStorageDirectory();
+  final extPath = ext?.path ?? (await getApplicationSupportDirectory()).path;
+  if (root.isNotEmpty) {
+    return {
+      'models': '$root/models',
+      'wikipedia': '$root/wikipedia',
+      'corpus': '$root/corpus',
+      'maps': '$root/maps',
+    };
+  }
+  final modelsLoc = prefs.getString(_kModelsLocationKey) ?? '';
+  final corpusLoc = prefs.getString(_kCorpusLocationKey) ?? '';
+  final mapsLoc = prefs.getString(_kMapsFolderKey) ?? '';
+  return {
+    'models': modelsLoc.isEmpty ? '$appDocs/models' : '$modelsLoc/models',
+    'wikipedia': modelsLoc.isEmpty ? '$extPath/wikipedia' : '$modelsLoc/wikipedia',
+    'corpus': corpusLoc.isEmpty ? '$appDocs/corpus' : corpusLoc,
+    'maps': mapsLoc.isEmpty ? '$extPath/maps' : '$mapsLoc/maps',
+  };
+}
+
+/// Moves all of Eva's data into [newRoot] (one subfolder per area), repoints the
+/// stored Wikipedia path, makes [newRoot] the unified storage root, and clears
+/// the old per-area location prefs. Progress is reported via [onStep]. Existing
+/// files already at the destination are left in place. Best-effort and safe to
+/// re-run.
+Future<void> migrateStorageTo(String newRoot,
+    {void Function(String message)? onStep}) async {
+  final src = await currentDataDirs();
+  final targets = <String, String>{
+    'models': '$newRoot/models',
+    'wikipedia': '$newRoot/wikipedia',
+    'corpus': '$newRoot/corpus',
+    'maps': '$newRoot/maps',
+  };
+  for (final area in src.keys) {
+    final from = Directory(src[area]!);
+    final to = targets[area]!;
+    if (from.path == to) continue;
+    if (!await from.exists()) continue;
+    onStep?.call('Moving ${_areaLabel(area)}…');
+    await _moveDir(from, Directory(to));
+  }
+  // Repoint the stored Wikipedia .zim path if it sat under the moved folder.
+  final zim = await loadWikipediaZimPath();
+  if (zim.isNotEmpty && _isUnder(zim, src['wikipedia']!)) {
+    await saveWikipediaZimPath(
+        zim.replaceFirst(src['wikipedia']!, targets['wikipedia']!));
+  }
+  onStep?.call('Finishing…');
+  await saveStorageRoot(newRoot);
+  // Clear the legacy per-area prefs so everything derives from the new root.
+  final prefs = await SharedPreferences.getInstance();
+  await prefs.remove(_kModelsLocationKey);
+  await prefs.remove(_kCorpusLocationKey);
+  await prefs.remove(_kMapsFolderKey);
+}
+
+String _areaLabel(String area) {
+  switch (area) {
+    case 'models':
+      return 'models';
+    case 'wikipedia':
+      return 'offline Wikipedia';
+    case 'corpus':
+      return 'documents';
+    case 'maps':
+      return 'map cache';
+  }
+  return area;
+}
+
+bool _isUnder(String path, String dir) => path == dir || path.startsWith('$dir/');
+
+/// Moves [src] to [dst]: a fast rename when on the same filesystem, else a
+/// recursive copy + delete (e.g. internal storage → SD card).
+Future<void> _moveDir(Directory src, Directory dst) async {
+  try {
+    await dst.parent.create(recursive: true);
+    await src.rename(dst.path);
+    return;
+  } catch (_) {
+    // Cross-device move or destination exists — fall back to copy + delete.
+  }
+  await _copyDir(src, dst);
+  try {
+    await src.delete(recursive: true);
+  } catch (_) {}
+}
+
+Future<void> _copyDir(Directory src, Directory dst) async {
+  await dst.create(recursive: true);
+  await for (final entity in src.list(followLinks: false)) {
+    final name = entity.path.split('/').last;
+    if (entity is Directory) {
+      await _copyDir(entity, Directory('${dst.path}/$name'));
+    } else if (entity is File) {
+      await entity.copy('${dst.path}/$name');
+    }
+  }
 }

@@ -20,7 +20,7 @@ adb install -r binary/Eva.apk
 The APK is published with every build and is always available at this stable
 URL (this is the easiest thing to share):
 
-> https://github.com/geograms/eva/releases/latest/download/cactus-android-arm64-v8a.apk
+> https://github.com/geograms/eva/releases/latest/download/eva-android-arm64-v8a.apk
 
 ## Why isn't the APK committed here?
 

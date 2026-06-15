@@ -53,7 +53,6 @@ class _SettingsScreenState extends State<SettingsScreen> {
   late final PhotoService _photos = PhotoService(_docs);
   late final MusicService _music = MusicService(_docs);
   List<DocumentInfo> _documents = const [];
-  String _corpusLocation = 'App storage (default)';
   List<ModelSpec> _catalog = const [];
   final Set<String> _installed = {};
   String? _downloadingId;
@@ -67,18 +66,21 @@ class _SettingsScreenState extends State<SettingsScreen> {
   List<stt.LocaleName> _locales = const [];
   bool _localesLoading = false;
   int _maxTokens = kDefaultMaxTokens;
-  String _modelsLocation = '';
   int _skippedBad = 0;
   int _photoCount = 0;
   int _musicCount = 0;
   bool _wikiEnabled = true;
   String _wikiPath = '';
   final WikipediaDownload _wikiDl = WikipediaDownload.instance;
+  WikiEdition? _wikiDownloadingEdition; // which edition is downloading now
   bool _mapsEnabled = true;
-  String _mapsFolder = '';
   bool _mapsSatellite = false;
   int _mapCacheBytes = 0;
   bool _reminderPermission = false;
+  String _storageRoot = ''; // unified data folder (empty = app storage)
+  bool _migrating = false;
+  // Which settings area is open; null shows the top-level menu.
+  String? _panel;
   String? _error;
 
   @override
@@ -108,26 +110,23 @@ class _SettingsScreenState extends State<SettingsScreen> {
     _voiceEngine = await loadVoiceEngine();
     _voiceLocale = await loadVoiceLocale();
     _maxTokens = await loadMaxTokens();
-    _modelsLocation = await loadModelsLocation();
     _skippedBad = await _docs.skippedCount();
     _photoCount = await _photos.photoCount();
     _musicCount = await _music.trackCount();
     _wikiEnabled = await loadWikipediaEnabled();
     _wikiPath = await loadWikipediaZimPath();
     _mapsEnabled = await loadMapsEnabled();
-    _mapsFolder = await loadMapsFolder();
     _mapsSatellite = await loadMapsSatellite();
     _reminderPermission = await ReminderService.instance.notificationsEnabled();
+    _storageRoot = await loadStorageRoot();
     _refreshMapCacheSize();
     _documents = await _docs.list();
-    _corpusLocation = await _docs.locationLabel();
     await _refreshInstalled();
     if (_voiceEngine == VoiceEngine.system) _loadLocales();
   }
 
   Future<void> _refreshDocs() async {
     _documents = await _docs.list();
-    _corpusLocation = await _docs.locationLabel();
     if (mounted) setState(() {});
   }
 
@@ -225,7 +224,10 @@ class _SettingsScreenState extends State<SettingsScreen> {
 
   /// Lets the user choose where model downloads are stored (e.g. SD card) so
   /// they survive a reinstall; an existing folder with models is reused.
-  Future<void> _chooseModelsLocation() async {
+  /// Chooses a single storage folder for all of Eva's data and moves the
+  /// existing data into it (models, offline Wikipedia, documents, map cache), so
+  /// nothing has to be downloaded again.
+  Future<void> _chooseStorageFolder() async {
     var status = await Permission.manageExternalStorage.status;
     if (!status.isGranted) {
       status = await Permission.manageExternalStorage.request();
@@ -236,74 +238,48 @@ class _SettingsScreenState extends State<SettingsScreen> {
     }
     final dir = await FilePicker.platform.getDirectoryPath();
     if (dir == null) return;
-    await saveModelsLocation(dir);
-    final found = await widget.manager.countModelsAt(dir);
-    setState(() => _modelsLocation = dir);
-    await _toast(found > 0
-        ? 'Found $found model${found == 1 ? '' : 's'} there — they will be '
-            'reused. New downloads go there too.'
-        : 'New model downloads will be stored there.');
-  }
+    if (dir == _storageRoot) return;
+    final go = await _confirm(
+      'Move data here?',
+      'Eva will move its models and downloaded data into:\n\n$dir\n\nThis can '
+          'take a while for large models. Continue?',
+    );
+    if (go != true) return;
 
-  /// Lets the user choose a folder (e.g. SD card) for the corpus, reusing an
-  /// existing archive there or offering to move the current documents into it.
-  Future<void> _chooseLocation() async {
-    var status = await Permission.manageExternalStorage.status;
-    if (!status.isGranted) {
-      status = await Permission.manageExternalStorage.request();
-    }
-    if (!status.isGranted) {
-      await _toast('Storage permission is required to use a custom folder.');
-      return;
-    }
-    final dir = await FilePicker.platform.getDirectoryPath();
-    if (dir == null) return;
-
-    // Peek at any existing pack in the target folder (without switching to it).
-    final hadDocs = _documents.isNotEmpty;
-    final targetManifest = await _docs.readManifestAt(dir);
-    final reason = await _docs.incompatibilityReasonAt(dir);
-
-    if (targetManifest != null) {
-      // Folder already holds an archive.
-      if (reason != null) {
-        final useAnyway = await _confirm('Incompatible archive', reason);
-        if (useAnyway != true) return;
-      }
-      await _docs.useLocation(dir);
-      await _refreshDocs();
-      await _toast('Using archive at this folder '
-          '(${targetManifest['documentCount'] ?? '?'} documents).');
-      return;
-    }
-
-    // Empty target folder.
-    if (hadDocs) {
-      final move = await _confirmThreeWay(
-        'Use this folder',
-        'Move your $_docsCountLabel into this folder, or start a fresh, '
-            'empty archive here?',
+    setState(() => _migrating = true);
+    var step = 'Preparing…';
+    StateSetter? dialogSet;
+    if (mounted) {
+      showDialog<void>(
+        context: context,
+        barrierDismissible: false,
+        builder: (ctx) => StatefulBuilder(builder: (ctx, set) {
+          dialogSet = set;
+          return AlertDialog(
+            title: const Text('Moving your data'),
+            content: Column(mainAxisSize: MainAxisSize.min, children: [
+              const LinearProgressIndicator(),
+              const SizedBox(height: 12),
+              Text(step),
+            ]),
+          );
+        }),
       );
-      if (move == null) return;
-      if (move) {
-        await _docs.moveCorpusTo(dir);
-      } else {
-        await _docs.useLocation(dir);
-      }
-    } else {
-      await _docs.useLocation(dir);
     }
-    await _refreshDocs();
-    await _toast('Documents are now stored at this folder.');
-  }
-
-  String get _docsCountLabel =>
-      '${_documents.length} document${_documents.length == 1 ? '' : 's'}';
-
-  Future<void> _useDefaultLocation() async {
-    await _docs.useDefaultLocation();
-    await _refreshDocs();
-    await _toast('Using app default storage.');
+    try {
+      await migrateStorageTo(dir, onStep: (m) {
+        step = m;
+        dialogSet?.call(() {});
+      });
+      _storageRoot = await loadStorageRoot();
+      if (mounted) Navigator.of(context).pop(); // close progress dialog
+      await _toast('Data moved. Everything now lives in the new folder.');
+    } catch (e) {
+      if (mounted) Navigator.of(context).pop();
+      await _toast('Could not move all data: $e');
+    } finally {
+      if (mounted) setState(() => _migrating = false);
+    }
   }
 
   Future<bool?> _confirm(String title, String body) => showDialog<bool>(
@@ -317,27 +293,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
                 child: const Text('Cancel')),
             FilledButton(
                 onPressed: () => Navigator.pop(c, true),
-                child: const Text('Use anyway')),
-          ],
-        ),
-      );
-
-  // Returns true = move, false = fresh, null = cancel.
-  Future<bool?> _confirmThreeWay(String title, String body) => showDialog<bool?>(
-        context: context,
-        builder: (c) => AlertDialog(
-          title: Text(title),
-          content: Text(body),
-          actions: [
-            TextButton(
-                onPressed: () => Navigator.pop(c, null),
-                child: const Text('Cancel')),
-            TextButton(
-                onPressed: () => Navigator.pop(c, false),
-                child: const Text('Start fresh')),
-            FilledButton(
-                onPressed: () => Navigator.pop(c, true),
-                child: const Text('Move here')),
+                child: const Text('Continue')),
           ],
         ),
       );
@@ -430,7 +386,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
 
       final found = await widget.manager.scanFolder(dir);
       if (found.isEmpty) {
-        setState(() => _error = 'No Cactus models found in that folder.');
+        setState(() => _error = 'No Eva models found in that folder.');
         return;
       }
 
@@ -457,525 +413,574 @@ class _SettingsScreenState extends State<SettingsScreen> {
     await _refreshInstalled();
   }
 
+  // Settings are organised as a menu of areas; each opens in its own panel so
+  // no single screen feels crowded.
+  static const List<({String key, String title, IconData icon, String subtitle})>
+      _categories = [
+    (key: 'appearance', title: 'Appearance', icon: Icons.palette_outlined, subtitle: 'Light / dark theme'),
+    (key: 'persona', title: 'Persona & replies', icon: Icons.face_retouching_natural, subtitle: 'System prompt, reply length'),
+    (key: 'models', title: 'Language model', icon: Icons.memory, subtitle: 'Choose or download the AI model'),
+    (key: 'voice', title: 'Voice', icon: Icons.mic_none, subtitle: 'Speech-to-text engine & language'),
+    (key: 'assistant', title: 'Phone assistant', icon: Icons.assistant_outlined, subtitle: 'Use Eva as the device assistant'),
+    (key: 'documents', title: 'Documents', icon: Icons.folder_copy_outlined, subtitle: 'Index & search your files'),
+    (key: 'photos', title: 'Photos', icon: Icons.photo_library_outlined, subtitle: 'Index & browse your gallery'),
+    (key: 'music', title: 'Music', icon: Icons.library_music_outlined, subtitle: 'Index your audio library'),
+    (key: 'radio', title: 'Radio', icon: Icons.radio, subtitle: 'Online radio stations'),
+    (key: 'wikipedia', title: 'Wikipedia', icon: Icons.public, subtitle: 'Offline knowledge'),
+    (key: 'maps', title: 'Maps', icon: Icons.map_outlined, subtitle: 'Offline maps & navigation'),
+    (key: 'reminders', title: 'Reminders', icon: Icons.notifications_active_outlined, subtitle: 'Timed alerts'),
+    (key: 'storage', title: 'Storage', icon: Icons.sd_storage_outlined, subtitle: 'Where models & data are kept'),
+  ];
+
   @override
   Widget build(BuildContext context) {
-    final busy = _downloadingId != null || _scanning || _voiceDownloading;
-    return Scaffold(
-      appBar: AppBar(title: const Text('Settings')),
-      body: ListView(
-        padding: const EdgeInsets.symmetric(vertical: 8),
-        children: [
-          _sectionHeader('Appearance'),
-          Padding(
-            padding: const EdgeInsets.fromLTRB(16, 0, 16, 8),
-            child: ValueListenableBuilder<ThemeMode>(
-              valueListenable: themeModeNotifier,
-              builder: (context, mode, _) => SegmentedButton<ThemeMode>(
-                segments: const [
-                  ButtonSegment(value: ThemeMode.system, label: Text('System')),
-                  ButtonSegment(value: ThemeMode.light, label: Text('Light')),
-                  ButtonSegment(value: ThemeMode.dark, label: Text('Dark')),
-                ],
-                selected: {mode},
-                onSelectionChanged: (s) => setThemeMode(s.first),
-              ),
-            ),
-          ),
-          const Divider(),
-          _sectionHeader('Persona'),
-          Padding(
-            padding: const EdgeInsets.fromLTRB(16, 0, 16, 8),
-            child: TextField(
-              controller: _prompt,
-              minLines: 3,
-              maxLines: 6,
-              onChanged: saveSystemPrompt,
-              decoration: const InputDecoration(
-                border: OutlineInputBorder(),
-                labelText: 'System prompt',
-                helperText: 'How the assistant should behave. Saved automatically.',
-              ),
-            ),
-          ),
-          Padding(
-            padding: const EdgeInsets.fromLTRB(16, 0, 16, 8),
-            child: Align(
-              alignment: Alignment.centerLeft,
-              child: TextButton(
-                onPressed: () {
-                  _prompt.text = kDefaultSystemPrompt;
-                  saveSystemPrompt(kDefaultSystemPrompt);
+    if (_panel == null) {
+      return Scaffold(
+        appBar: AppBar(title: const Text('Settings')),
+        body: ListView(
+          children: [
+            for (final c in _categories)
+              ListTile(
+                leading: Icon(c.icon),
+                title: Text(c.title),
+                subtitle: Text(c.subtitle),
+                trailing: const Icon(Icons.chevron_right),
+                onTap: () {
+                  if (c.key == 'radio') {
+                    Navigator.of(context).push(MaterialPageRoute(
+                      builder: (_) => RadioStationsScreen(player: widget.player),
+                    ));
+                  } else {
+                    setState(() => _panel = c.key);
+                  }
                 },
-                child: const Text('Reset to default'),
               ),
-            ),
-          ),
-          const Padding(
-            padding: EdgeInsets.fromLTRB(16, 4, 16, 0),
-            child: Text('Reply length'),
-          ),
-          const Padding(
-            padding: EdgeInsets.fromLTRB(16, 0, 16, 6),
-            child: Text('Longer replies take more time to generate.',
-                style: TextStyle(fontSize: 12, color: Colors.grey)),
-          ),
-          Padding(
-            padding: const EdgeInsets.fromLTRB(16, 0, 16, 8),
-            child: SegmentedButton<int>(
-              segments: const [
-                ButtonSegment(value: 256, label: Text('Short')),
-                ButtonSegment(value: 1024, label: Text('Normal')),
-                ButtonSegment(value: 2048, label: Text('Long')),
-              ],
-              selected: {
-                kMaxTokensChoices.contains(_maxTokens)
-                    ? _maxTokens
-                    : kDefaultMaxTokens
-              },
-              onSelectionChanged: (s) {
-                setState(() => _maxTokens = s.first);
-                saveMaxTokens(s.first);
-              },
-            ),
-          ),
-          const Divider(),
-          _sectionHeader('Models'),
-          ListTile(
-            leading: const Icon(Icons.sd_storage_outlined),
-            title: const Text('Models storage'),
-            subtitle: Text(_modelsLocation.isEmpty
-                ? 'App storage (cleared on uninstall)'
-                : _modelsLocation),
-            trailing: TextButton(
-              onPressed: _chooseModelsLocation,
-              child: const Text('Change'),
-            ),
-          ),
-          if (_error != null)
-            Padding(
-              padding: const EdgeInsets.fromLTRB(16, 0, 16, 8),
-              child: Text(_error!, style: const TextStyle(color: Colors.red)),
-            ),
-          Padding(
-            padding: const EdgeInsets.fromLTRB(16, 0, 16, 8),
-            child: OutlinedButton.icon(
-              onPressed: busy ? null : _addFromFolder,
-              icon: _scanning
-                  ? const SizedBox(
-                      width: 16, height: 16, child: CircularProgressIndicator(strokeWidth: 2))
-                  : const Icon(Icons.folder_open),
-              label: const Text('Add models from a folder…'),
-            ),
-          ),
-          const Padding(
-            padding: EdgeInsets.fromLTRB(16, 0, 16, 12),
-            child: Text(
-              'Point to a folder (e.g. an SD card) that already contains extracted '
-              'Cactus models, or download one below. Larger models are stronger '
-              'but slower and use more memory.',
-              style: TextStyle(fontSize: 12, color: Colors.grey),
-            ),
-          ),
-          for (final m in _catalog) _modelTile(m, busy),
-          const SizedBox(height: 8),
-          const Divider(),
-          _sectionHeader('Voice'),
-          Padding(
-            padding: const EdgeInsets.fromLTRB(16, 0, 16, 8),
-            child: SegmentedButton<VoiceEngine>(
-              segments: const [
-                ButtonSegment(
-                  value: VoiceEngine.fast,
-                  label: Text('English'),
-                  icon: Icon(Icons.bolt),
-                ),
-                ButtonSegment(
-                  value: VoiceEngine.system,
-                  label: Text('System'),
-                  icon: Icon(Icons.language),
-                ),
-              ],
-              selected: {_voiceEngine},
-              onSelectionChanged: busy
-                  ? null
-                  : (s) async {
-                      final e = s.first;
-                      setState(() => _voiceEngine = e);
-                      await saveVoiceEngine(e);
-                      if (e == VoiceEngine.system) _loadLocales();
-                    },
-            ),
-          ),
-          if (_voiceEngine == VoiceEngine.fast) ...[
-            _voiceTile(busy),
-            const Padding(
-              padding: EdgeInsets.fromLTRB(16, 0, 16, 16),
-              child: Text(
-                'A fast, fully offline English model. Tap the microphone in the '
-                'chat to dictate; the model is downloaded once.',
-                style: TextStyle(fontSize: 12, color: Colors.grey),
-              ),
-            ),
-          ] else ...[
-            _systemVoiceConfig(),
-            const Padding(
-              padding: EdgeInsets.fromLTRB(16, 0, 16, 16),
-              child: Text(
-                "Uses the phone's built-in speech recognition (many languages, "
-                'including the system language). Choose a language or leave it on '
-                'Auto. Works offline where the language pack is installed.',
-                style: TextStyle(fontSize: 12, color: Colors.grey),
-              ),
-            ),
           ],
-          const Divider(),
-          _sectionHeader('Assistant'),
-          _assistantTile(),
-          const Divider(),
-          _sectionHeader('Documents'),
-          ListTile(
-            leading: const Icon(Icons.folder_copy_outlined),
-            title: const Text('Browse indexed documents'),
-            subtitle: Text(_documents.isEmpty
-                ? 'No documents added yet.'
-                : '${_documents.length} documents — view by folder, open, remove'),
-            trailing: _documents.isEmpty
-                ? null
-                : const Icon(Icons.chevron_right),
-            onTap: _documents.isEmpty
-                ? null
-                : () async {
-                    await Navigator.of(context).push(MaterialPageRoute(
-                      builder: (_) => DocumentsScreen(docs: _docs),
-                    ));
-                    await _refreshDocs();
-                  },
+        ),
+      );
+    }
+
+    final cat = _categories.firstWhere((c) => c.key == _panel);
+    final busy = _downloadingId != null || _scanning || _voiceDownloading;
+    // System back returns to the menu rather than closing Settings.
+    return PopScope(
+      canPop: false,
+      onPopInvokedWithResult: (didPop, _) {
+        if (!didPop && mounted) setState(() => _panel = null);
+      },
+      child: Scaffold(
+        appBar: AppBar(
+          title: Text(cat.title),
+          leading: IconButton(
+            icon: const Icon(Icons.arrow_back),
+            onPressed: () => setState(() => _panel = null),
           ),
-          ListTile(
-            leading: const Icon(Icons.travel_explore),
-            title: const Text('Scan phone for documents'),
-            subtitle: const Text(
-                'Finds every PDF/text file on this phone and adds it.'),
-            onTap: busy ? null : () => _bulkImport('/storage/emulated/0'),
-          ),
-          ListTile(
-            leading: const Icon(Icons.drive_folder_upload_outlined),
-            title: const Text('Import documents from a folder'),
-            onTap: busy ? null : _pickFolderAndImport,
-          ),
-          if (_skippedBad > 0)
-            ListTile(
-              leading: const Icon(Icons.refresh),
-              title: Text('Retry $_skippedBad skipped file'
-                  '${_skippedBad == 1 ? '' : 's'}'),
-              subtitle: const Text(
-                  'Files with no extractable text are skipped on scans. Forget '
-                  'that so the next scan tries them again.'),
-              onTap: busy
-                  ? null
-                  : () async {
-                      await _docs.clearSkipped();
-                      setState(() => _skippedBad = 0);
-                      await _toast('Skip-list cleared — they will be tried on '
-                          'the next scan.');
-                    },
-            ),
-          ListTile(
-            leading: const Icon(Icons.sd_storage_outlined),
-            title: const Text('Storage location'),
-            subtitle: Text(_corpusLocation),
-            isThreeLine: _corpusLocation.length > 30,
-          ),
-          Padding(
-            padding: const EdgeInsets.fromLTRB(16, 0, 16, 0),
-            child: Wrap(
-              spacing: 8,
-              children: [
-                OutlinedButton.icon(
-                  onPressed: busy ? null : _chooseLocation,
-                  icon: const Icon(Icons.folder_open, size: 18),
-                  label: const Text('Choose folder…'),
-                ),
-                if (_corpusLocation != 'App storage (default)')
-                  TextButton(
-                    onPressed: busy ? null : _useDefaultLocation,
-                    child: const Text('Use app default'),
-                  ),
-              ],
-            ),
-          ),
-          const Padding(
-            padding: EdgeInsets.fromLTRB(16, 8, 16, 16),
-            child: Text(
-              'Add PDFs or text files from the chat (paperclip icon) to ask Eva '
-              'about them. Search runs fully offline. Point the storage at an SD '
-              'card to keep the indexed archive — it can be reused after '
-              'reinstalling the app.',
-              style: TextStyle(fontSize: 12, color: Colors.grey),
-            ),
-          ),
-          const Divider(),
-          _sectionHeader('Photos'),
-          ListTile(
-            leading: const Icon(Icons.photo_library_outlined),
-            title: const Text('Browse photos'),
-            subtitle: Text(_photoCount == 0
-                ? 'Scan your gallery to browse and search photos.'
-                : '$_photoCount photos indexed — view by day and type'),
-            trailing:
-                _photoCount == 0 ? null : const Icon(Icons.chevron_right),
-            onTap: _photoCount == 0
-                ? null
-                : () async {
-                    await Navigator.of(context).push(MaterialPageRoute(
-                      builder: (_) => PhotosScreen(photos: _photos),
-                    ));
-                  },
-          ),
-          ListTile(
-            leading: const Icon(Icons.image_search),
-            title: const Text('Index photo gallery'),
-            subtitle: const Text(
-                'Catalogs every photo with a cached thumbnail, by date and '
-                'type, continuously in the background. Tap to (re)scan for new '
-                'photos.'),
-            onTap: () async {
-              var ok = await Permission.photos.request();
-              if (!ok.isGranted) ok = await Permission.storage.request();
-              if (!ok.isGranted &&
-                  !(await Permission.manageExternalStorage.isGranted)) {
-                await _toast('Photo access is required to index the gallery.');
-                return;
-              }
-              await savePhotoScanDone(false);
-              await _toast('Photo indexing will run in the background — '
-                  'progress shows at the top of the chat.');
-            },
-          ),
-          const Padding(
-            padding: EdgeInsets.fromLTRB(16, 4, 16, 16),
-            child: Text(
-              'Indexing runs continuously in the background until the whole '
-              'gallery is catalogued. Recognising what is inside each photo (so '
-              'you can search by content) is a separate on-device pass added '
-              'later.',
-              style: TextStyle(fontSize: 12, color: Colors.grey),
-            ),
-          ),
-          _sectionHeader('Music'),
-          ListTile(
-            leading: const Icon(Icons.library_music_outlined),
-            title: const Text('Music library'),
-            subtitle: Text(_musicCount == 0
-                ? 'Scan your audio files to catalog artists, albums and songs.'
-                : '$_musicCount tracks indexed — ask Eva about your artists'),
-          ),
-          ListTile(
-            leading: const Icon(Icons.audiotrack),
-            title: const Text('Index music library'),
-            subtitle: const Text(
-                'Reads artist, album, title and genre tags from your audio '
-                'files, then fetches lyrics online when available. Runs '
-                'continuously in the background. Tap to (re)scan for new tracks.'),
-            onTap: () async {
-              var ok = await Permission.audio.request();
-              if (!ok.isGranted) ok = await Permission.storage.request();
-              if (!ok.isGranted &&
-                  !(await Permission.manageExternalStorage.isGranted)) {
-                await _toast('Storage access is required to index music.');
-                return;
-              }
-              await saveMusicScanDone(false);
-              await _toast('Music indexing will run in the background — '
-                  'progress shows at the top of the chat.');
-            },
-          ),
-          const Padding(
-            padding: EdgeInsets.fromLTRB(16, 4, 16, 16),
-            child: Text(
-              'Lyrics and genre are fetched from a free online service when the '
-              'phone has internet; everything else is read on-device. This data '
-              'lets Eva answer questions about your artists and songs.',
-              style: TextStyle(fontSize: 12, color: Colors.grey),
-            ),
-          ),
-          ListTile(
-            leading: const Icon(Icons.radio),
-            title: const Text('Radio stations'),
-            subtitle: const Text(
-                'Manage online radio stations to play. Comes with examples; '
-                'add your own stream URLs.'),
-            trailing: const Icon(Icons.chevron_right),
-            onTap: () => Navigator.of(context).push(MaterialPageRoute(
-              builder: (_) => RadioStationsScreen(player: widget.player),
-            )),
-          ),
-          const Divider(),
-          _sectionHeader('Reminders'),
-          SwitchListTile(
-            secondary: const Icon(Icons.notifications_active_outlined),
-            title: const Text('Allow timed reminders'),
-            subtitle: Text(_reminderPermission
-                ? 'Eva can post reminder notifications.'
-                : 'Tap to allow notifications so reminders can alert you.'),
-            value: _reminderPermission,
-            onChanged: (_) async {
-              final ok = await ReminderService.instance.requestPermissions();
-              setState(() => _reminderPermission = ok);
-              await _toast(ok
-                  ? 'Reminders enabled.'
-                  : 'Notifications are blocked — enable them in system settings.');
-            },
-          ),
-          const Padding(
-            padding: EdgeInsets.fromLTRB(16, 0, 16, 16),
-            child: Text(
-              'Ask in chat, e.g. "remind me to call mum in 15 minutes" or '
-              '"set a reminder for 7pm to leave". Reminders fire as system '
-              'notifications even if Eva is closed.',
-              style: TextStyle(fontSize: 12, color: Colors.grey),
-            ),
-          ),
-          _sectionHeader('Knowledge (Offline Wikipedia)'),
-          SwitchListTile(
-            secondary: const Icon(Icons.public),
-            title: const Text('Use Wikipedia to help answer'),
-            subtitle: Text(_wikiPath.isEmpty
-                ? 'No Wikipedia installed yet.'
-                : 'Installed: ${_wikiPath.split('/').last}'),
-            value: _wikiEnabled,
-            onChanged: (v) async {
-              await saveWikipediaEnabled(v);
-              setState(() => _wikiEnabled = v);
-            },
-          ),
-          if (_wikiDl.downloading)
-            ListTile(
-              leading: const Icon(Icons.downloading),
-              title: const Text('Downloading Simple English Wikipedia…'),
-              subtitle: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  const SizedBox(height: 6),
-                  LinearProgressIndicator(
-                      value: _wikiDl.progress > 0 ? _wikiDl.progress : null),
-                  const SizedBox(height: 4),
-                  Text(_wikiDl.total > 0
-                      ? '${formatBytes(_wikiDl.received)} of '
-                          '${formatBytes(_wikiDl.total)} '
-                          '(${(_wikiDl.progress * 100).round()}%)'
-                      : formatBytes(_wikiDl.received)),
-                ],
-              ),
-              trailing: TextButton(
-                onPressed: _wikiDl.cancel,
-                child: const Text('Cancel'),
-              ),
-            )
-          else
-            ListTile(
-              leading: const Icon(Icons.download_outlined),
-              title: const Text('Download Simple English Wikipedia'),
-              subtitle: const Text(
-                  'No images, ~937 MB. Checks free space first and won\'t '
-                  'download if there isn\'t room.'),
-              onTap: _downloadSimpleWiki,
-            ),
-          ListTile(
-            leading: const Icon(Icons.file_open_outlined),
-            title: const Text('Install a .zim you already have'),
-            subtitle: const Text(
-                'Pick a Kiwix file from this device, or detect one.'),
-            trailing: TextButton(
-              onPressed: _scanForWiki,
-              child: const Text('Detect'),
-            ),
-            onTap: _pickWikiFile,
-          ),
-          const Padding(
-            padding: EdgeInsets.fromLTRB(16, 4, 16, 16),
-            child: Text(
-              'Eva answers general-knowledge questions from the offline '
-              'Wikipedia — fully offline — and cites the article, which you can '
-              'open and read here. Full English is 48–115 GB if you ever want it '
-              '(download from kiwix.org and install above).',
-              style: TextStyle(fontSize: 12, color: Colors.grey),
-            ),
-          ),
-          const Divider(),
-          _sectionHeader('Maps (offline cache)'),
-          SwitchListTile(
-            secondary: const Icon(Icons.map_outlined),
-            title: const Text('Show places & paths on a map'),
-            subtitle: const Text(
-                'Answer "where is…" / "show me … on a map" with a map tile.'),
-            value: _mapsEnabled,
-            onChanged: (v) async {
-              await saveMapsEnabled(v);
-              setState(() => _mapsEnabled = v);
-            },
-          ),
-          ListTile(
-            leading: const Icon(Icons.sd_storage_outlined),
-            title: const Text('Map data folder'),
-            subtitle: Text(_mapsFolder.isEmpty
-                ? 'App storage (cleared on uninstall)'
-                : _mapsFolder),
-            trailing: TextButton(
-              onPressed: _chooseMapsFolder,
-              child: const Text('Change'),
-            ),
-          ),
-          SwitchListTile(
-            secondary: const Icon(Icons.satellite_alt),
-            title: const Text('Open maps in satellite view'),
-            subtitle: const Text('Otherwise streets, roads and paths.'),
-            value: _mapsSatellite,
-            onChanged: (v) async {
-              await saveMapsSatellite(v);
-              setState(() => _mapsSatellite = v);
-            },
-          ),
-          ListTile(
-            leading: const Icon(Icons.my_location),
-            title: const Text('Allow location for the live dot'),
-            subtitle: const Text(
-                'So the map can show where you are and the distance to a place.'),
-            trailing: TextButton(
-              onPressed: _requestLocation,
-              child: const Text('Allow'),
-            ),
-          ),
-          ListTile(
-            leading: const Icon(Icons.cleaning_services_outlined),
-            title: const Text('Clear cached map tiles'),
-            subtitle: Text(_mapCacheBytes > 0
-                ? '${formatBytes(_mapCacheBytes)} cached — clearing also refreshes '
-                    'stale maps (re-fetched next time online).'
-                : 'Nothing cached yet. Tiles you view are saved here for offline use.'),
-            trailing: TextButton(
-              onPressed: _mapCacheBytes > 0 ? _clearMapCache : null,
-              child: const Text('Clear'),
-            ),
-          ),
-          const Padding(
-            padding: EdgeInsets.fromLTRB(16, 4, 16, 16),
-            child: Text(
-              'Maps are cached as you use them — no upfront country downloads. '
-              'Areas, places and routes you have already viewed keep working '
-              'offline from this folder; brand-new places need internet the first '
-              'time. Point the folder at one that already has tiles to reuse them.',
-              style: TextStyle(fontSize: 12, color: Colors.grey),
-            ),
-          ),
-        ],
+        ),
+        body: ListView(
+          padding: const EdgeInsets.symmetric(vertical: 8),
+          children: _panelChildren(_panel!, busy),
+        ),
       ),
     );
   }
 
-  Future<void> _downloadSimpleWiki() async {
+  List<Widget> _panelChildren(String key, bool busy) {
+    switch (key) {
+      case 'appearance':
+        return _appearancePanel();
+      case 'persona':
+        return _personaPanel();
+      case 'models':
+        return _modelsPanel(busy);
+      case 'voice':
+        return _voicePanel(busy);
+      case 'assistant':
+        return [_assistantTile()];
+      case 'documents':
+        return _documentsPanel(busy);
+      case 'photos':
+        return _photosPanel();
+      case 'music':
+        return _musicPanel();
+      case 'wikipedia':
+        return _wikipediaPanel();
+      case 'maps':
+        return _mapsPanel();
+      case 'reminders':
+        return _remindersPanel();
+      case 'storage':
+        return _storagePanel();
+    }
+    return const [];
+  }
+
+  static const _hint = TextStyle(fontSize: 12, color: Colors.grey);
+
+  List<Widget> _appearancePanel() => [
+        Padding(
+          padding: const EdgeInsets.fromLTRB(16, 8, 16, 8),
+          child: ValueListenableBuilder<ThemeMode>(
+            valueListenable: themeModeNotifier,
+            builder: (context, mode, _) => SegmentedButton<ThemeMode>(
+              segments: const [
+                ButtonSegment(value: ThemeMode.system, label: Text('System')),
+                ButtonSegment(value: ThemeMode.light, label: Text('Light')),
+                ButtonSegment(value: ThemeMode.dark, label: Text('Dark')),
+              ],
+              selected: {mode},
+              onSelectionChanged: (s) => setThemeMode(s.first),
+            ),
+          ),
+        ),
+      ];
+
+  List<Widget> _personaPanel() => [
+        Padding(
+          padding: const EdgeInsets.fromLTRB(16, 8, 16, 8),
+          child: TextField(
+            controller: _prompt,
+            minLines: 3,
+            maxLines: 6,
+            onChanged: saveSystemPrompt,
+            decoration: const InputDecoration(
+              border: OutlineInputBorder(),
+              labelText: 'System prompt',
+              helperText: 'How the assistant should behave. Saved automatically.',
+            ),
+          ),
+        ),
+        Padding(
+          padding: const EdgeInsets.fromLTRB(16, 0, 16, 8),
+          child: Align(
+            alignment: Alignment.centerLeft,
+            child: TextButton(
+              onPressed: () {
+                _prompt.text = kDefaultSystemPrompt;
+                saveSystemPrompt(kDefaultSystemPrompt);
+              },
+              child: const Text('Reset to default'),
+            ),
+          ),
+        ),
+        const Padding(
+          padding: EdgeInsets.fromLTRB(16, 4, 16, 0),
+          child: Text('Reply length'),
+        ),
+        const Padding(
+          padding: EdgeInsets.fromLTRB(16, 0, 16, 6),
+          child: Text('Longer replies take more time to generate.', style: _hint),
+        ),
+        Padding(
+          padding: const EdgeInsets.fromLTRB(16, 0, 16, 8),
+          child: SegmentedButton<int>(
+            segments: const [
+              ButtonSegment(value: 256, label: Text('Short')),
+              ButtonSegment(value: 1024, label: Text('Normal')),
+              ButtonSegment(value: 2048, label: Text('Long')),
+            ],
+            selected: {
+              kMaxTokensChoices.contains(_maxTokens) ? _maxTokens : kDefaultMaxTokens
+            },
+            onSelectionChanged: (s) {
+              setState(() => _maxTokens = s.first);
+              saveMaxTokens(s.first);
+            },
+          ),
+        ),
+      ];
+
+  List<Widget> _modelsPanel(bool busy) => [
+        if (_error != null)
+          Padding(
+            padding: const EdgeInsets.fromLTRB(16, 0, 16, 8),
+            child: Text(_error!, style: const TextStyle(color: Colors.red)),
+          ),
+        Padding(
+          padding: const EdgeInsets.fromLTRB(16, 0, 16, 8),
+          child: OutlinedButton.icon(
+            onPressed: busy ? null : _addFromFolder,
+            icon: _scanning
+                ? const SizedBox(
+                    width: 16, height: 16, child: CircularProgressIndicator(strokeWidth: 2))
+                : const Icon(Icons.folder_open),
+            label: const Text('Add models from a folder…'),
+          ),
+        ),
+        const Padding(
+          padding: EdgeInsets.fromLTRB(16, 0, 16, 12),
+          child: Text(
+            'Point to a folder (e.g. an SD card) that already contains extracted '
+            'Eva models, or download one below. Larger models are stronger but '
+            'slower and use more memory. Models are kept in the Storage folder.',
+            style: _hint,
+          ),
+        ),
+        for (final m in _catalog) _modelTile(m, busy),
+      ];
+
+  List<Widget> _voicePanel(bool busy) => [
+        Padding(
+          padding: const EdgeInsets.fromLTRB(16, 8, 16, 8),
+          child: SegmentedButton<VoiceEngine>(
+            segments: const [
+              ButtonSegment(value: VoiceEngine.fast, label: Text('English'), icon: Icon(Icons.bolt)),
+              ButtonSegment(value: VoiceEngine.system, label: Text('System'), icon: Icon(Icons.language)),
+            ],
+            selected: {_voiceEngine},
+            onSelectionChanged: busy
+                ? null
+                : (s) async {
+                    final e = s.first;
+                    setState(() => _voiceEngine = e);
+                    await saveVoiceEngine(e);
+                    if (e == VoiceEngine.system) _loadLocales();
+                  },
+          ),
+        ),
+        if (_voiceEngine == VoiceEngine.fast) ...[
+          _voiceTile(busy),
+          const Padding(
+            padding: EdgeInsets.fromLTRB(16, 0, 16, 16),
+            child: Text(
+              'A fast, fully offline English model. Tap the microphone in the '
+              'chat to dictate; the model is downloaded once.',
+              style: _hint,
+            ),
+          ),
+        ] else ...[
+          _systemVoiceConfig(),
+          const Padding(
+            padding: EdgeInsets.fromLTRB(16, 0, 16, 16),
+            child: Text(
+              "Uses the phone's built-in speech recognition (many languages, "
+              'including the system language). Choose a language or leave it on '
+              'Auto. Works offline where the language pack is installed.',
+              style: _hint,
+            ),
+          ),
+        ],
+      ];
+
+  List<Widget> _documentsPanel(bool busy) => [
+        ListTile(
+          leading: const Icon(Icons.folder_copy_outlined),
+          title: const Text('Browse indexed documents'),
+          subtitle: Text(_documents.isEmpty
+              ? 'No documents added yet.'
+              : '${_documents.length} documents — view by folder, open, remove'),
+          trailing: _documents.isEmpty ? null : const Icon(Icons.chevron_right),
+          onTap: _documents.isEmpty
+              ? null
+              : () async {
+                  await Navigator.of(context).push(MaterialPageRoute(
+                    builder: (_) => DocumentsScreen(docs: _docs),
+                  ));
+                  await _refreshDocs();
+                },
+        ),
+        ListTile(
+          leading: const Icon(Icons.travel_explore),
+          title: const Text('Scan phone for documents'),
+          subtitle: const Text('Finds every PDF/text file on this phone and adds it.'),
+          onTap: busy ? null : () => _bulkImport('/storage/emulated/0'),
+        ),
+        ListTile(
+          leading: const Icon(Icons.drive_folder_upload_outlined),
+          title: const Text('Import documents from a folder'),
+          onTap: busy ? null : _pickFolderAndImport,
+        ),
+        if (_skippedBad > 0)
+          ListTile(
+            leading: const Icon(Icons.refresh),
+            title: Text('Retry $_skippedBad skipped file${_skippedBad == 1 ? '' : 's'}'),
+            subtitle: const Text(
+                'Files with no extractable text are skipped on scans. Forget '
+                'that so the next scan tries them again.'),
+            onTap: busy
+                ? null
+                : () async {
+                    await _docs.clearSkipped();
+                    setState(() => _skippedBad = 0);
+                    await _toast('Skip-list cleared — they will be tried on the next scan.');
+                  },
+          ),
+        const Padding(
+          padding: EdgeInsets.fromLTRB(16, 8, 16, 16),
+          child: Text(
+            'Add PDFs or text files from the chat (paperclip icon) to ask Eva '
+            'about them. Search runs fully offline. Files are kept in the Storage '
+            'folder, so they can be reused after reinstalling the app.',
+            style: _hint,
+          ),
+        ),
+      ];
+
+  List<Widget> _photosPanel() => [
+        ListTile(
+          leading: const Icon(Icons.photo_library_outlined),
+          title: const Text('Browse photos'),
+          subtitle: Text(_photoCount == 0
+              ? 'Scan your gallery to browse and search photos.'
+              : '$_photoCount photos indexed — view by day and type'),
+          trailing: _photoCount == 0 ? null : const Icon(Icons.chevron_right),
+          onTap: _photoCount == 0
+              ? null
+              : () async {
+                  await Navigator.of(context).push(MaterialPageRoute(
+                    builder: (_) => PhotosScreen(photos: _photos),
+                  ));
+                },
+        ),
+        ListTile(
+          leading: const Icon(Icons.image_search),
+          title: const Text('Index photo gallery'),
+          subtitle: const Text(
+              'Catalogs every photo with a cached thumbnail, by date and type, '
+              'continuously in the background. Tap to (re)scan for new photos.'),
+          onTap: () async {
+            var ok = await Permission.photos.request();
+            if (!ok.isGranted) ok = await Permission.storage.request();
+            if (!ok.isGranted && !(await Permission.manageExternalStorage.isGranted)) {
+              await _toast('Photo access is required to index the gallery.');
+              return;
+            }
+            await savePhotoScanDone(false);
+            await _toast('Photo indexing will run in the background — progress shows at the top of the chat.');
+          },
+        ),
+        const Padding(
+          padding: EdgeInsets.fromLTRB(16, 4, 16, 16),
+          child: Text(
+            'Indexing runs continuously in the background until the whole gallery '
+            'is catalogued. Recognising what is inside each photo (so you can '
+            'search by content) is a separate on-device pass added later.',
+            style: _hint,
+          ),
+        ),
+      ];
+
+  List<Widget> _musicPanel() => [
+        ListTile(
+          leading: const Icon(Icons.library_music_outlined),
+          title: const Text('Music library'),
+          subtitle: Text(_musicCount == 0
+              ? 'Scan your audio files to catalog artists, albums and songs.'
+              : '$_musicCount tracks indexed — ask Eva about your artists'),
+        ),
+        ListTile(
+          leading: const Icon(Icons.audiotrack),
+          title: const Text('Index music library'),
+          subtitle: const Text(
+              'Reads artist, album, title and genre tags from your audio files, '
+              'then fetches lyrics online when available. Runs continuously in '
+              'the background. Tap to (re)scan for new tracks.'),
+          onTap: () async {
+            var ok = await Permission.audio.request();
+            if (!ok.isGranted) ok = await Permission.storage.request();
+            if (!ok.isGranted && !(await Permission.manageExternalStorage.isGranted)) {
+              await _toast('Storage access is required to index music.');
+              return;
+            }
+            await saveMusicScanDone(false);
+            await _toast('Music indexing will run in the background — progress shows at the top of the chat.');
+          },
+        ),
+        const Padding(
+          padding: EdgeInsets.fromLTRB(16, 4, 16, 8),
+          child: Text(
+            'Lyrics and genre are fetched from a free online service when the '
+            'phone has internet; everything else is read on-device.',
+            style: _hint,
+          ),
+        ),
+        const Divider(),
+        ListTile(
+          leading: const Icon(Icons.radio),
+          title: const Text('Radio stations'),
+          subtitle: const Text('Online stations to play. Comes with examples.'),
+          trailing: const Icon(Icons.chevron_right),
+          onTap: () => Navigator.of(context).push(MaterialPageRoute(
+            builder: (_) => RadioStationsScreen(player: widget.player),
+          )),
+        ),
+      ];
+
+  List<Widget> _remindersPanel() => [
+        SwitchListTile(
+          secondary: const Icon(Icons.notifications_active_outlined),
+          title: const Text('Allow timed reminders'),
+          subtitle: Text(_reminderPermission
+              ? 'Eva can post reminder notifications.'
+              : 'Tap to allow notifications so reminders can alert you.'),
+          value: _reminderPermission,
+          onChanged: (_) async {
+            final ok = await ReminderService.instance.requestPermissions();
+            setState(() => _reminderPermission = ok);
+            await _toast(ok
+                ? 'Reminders enabled.'
+                : 'Notifications are blocked — enable them in system settings.');
+          },
+        ),
+        const Padding(
+          padding: EdgeInsets.fromLTRB(16, 0, 16, 16),
+          child: Text(
+            'Ask in chat, e.g. "remind me to call mum in 15 minutes" or "set a '
+            'reminder for 7pm to leave". Reminders fire as system notifications '
+            'even if Eva is closed.',
+            style: _hint,
+          ),
+        ),
+      ];
+
+  List<Widget> _wikipediaPanel() => [
+        SwitchListTile(
+          secondary: const Icon(Icons.public),
+          title: const Text('Use Wikipedia to help answer'),
+          subtitle: Text(_wikiPath.isEmpty
+              ? 'No Wikipedia installed yet.'
+              : 'Installed: ${_wikiPath.split('/').last}'),
+          value: _wikiEnabled,
+          onChanged: (v) async {
+            await saveWikipediaEnabled(v);
+            setState(() => _wikiEnabled = v);
+          },
+        ),
+        if (_wikiDl.downloading)
+          ListTile(
+            leading: const Icon(Icons.downloading),
+            title: Text('Downloading ${_wikiDownloadingEdition?.label ?? 'Wikipedia'}…'),
+            subtitle: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                const SizedBox(height: 6),
+                LinearProgressIndicator(value: _wikiDl.progress > 0 ? _wikiDl.progress : null),
+                const SizedBox(height: 4),
+                Text(_wikiDl.total > 0
+                    ? '${formatBytes(_wikiDl.received)} of ${formatBytes(_wikiDl.total)} '
+                        '(${(_wikiDl.progress * 100).round()}%)'
+                    : formatBytes(_wikiDl.received)),
+              ],
+            ),
+            trailing: TextButton(onPressed: _wikiDl.cancel, child: const Text('Cancel')),
+          )
+        else ...[
+          const Padding(
+            padding: EdgeInsets.fromLTRB(16, 12, 16, 4),
+            child: Text('Download an edition', style: TextStyle(fontWeight: FontWeight.bold)),
+          ),
+          for (final e in WikipediaDownload.editions)
+            ListTile(
+              leading: const Icon(Icons.download_outlined),
+              title: Text(e.label),
+              subtitle: Text('≈ ${formatBytes(e.approxBytes)} · checks free space first'),
+              onTap: () => _downloadWiki(e),
+            ),
+        ],
+        const Divider(),
+        ListTile(
+          leading: const Icon(Icons.file_open_outlined),
+          title: const Text('Install a .zim you already have'),
+          subtitle: const Text('Pick a Kiwix file from this device, or detect one.'),
+          trailing: TextButton(onPressed: _scanForWiki, child: const Text('Detect')),
+          onTap: _pickWikiFile,
+        ),
+        const Padding(
+          padding: EdgeInsets.fromLTRB(16, 4, 16, 16),
+          child: Text(
+            'Eva answers general-knowledge questions from the offline Wikipedia — '
+            'fully offline — and cites the article, which you can open and read '
+            'here. Sizes are estimates; the download is skipped if it won\'t fit. '
+            'Any other .zim from kiwix.org can be sideloaded above.',
+            style: _hint,
+          ),
+        ),
+      ];
+
+  List<Widget> _mapsPanel() => [
+        SwitchListTile(
+          secondary: const Icon(Icons.map_outlined),
+          title: const Text('Show places & paths on a map'),
+          subtitle: const Text('Answer "where is…" / "show me … on a map" with a map tile.'),
+          value: _mapsEnabled,
+          onChanged: (v) async {
+            await saveMapsEnabled(v);
+            setState(() => _mapsEnabled = v);
+          },
+        ),
+        SwitchListTile(
+          secondary: const Icon(Icons.satellite_alt),
+          title: const Text('Open maps in satellite view'),
+          subtitle: const Text('Otherwise streets, roads and paths.'),
+          value: _mapsSatellite,
+          onChanged: (v) async {
+            await saveMapsSatellite(v);
+            setState(() => _mapsSatellite = v);
+          },
+        ),
+        ListTile(
+          leading: const Icon(Icons.my_location),
+          title: const Text('Allow location for the live dot'),
+          subtitle: const Text('So the map can show where you are and the distance to a place.'),
+          trailing: TextButton(onPressed: _requestLocation, child: const Text('Allow')),
+        ),
+        ListTile(
+          leading: const Icon(Icons.cleaning_services_outlined),
+          title: const Text('Clear cached map tiles'),
+          subtitle: Text(_mapCacheBytes > 0
+              ? '${formatBytes(_mapCacheBytes)} cached — clearing also refreshes stale maps (re-fetched next time online).'
+              : 'Nothing cached yet. Tiles you view are saved for offline use.'),
+          trailing: TextButton(
+            onPressed: _mapCacheBytes > 0 ? _clearMapCache : null,
+            child: const Text('Clear'),
+          ),
+        ),
+        const Padding(
+          padding: EdgeInsets.fromLTRB(16, 4, 16, 16),
+          child: Text(
+            'Maps are cached as you use them — no upfront country downloads. Areas, '
+            'places and routes you have already viewed keep working offline; '
+            'brand-new places need internet the first time. The cache lives in the '
+            'Storage folder.',
+            style: _hint,
+          ),
+        ),
+      ];
+
+  List<Widget> _storagePanel() => [
+        ListTile(
+          leading: const Icon(Icons.sd_storage_outlined),
+          title: const Text('Storage folder'),
+          subtitle: Text(_storageRoot.isEmpty
+              ? 'App storage (cleared on uninstall)'
+              : _storageRoot),
+          isThreeLine: _storageRoot.length > 30,
+        ),
+        Padding(
+          padding: const EdgeInsets.fromLTRB(16, 0, 16, 8),
+          child: OutlinedButton.icon(
+            onPressed: _migrating ? null : _chooseStorageFolder,
+            icon: _migrating
+                ? const SizedBox(width: 16, height: 16, child: CircularProgressIndicator(strokeWidth: 2))
+                : const Icon(Icons.drive_file_move_outline),
+            label: Text(_migrating ? 'Moving files…' : 'Choose folder & move data…'),
+          ),
+        ),
+        const Padding(
+          padding: EdgeInsets.fromLTRB(16, 4, 16, 16),
+          child: Text(
+            'One folder holds everything Eva downloads: AI models, the offline '
+            'Wikipedia, your documents and the map cache. Choosing a new folder '
+            '(e.g. an SD card) moves all existing data there so nothing has to be '
+            'downloaded again. Pointing at a folder that already holds Eva data '
+            'reuses it.',
+            style: _hint,
+          ),
+        ),
+      ];
+
+  Future<void> _downloadWiki(WikiEdition edition) async {
     await _toast('Checking free space…');
-    final check = await _wikiDl.check(WikipediaDownload.simpleNopic);
+    final check = await _wikiDl.check(edition);
     if (check == null) {
       await _toast('Could not reach the download server. Check your internet.');
       return;
@@ -987,12 +992,14 @@ class _SettingsScreenState extends State<SettingsScreen> {
           '$free is available. Free up space and try again.');
       return;
     }
+    setState(() => _wikiDownloadingEdition = edition);
     final ok = await _wikiDl.start(check);
     if (!mounted) return;
+    setState(() => _wikiDownloadingEdition = null);
     if (ok) {
       _wikiPath = await loadWikipediaZimPath();
       setState(() {});
-      await _toast('Simple English Wikipedia installed.');
+      await _toast('${edition.label} installed.');
     } else if (_wikiDl.error != null) {
       await _toast(_wikiDl.error!);
     } else {
@@ -1028,25 +1035,6 @@ class _SettingsScreenState extends State<SettingsScreen> {
     await saveWikipediaZimPath(found);
     if (mounted) setState(() => _wikiPath = found);
     await _toast('Found ${found.split('/').last}.');
-  }
-
-  /// Chooses the folder where map tiles/geocodes cache. Pointing at a folder
-  /// that already holds a cache reuses it offline (no re-fetch).
-  Future<void> _chooseMapsFolder() async {
-    var status = await Permission.manageExternalStorage.status;
-    if (!status.isGranted) {
-      status = await Permission.manageExternalStorage.request();
-    }
-    if (!status.isGranted) {
-      await _toast('Storage permission is required to use a custom folder.');
-      return;
-    }
-    final dir = await FilePicker.platform.getDirectoryPath();
-    if (dir == null) return;
-    await saveMapsFolder(dir);
-    setState(() => _mapsFolder = dir);
-    _refreshMapCacheSize();
-    await _toast('Maps will cache to this folder (reused offline from here).');
   }
 
   Future<void> _requestLocation() async {
@@ -1178,14 +1166,6 @@ class _SettingsScreenState extends State<SettingsScreen> {
       trailing: trailing,
     );
   }
-
-  Widget _sectionHeader(String text) => Padding(
-        padding: const EdgeInsets.fromLTRB(16, 8, 16, 8),
-        child: Text(text,
-            style: TextStyle(
-                fontWeight: FontWeight.bold,
-                color: Theme.of(context).colorScheme.primary)),
-      );
 
   Future<bool>? _assistantStatus;
 

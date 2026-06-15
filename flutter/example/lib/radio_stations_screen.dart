@@ -22,14 +22,35 @@ class _RadioStationsScreenState extends State<RadioStationsScreen> {
   @override
   void initState() {
     super.initState();
+    widget.player.addListener(_onPlayer);
     _load();
+  }
+
+  @override
+  void dispose() {
+    widget.player.removeListener(_onPlayer);
+    super.dispose();
+  }
+
+  void _onPlayer() {
+    if (mounted) setState(() {}); // reflect play/stop state in the list + bar
+  }
+
+  /// Sorts by most-played first (favourites surface), then alphabetically.
+  List<RadioStation> _sorted(List<RadioStation> s) {
+    final list = List<RadioStation>.of(s);
+    list.sort((a, b) {
+      final byPlays = b.playCount.compareTo(a.playCount);
+      return byPlays != 0 ? byPlays : a.name.toLowerCase().compareTo(b.name.toLowerCase());
+    });
+    return list;
   }
 
   Future<void> _load() async {
     final s = await loadRadioStations();
     if (mounted) {
       setState(() {
-        _stations = s;
+        _stations = _sorted(s);
         _loading = false;
       });
     }
@@ -41,11 +62,19 @@ class _RadioStationsScreenState extends State<RadioStationsScreen> {
   }
 
   Future<void> _play(RadioStation s) async {
+    // Count the play first (so favourites float to the top) — independent of how
+    // long tuning in takes.
+    final updated = await incrementRadioPlay(s.url);
+    if (mounted) setState(() => _stations = _sorted(updated));
     await widget.player.playRadio(s.name, s.url);
     if (mounted) {
       ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(content: Text('▶ Tuning in to ${s.name}…')));
     }
+  }
+
+  Future<void> _stop() async {
+    await widget.player.stop();
   }
 
   Future<void> _edit({RadioStation? existing, int? index}) async {
@@ -127,6 +156,12 @@ class _RadioStationsScreenState extends State<RadioStationsScreen> {
       appBar: AppBar(
         title: const Text('Radio stations'),
         actions: [
+          if (widget.player.isRadio)
+            IconButton(
+              tooltip: 'Stop radio',
+              icon: const Icon(Icons.stop_circle),
+              onPressed: _stop,
+            ),
           IconButton(
             tooltip: 'Restore examples',
             icon: const Icon(Icons.restore),
@@ -160,6 +195,10 @@ class _RadioStationsScreenState extends State<RadioStationsScreen> {
                     final s = _stations[i];
                     final playing =
                         widget.player.isRadio && widget.player.radioName == s.name;
+                    final plays = s.playCount > 0
+                        ? '${s.playCount} play${s.playCount == 1 ? '' : 's'}'
+                        : 'not played yet';
+                    final meta = s.genre.isNotEmpty ? '$plays · ${s.genre}' : plays;
                     return ListTile(
                       leading: Icon(playing ? Icons.equalizer : Icons.radio,
                           color: playing
@@ -167,20 +206,22 @@ class _RadioStationsScreenState extends State<RadioStationsScreen> {
                               : null),
                       title: Text(s.name),
                       subtitle: Text(
-                        s.genre.isNotEmpty ? '${s.genre}\n${s.url}' : s.url,
+                        '$meta\n${s.url}',
                         maxLines: 2,
                         overflow: TextOverflow.ellipsis,
                         style: const TextStyle(fontSize: 11),
                       ),
-                      isThreeLine: s.genre.isNotEmpty,
-                      onTap: () => _play(s),
+                      isThreeLine: true,
+                      onTap: () => playing ? _stop() : _play(s),
                       trailing: Row(
                         mainAxisSize: MainAxisSize.min,
                         children: [
                           IconButton(
-                            tooltip: 'Play',
-                            icon: const Icon(Icons.play_arrow),
-                            onPressed: () => _play(s),
+                            tooltip: playing ? 'Stop' : 'Play',
+                            icon: Icon(playing
+                                ? Icons.stop
+                                : Icons.play_arrow),
+                            onPressed: () => playing ? _stop() : _play(s),
                           ),
                           PopupMenuButton<String>(
                             onSelected: (v) {
