@@ -1,5 +1,6 @@
 import 'dart:ffi';
 import 'dart:io';
+import 'dart:math';
 
 import 'package:flutter/services.dart' show rootBundle;
 import 'package:path_provider/path_provider.dart';
@@ -143,6 +144,24 @@ class WikipediaService {
     var hits = ffi.hasFulltext(h) ? ffi.search(h, query, k: k) : const <ZimHit>[];
     if (hits.isEmpty) hits = ffi.suggest(h, query, k: k);
     return hits;
+  }
+
+  /// A pseudo-random article for "surprise me" browsing: suggests titles for a
+  /// few random common letters and picks one. Returns null if nothing is found.
+  Future<ZimHit?> randomArticle() async {
+    if (!await ensureOpen()) return null;
+    final ffi = _ffi!, h = _handle!;
+    const seeds = [
+      'a', 'e', 'i', 'o', 'u', 'the', 'history', 'science', 'world', 'music',
+      'river', 'city', 'war', 'art', 'animal', 'space', 'human', 'film',
+    ];
+    final rnd = Random();
+    for (var attempt = 0; attempt < 4; attempt++) {
+      final seed = seeds[rnd.nextInt(seeds.length)];
+      final hits = ffi.suggest(h, seed, k: 20);
+      if (hits.isNotEmpty) return hits[rnd.nextInt(hits.length)];
+    }
+    return null;
   }
 
   /// Raw entry bytes + mimetype, for the WebView reader / loopback server.

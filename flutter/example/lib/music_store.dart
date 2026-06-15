@@ -206,6 +206,36 @@ class MusicStore {
     }
   }
 
+  /// Distinct artists with track counts, most tracks first (skips untagged).
+  List<({String name, int count})> artists({int limit = 200}) {
+    final rs = _db.select(
+      "SELECT artist AS name, COUNT(*) AS n FROM tracks WHERE artist != '' "
+      'GROUP BY LOWER(artist) ORDER BY n DESC, name LIMIT ?;',
+      [limit],
+    );
+    return [for (final r in rs) (name: r['name'] as String, count: r['n'] as int)];
+  }
+
+  /// Distinct genres with track counts, most tracks first (skips untagged).
+  List<({String name, int count})> genres({int limit = 200}) {
+    final rs = _db.select(
+      "SELECT genre AS name, COUNT(*) AS n FROM tracks WHERE genre != '' "
+      'GROUP BY LOWER(genre) ORDER BY n DESC, name LIMIT ?;',
+      [limit],
+    );
+    return [for (final r in rs) (name: r['name'] as String, count: r['n'] as int)];
+  }
+
+  /// Tracks in a genre (case-insensitive), favourites first.
+  List<TrackInfo> byGenre(String genre, {int limit = 200}) {
+    final rs = _db.select(
+      'SELECT * FROM tracks WHERE LOWER(genre) = ? '
+      'ORDER BY play_count DESC, artist, album, track_no, title LIMIT ?;',
+      [genre.toLowerCase(), limit],
+    );
+    return [for (final r in rs) _row(r)];
+  }
+
   /// All tracks by an artist (case-insensitive substring), album/track order.
   List<TrackInfo> byArtist(String artist, {int limit = 100}) {
     final rs = _db.select(

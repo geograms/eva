@@ -23,6 +23,7 @@ class PhotoInfo {
     required this.type,
     this.thumb,
     this.caption,
+    this.tags = const [],
   });
   final int id;
   final String path;
@@ -34,6 +35,7 @@ class PhotoInfo {
   final PhotoType type;
   final Uint8List? thumb; // cached JPEG thumbnail
   final String? caption; // filled by the later ML pass
+  final List<String> tags; // user-added labels for categorisation
 }
 
 /// SQLite-backed photo metadata + cached thumbnails. Lives in the corpus pack so
@@ -58,9 +60,14 @@ class PhotoStore {
         type TEXT NOT NULL DEFAULT 'image',
         thumb BLOB,                  -- cached JPEG thumbnail
         caption TEXT,                -- filled by the vision pass (later)
-        captioned INTEGER NOT NULL DEFAULT 0
+        captioned INTEGER NOT NULL DEFAULT 0,
+        tags TEXT NOT NULL DEFAULT ''  -- comma-separated user tags
       );
     ''');
+    // Migrate databases created before user tags existed.
+    try {
+      db.execute("ALTER TABLE photos ADD COLUMN tags TEXT NOT NULL DEFAULT '';");
+    } catch (_) {/* column already exists */}
     db.execute('CREATE INDEX IF NOT EXISTS idx_photos_taken ON photos(taken_at);');
     db.execute('CREATE INDEX IF NOT EXISTS idx_photos_type ON photos(type);');
     // Full-text index over captions (the vision pass writes them), so content
@@ -87,7 +94,7 @@ class PhotoStore {
     }
     final rs = _db.select(
       'SELECT id, path, taken_at, width, height, size, bucket, type, '
-      'thumb, caption FROM photos WHERE ${where.join(' AND ')} '
+      'thumb, caption, tags FROM photos WHERE ${where.join(' AND ')} '
       'ORDER BY taken_at DESC LIMIT ?;',
       [...args, limit],
     );
@@ -157,7 +164,7 @@ class PhotoStore {
     try {
       final rs = _db.select(
         'SELECT p.id, p.path, p.taken_at, p.width, p.height, p.size, p.bucket, '
-        'p.type, p.thumb, p.caption FROM captions_fts f '
+        'p.type, p.thumb, p.caption, p.tags FROM captions_fts f '
         'JOIN photos p ON p.id = f.rowid '
         'WHERE captions_fts MATCH ?'
         '${extra.isEmpty ? '' : ' AND ${extra.join(' AND ')}'} '
@@ -220,8 +227,8 @@ class PhotoStore {
       args.add(type.name);
     }
     final cols = withThumb
-        ? 'id, path, taken_at, width, height, size, bucket, type, thumb, caption'
-        : 'id, path, taken_at, width, height, size, bucket, type, NULL AS thumb, caption';
+        ? 'id, path, taken_at, width, height, size, bucket, type, thumb, caption, tags'
+        : 'id, path, taken_at, width, height, size, bucket, type, NULL AS thumb, caption, tags';
     final sql = 'SELECT $cols FROM photos'
         '${where.isEmpty ? '' : ' WHERE ${where.join(' AND ')}'}'
         ' ORDER BY taken_at DESC LIMIT ?;';
@@ -240,7 +247,61 @@ class PhotoStore {
         type: photoTypeFromString(r['type'] as String),
         thumb: r['thumb'] as Uint8List?,
         caption: r['caption'] as String?,
+        tags: _splitTags(r['tags'] as String?),
       );
+
+  static List<String> _splitTags(String? raw) => (raw ?? '')
+      .split(',')
+      .map((t) => t.trim())
+      .where((t) => t.isNotEmpty)
+      .toList();
+
+  /// Replaces the user tags on a photo (stored comma-separated).
+  void setTags(int id, List<String> tags) {
+    final clean = tags.map((t) => t.trim()).where((t) => t.isNotEmpty).toList();
+    _db.execute('UPDATE photos SET tags=? WHERE id=?;', [clean.join(', '), id]);
+  }
+
+  /// All distinct tags in use, with how many photos carry each, most-used first.
+  List<({String tag, int count})> tagCounts() {
+    final rs = _db.select("SELECT tags FROM photos WHERE tags != '';");
+    final counts = <String, int>{};
+    for (final r in rs) {
+      for (final t in _splitTags(r['tags'] as String?)) {
+        counts[t] = (counts[t] ?? 0) + 1;
+      }
+    }
+    final list = [for (final e in counts.entries) (tag: e.key, count: e.value)];
+    list.sort((a, b) => b.count.compareTo(a.count));
+    return list;
+  }
+
+  /// Photos carrying [tag], newest first.
+  List<PhotoInfo> byTag(String tag, {int limit = 500}) {
+    final rs = _db.select(
+      'SELECT id, path, taken_at, width, height, size, bucket, type, thumb, '
+      'caption, tags FROM photos WHERE tags LIKE ? '
+      'ORDER BY taken_at DESC LIMIT ?;',
+      ['%$tag%', limit],
+    );
+    // LIKE is loose; keep only exact tag membership.
+    return [for (final r in rs) _row(r)].where((p) => p.tags.contains(tag)).toList();
+  }
+
+  /// Gallery search across the LLM caption AND user tags (case-insensitive
+  /// substring), newest first. Simpler than FTS so it also covers tags.
+  List<PhotoInfo> searchAll(String query, {int limit = 300}) {
+    final q = query.trim().toLowerCase();
+    if (q.isEmpty) return const [];
+    final rs = _db.select(
+      'SELECT id, path, taken_at, width, height, size, bucket, type, thumb, '
+      'caption, tags FROM photos '
+      'WHERE LOWER(caption) LIKE ? OR LOWER(tags) LIKE ? '
+      'ORDER BY taken_at DESC LIMIT ?;',
+      ['%$q%', '%$q%', limit],
+    );
+    return [for (final r in rs) _row(r)];
+  }
 
   void removeMissing(bool Function(String path) exists) {
     final rs = _db.select('SELECT id, path FROM photos;');

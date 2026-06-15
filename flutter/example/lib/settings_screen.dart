@@ -22,6 +22,7 @@ import 'photos_screen.dart';
 import 'disk_space.dart';
 import 'system_voice.dart';
 import 'wikipedia_download.dart';
+import 'wikipedia_reader_screen.dart';
 import 'wikipedia_service.dart';
 import 'voice_service.dart';
 
@@ -845,6 +846,14 @@ class _SettingsScreenState extends State<SettingsScreen> {
             setState(() => _wikiEnabled = v);
           },
         ),
+        if (_wikiPath.isNotEmpty)
+          ListTile(
+            leading: const Icon(Icons.auto_stories),
+            title: const Text('Browse & read articles'),
+            subtitle: const Text('Open the installed edition — search or read a random article.'),
+            trailing: const Icon(Icons.chevron_right),
+            onTap: _browseWiki,
+          ),
         if (_wikiDl.downloading)
           ListTile(
             leading: const Icon(Icons.downloading),
@@ -1022,6 +1031,23 @@ class _SettingsScreenState extends State<SettingsScreen> {
     await saveWikipediaZimPath(path);
     if (mounted) setState(() => _wikiPath = path);
     await _toast('Wikipedia installed — Eva can now use it.');
+  }
+
+  /// Opens the installed Wikipedia at its main page for free browsing/reading.
+  Future<void> _browseWiki() async {
+    final wiki = WikipediaService.instance;
+    if (!await wiki.ensureOpen()) {
+      await _toast('Could not open the installed Wikipedia.');
+      return;
+    }
+    final path = await wiki.mainPath();
+    if (!mounted || path.isEmpty) {
+      await _toast('This edition has no main page to open.');
+      return;
+    }
+    await Navigator.of(context).push(MaterialPageRoute(
+      builder: (_) => WikipediaReaderScreen(title: 'Wikipedia', articlePath: path),
+    ));
   }
 
   Future<void> _scanForWiki() async {

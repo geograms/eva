@@ -22,8 +22,11 @@ import 'app_prefs.dart';
 import 'assistant_channel.dart';
 import 'background_indexer.dart';
 import 'chat_store.dart';
+import 'docs_tab.dart';
 import 'document_service.dart';
+import 'images_tab.dart';
 import 'inference_isolate.dart';
+import 'music_tab.dart';
 import 'intro_screen.dart';
 import 'map_viewer_screen.dart';
 import 'maps/map_ref.dart';
@@ -123,6 +126,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
   final VoiceService _voice = VoiceService();
   final SystemVoiceService _systemVoice = SystemVoiceService();
   final DocumentService _docs = DocumentService();
+  int _tab = 0; // 0 chat · 1 images · 2 music · 3 docs
   late final PhotoService _photos = PhotoService(_docs);
   PhotoIndexController? _photoIndexer;
   late final MusicService _music = MusicService(_docs);
@@ -1968,30 +1972,63 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
         _bootstrap();
       });
     }
+    if (_phase != AppPhase.ready) {
+      return Scaffold(
+        appBar: AppBar(title: const Text('Eva')),
+        body: _phase == AppPhase.error ? _buildError() : _buildLoading(),
+      );
+    }
+
+    const titles = ['Eva', 'Images', 'Music', 'Docs'];
     return Scaffold(
-      drawer: _phase == AppPhase.ready ? _buildDrawer() : null,
+      drawer: _tab == 0 ? _buildDrawer() : null,
       appBar: AppBar(
-        title: const Text('Eva'),
+        title: Text(titles[_tab]),
         actions: [
-          if (_phase == AppPhase.ready)
+          if (_tab == 0)
             IconButton(
               tooltip: 'New chat',
               onPressed: (_generating || _messages.isEmpty) ? null : _newChat,
               icon: const Icon(Icons.add_comment_outlined),
             ),
-          if (_phase == AppPhase.ready)
-            IconButton(
-              tooltip: 'Settings',
-              onPressed: _generating ? null : _openSettings,
-              icon: const Icon(Icons.tune),
-            ),
+          IconButton(
+            tooltip: 'Settings',
+            onPressed: _generating ? null : _openSettings,
+            icon: const Icon(Icons.tune),
+          ),
         ],
       ),
-      body: switch (_phase) {
-        AppPhase.ready => _buildChat(),
-        AppPhase.error => _buildError(),
-        _ => _buildLoading(),
-      },
+      body: IndexedStack(
+        index: _tab,
+        children: [
+          _buildChat(),
+          ImagesTab(photos: _photos),
+          MusicTab(music: _music, player: _player),
+          DocsTab(docs: _docs),
+        ],
+      ),
+      bottomNavigationBar: NavigationBar(
+        selectedIndex: _tab,
+        onDestinationSelected: (i) => setState(() => _tab = i),
+        destinations: const [
+          NavigationDestination(
+              icon: Icon(Icons.chat_bubble_outline),
+              selectedIcon: Icon(Icons.chat_bubble),
+              label: 'Chat'),
+          NavigationDestination(
+              icon: Icon(Icons.photo_library_outlined),
+              selectedIcon: Icon(Icons.photo_library),
+              label: 'Images'),
+          NavigationDestination(
+              icon: Icon(Icons.library_music_outlined),
+              selectedIcon: Icon(Icons.library_music),
+              label: 'Music'),
+          NavigationDestination(
+              icon: Icon(Icons.menu_book_outlined),
+              selectedIcon: Icon(Icons.menu_book),
+              label: 'Docs'),
+        ],
+      ),
     );
   }
 
