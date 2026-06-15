@@ -7,6 +7,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter_map/flutter_map.dart';
 import 'package:geolocator/geolocator.dart';
 import 'package:gpt_markdown/gpt_markdown.dart';
+import 'package:just_audio_background/just_audio_background.dart' hide TrackInfo;
 import 'package:latlong2/latlong.dart';
 import 'package:image_picker/image_picker.dart';
 import 'package:shared_preferences/shared_preferences.dart';
@@ -22,6 +23,7 @@ import 'app_prefs.dart';
 import 'assistant_channel.dart';
 import 'background_indexer.dart';
 import 'chat_store.dart';
+import 'doc_meta.dart';
 import 'docs_tab.dart';
 import 'document_service.dart';
 import 'images_tab.dart';
@@ -55,6 +57,15 @@ const Color _seedColor = Color(0xFF2E7D32);
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
+  // Enable background playback + a lock-screen / notification media control.
+  // Best-effort: a failure here must never block the app from starting.
+  try {
+    await JustAudioBackground.init(
+      androidNotificationChannelId: 'radio.geogram.eva.audio',
+      androidNotificationChannelName: 'Eva playback',
+      androidNotificationOngoing: true,
+    );
+  } catch (_) {}
   await initThemeMode();
   runApp(const EvaApp());
 }
@@ -186,6 +197,7 @@ class _ChatScreenState extends State<ChatScreen>
   bool _captionStop = false;
   String? _modelBeforeCaption;
   int _captionsDone = 0;
+  bool _categorizing = false; // chat model labelling documents in the background
   static const String _kCaptionModelId = 'lfm2-vl-450m-int4';
   // Terse prompt + small token cap keep each caption fast (the dominant cost is
   // generation length). Newest photos are captioned first, up to a cap; older
@@ -221,9 +233,10 @@ class _ChatScreenState extends State<ChatScreen>
       _rescanForNewFiles();
     } else if (state == AppLifecycleState.paused ||
         state == AppLifecycleState.hidden) {
-      // Truly backgrounded: catch up on photo captioning while the user is away
-      // (only runs if charging).
+      // Truly backgrounded: catch up on photo captioning + document
+      // categorisation while the user is away (only runs if charging).
       _maybeStartCaptioning();
+      _maybeCategorizeDocs();
     }
   }
 
@@ -1598,7 +1611,10 @@ class _ChatScreenState extends State<ChatScreen>
     // Reliable re-check: triggers (metadata/doc notifications, charge events)
     // can be sparse during a long single embed, so poll the gate periodically.
     _captionTimer = Timer.periodic(const Duration(seconds: 15), (_) {
-      if (_charging) _maybeStartCaptioning();
+      if (_charging) {
+        _maybeStartCaptioning();
+        _maybeCategorizeDocs();
+      }
     });
   }
 
@@ -1711,6 +1727,91 @@ class _ChatScreenState extends State<ChatScreen>
       final full = (stats['response'] as String?)?.trim();
       final text = (full != null && full.isNotEmpty) ? full : buf.toString().trim();
       return text.isEmpty ? null : text;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  // ── Background document categorisation (LLM) ────────────────────────────────
+
+  static const String _categorizePrompt =
+      'You are a librarian. Classify the document excerpt into a short, broad '
+      'top-level category (a genre like Fiction, Science, History, Finance, '
+      'Technology, Cooking, Health, Law, Religion, Reference, Manual, Personal), '
+      'a more specific subcategory, and up to 4 short topic tags. '
+      'Reply ONLY with compact JSON: '
+      '{"category":"...","subcategory":"...","tags":["...","..."]}';
+
+  /// Runs the chat model over un-categorised documents while idle + charging,
+  /// storing a genre/subcategory/tags for each so the Docs › Folders tab can
+  /// group them. Uses the already-loaded chat model (no swap).
+  void _maybeCategorizeDocs() {
+    if (_categorizing ||
+        _captioning ||
+        _phase != AppPhase.ready ||
+        !_charging ||
+        _generating ||
+        _preparingDocs ||
+        _appActive) {
+      return;
+    }
+    unawaited(_runDocCategorization());
+  }
+
+  Future<void> _runDocCategorization() async {
+    if (_categorizing) return;
+    _categorizing = true;
+    try {
+      final docs = await _docs.list();
+      if (docs.isEmpty) return;
+      final meta = await DocMetaStore.all();
+      final todo =
+          docs.where((d) => !(meta[d.id]?.categorized ?? false)).toList();
+      for (final d in todo) {
+        if (_captionStop || !_charging || _generating || _appActive) break;
+        final text = await _docs.readText(d.id);
+        final cat = await _categorizeOne('${d.name}\n\n$text');
+        await DocMetaStore.setCategory(
+            d.id, cat?.$1 ?? 'Uncategorised', cat?.$2 ?? '', cat?.$3 ?? const []);
+        await Future<void>.delayed(const Duration(milliseconds: 80));
+      }
+    } catch (_) {
+      // transient — retry next idle window
+    } finally {
+      _categorizing = false;
+    }
+  }
+
+  Future<(String, String, List<String>)?> _categorizeOne(String docText) async {
+    try {
+      final excerpt =
+          docText.length > 2000 ? docText.substring(0, 2000) : docText;
+      final messages = jsonEncode([
+        {'role': 'system', 'content': _categorizePrompt},
+        {'role': 'user', 'content': excerpt},
+      ]);
+      final run = _engine.complete(messages,
+          optionsJson: '{"max_tokens":120,"temperature":0.1}');
+      final buf = StringBuffer();
+      run.tokens.listen(buf.write, onError: (_) {});
+      final stats = await run.stats;
+      final full = (stats['response'] as String?)?.trim();
+      final text =
+          (full != null && full.isNotEmpty) ? full : buf.toString().trim();
+      final m = RegExp(r'\{.*\}', dotAll: true).firstMatch(text);
+      if (m == null) return null;
+      final j = jsonDecode(m.group(0)!) as Map<String, dynamic>;
+      String s(Object? v) => (v ?? '').toString().trim();
+      final cat = s(j['category']);
+      final sub = s(j['subcategory']);
+      final tags = (j['tags'] as List?)
+              ?.map((e) => e.toString().trim())
+              .where((t) => t.isNotEmpty)
+              .take(4)
+              .toList() ??
+          const <String>[];
+      if (cat.isEmpty) return null;
+      return (cat, sub, tags);
     } catch (_) {
       return null;
     }

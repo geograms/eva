@@ -6,11 +6,13 @@ import android.content.Intent
 import android.os.Build
 import android.os.Bundle
 import android.provider.Settings
-import io.flutter.embedding.android.FlutterActivity
+import com.ryanheise.audioservice.AudioServiceActivity
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.MethodChannel
 
-class MainActivity : FlutterActivity() {
+// Extends AudioServiceActivity (itself a FlutterActivity) so the
+// just_audio_background foreground service can bind to this activity's engine.
+class MainActivity : AudioServiceActivity() {
     private var channel: MethodChannel? = null
     private var pendingRoleResult: MethodChannel.Result? = null
 

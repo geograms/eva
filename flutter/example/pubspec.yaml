@@ -77,6 +77,9 @@ dependencies:
   audio_metadata_reader: ^1.4.1
   # In-app audio playback for the "play <artist/song>" command.
   just_audio: ^0.10.5
+  # Keeps playback alive in the background and shows a lock-screen / notification
+  # media control (play/pause/next/prev).
+  just_audio_background: ^0.0.1-beta.16
   # In-app reader for offline Wikipedia (ZIM) articles, served from a loopback
   # HTTP endpoint backed by libzim.
   webview_flutter: ^4.7.0

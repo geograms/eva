@@ -51,22 +51,38 @@ class _DocTextViewerScreenState extends State<DocTextViewerScreen> {
     } else if (widget.resumeKey != null) {
       // No quote to jump to: resume the last scroll position and keep it saved.
       WidgetsBinding.instance.addPostFrameCallback((_) => _restoreScroll());
-      _scroll.addListener(_saveScroll);
+      _scroll.addListener(_onScroll);
     }
   }
 
+  int _progress = 0; // percent read, shown in the app bar
+
+  /// Restores the saved fraction, retrying while the document is still laying
+  /// out (maxScrollExtent is 0 until the long text has been measured).
   Future<void> _restoreScroll() async {
     final frac = await loadDocScroll(widget.resumeKey!);
-    if (frac == null || !mounted || !_scroll.hasClients) return;
-    final max = _scroll.position.maxScrollExtent;
-    if (max > 0) _scroll.jumpTo((frac * max).clamp(0, max));
+    if (frac == null || frac <= 0) return;
+    for (var attempt = 0; attempt < 20 && mounted; attempt++) {
+      if (_scroll.hasClients && _scroll.position.maxScrollExtent > 0) {
+        final max = _scroll.position.maxScrollExtent;
+        _scroll.jumpTo((frac * max).clamp(0, max));
+        setState(() => _progress = (frac * 100).clamp(0, 100).round());
+        return;
+      }
+      await Future<void>.delayed(const Duration(milliseconds: 100));
+    }
   }
 
-  void _saveScroll() {
+  void _onScroll() {
     if (!_scroll.hasClients) return;
     final max = _scroll.position.maxScrollExtent;
     if (max <= 0) return;
-    saveDocScroll(widget.resumeKey!, (_scroll.offset / max).clamp(0.0, 1.0));
+    final frac = (_scroll.offset / max).clamp(0.0, 1.0);
+    final pct = (frac * 100).round();
+    if (pct != _progress) {
+      setState(() => _progress = pct);
+      saveDocScroll(widget.resumeKey!, frac);
+    }
   }
 
   @override
@@ -80,6 +96,18 @@ class _DocTextViewerScreenState extends State<DocTextViewerScreen> {
   /// character window to render plus the highlight range within it.
   _Located _locate(String text, String snippet) {
     if (text.isEmpty) return const _Located.empty();
+    // E-reader mode (no quote to find): render the whole document so it can be
+    // read end to end and the scroll position resumed.
+    if (snippet.trim().isEmpty) {
+      return _Located(
+        found: false,
+        before: text,
+        highlight: '',
+        after: '',
+        leadingEllipsis: false,
+        trailingEllipsis: false,
+      );
+    }
     final words = snippet
         .trim()
         .split(RegExp(r'\s+'))
@@ -149,6 +177,16 @@ class _DocTextViewerScreenState extends State<DocTextViewerScreen> {
     return Scaffold(
       appBar: AppBar(
         title: Text(widget.title, maxLines: 1, overflow: TextOverflow.ellipsis),
+        bottom: (widget.resumeKey != null && !_loc.found)
+            ? PreferredSize(
+                preferredSize: const Size.fromHeight(22),
+                child: Padding(
+                  padding: const EdgeInsets.only(bottom: 6),
+                  child: Text('$_progress% read',
+                      style: Theme.of(context).textTheme.labelSmall),
+                ),
+              )
+            : null,
       ),
       body: Column(
         children: [

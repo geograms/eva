@@ -2,6 +2,7 @@ import 'dart:async';
 
 import 'package:flutter/foundation.dart';
 import 'package:just_audio/just_audio.dart';
+import 'package:just_audio_background/just_audio_background.dart' hide TrackInfo;
 
 import 'music_service.dart';
 import 'music_store.dart';
@@ -53,7 +54,10 @@ class MusicPlayer extends ChangeNotifier {
     _radioName = name;
     notifyListeners(); // reflect the station name immediately
     try {
-      await _player.setAudioSource(AudioSource.uri(Uri.parse(url)));
+      await _player.setAudioSource(AudioSource.uri(
+        Uri.parse(url),
+        tag: MediaItem(id: url, title: name, artist: 'Live radio'),
+      ));
       // A live stream never "finishes", so play()'s Future would not complete —
       // fire it without awaiting so callers aren't blocked.
       unawaited(_player.play());
@@ -75,7 +79,16 @@ class MusicPlayer extends ChangeNotifier {
     _counted.clear();
     _index = startAt.clamp(0, tracks.length - 1);
     final sources = [
-      for (final t in tracks) AudioSource.uri(Uri.file(t.path)),
+      for (final t in tracks)
+        AudioSource.uri(
+          Uri.file(t.path),
+          tag: MediaItem(
+            id: t.id.toString(),
+            title: t.title.isNotEmpty ? t.title : t.path.split('/').last,
+            artist: t.artist.isNotEmpty ? t.artist : 'Unknown artist',
+            album: t.album.isNotEmpty ? t.album : null,
+          ),
+        ),
     ];
     try {
       await _player.setAudioSources(sources, initialIndex: _index);
