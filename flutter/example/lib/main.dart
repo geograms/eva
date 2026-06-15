@@ -198,6 +198,7 @@ class _ChatScreenState extends State<ChatScreen>
   String? _modelBeforeCaption;
   int _captionsDone = 0;
   bool _categorizing = false; // chat model labelling documents in the background
+  bool _categorizeStop = false;
   static const String _kCaptionModelId = 'lfm2-vl-450m-int4';
   // Terse prompt + small token cap keep each caption fast (the dominant cost is
   // generation length). Newest photos are captioned first, up to a cap; older
@@ -253,6 +254,8 @@ class _ChatScreenState extends State<ChatScreen>
   void _onTabChanged() {
     if (_tab != _tabController.index) {
       setState(() => _tab = _tabController.index);
+      // Categorise documents in the foreground while the user views Docs.
+      if (_tab == 3) _maybeCategorizeDocs();
     }
   }
 
@@ -802,6 +805,7 @@ class _ChatScreenState extends State<ChatScreen>
       if (mounted) setState(() => _listening = false);
     }
     await _stopCaptioningForChat();
+    await _stopCategorizingForChat();
     await _tts.stop();
 
     // "remind me … in 15 minutes / at 7pm" schedules an OS notification.
@@ -1611,10 +1615,10 @@ class _ChatScreenState extends State<ChatScreen>
     // Reliable re-check: triggers (metadata/doc notifications, charge events)
     // can be sparse during a long single embed, so poll the gate periodically.
     _captionTimer = Timer.periodic(const Duration(seconds: 15), (_) {
-      if (_charging) {
-        _maybeStartCaptioning();
-        _maybeCategorizeDocs();
-      }
+      if (_charging) _maybeStartCaptioning();
+      // Gates internally: runs while charging+idle, or while viewing the Docs
+      // tab in the foreground.
+      _maybeCategorizeDocs();
     });
   }
 
@@ -1742,43 +1746,68 @@ class _ChatScreenState extends State<ChatScreen>
       'Reply ONLY with compact JSON: '
       '{"category":"...","subcategory":"...","tags":["...","..."]}';
 
-  /// Runs the chat model over un-categorised documents while idle + charging,
-  /// storing a genre/subcategory/tags for each so the Docs › Folders tab can
-  /// group them. Uses the already-loaded chat model (no swap).
+  /// Runs the chat model over not-yet-categorised documents — both while idle +
+  /// charging in the background AND while the user is viewing the Docs tab (so
+  /// they see progress) — labelling each with a genre/subcategory/tags. Reuses
+  /// the already-extracted text from the corpus database (no re-reading files)
+  /// and the already-loaded chat model (no swap).
   void _maybeCategorizeDocs() {
     if (_categorizing ||
         _captioning ||
         _phase != AppPhase.ready ||
-        !_charging ||
         _generating ||
-        _preparingDocs ||
-        _appActive) {
+        _preparingDocs) {
       return;
     }
+    if (!_shouldCategorize) return;
     unawaited(_runDocCategorization());
   }
+
+  // Categorise in the background when charging + idle, or in the foreground
+  // while the user is looking at the Docs tab.
+  bool get _shouldCategorize =>
+      (_charging && !_appActive) || (_appActive && _tab == 3);
 
   Future<void> _runDocCategorization() async {
     if (_categorizing) return;
     _categorizing = true;
+    _categorizeStop = false;
     try {
       final docs = await _docs.list();
       if (docs.isEmpty) return;
       final meta = await DocMetaStore.all();
       final todo =
           docs.where((d) => !(meta[d.id]?.categorized ?? false)).toList();
+      if (todo.isEmpty) return;
+      var done = 0;
+      docCategorizeProgress.value = (done: 0, total: todo.length);
       for (final d in todo) {
-        if (_captionStop || !_charging || _generating || _appActive) break;
-        final text = await _docs.readText(d.id);
+        if (_categorizeStop || _generating || !_shouldCategorize) break;
+        final text = await _docs.readText(d.id); // already-extracted text
         final cat = await _categorizeOne('${d.name}\n\n$text');
+        // On a parse miss, file under "General" (still marks it done so the
+        // pass doesn't loop on it).
         await DocMetaStore.setCategory(
-            d.id, cat?.$1 ?? 'Uncategorised', cat?.$2 ?? '', cat?.$3 ?? const []);
-        await Future<void>.delayed(const Duration(milliseconds: 80));
+            d.id, cat?.$1 ?? 'General', cat?.$2 ?? '', cat?.$3 ?? const []);
+        done++;
+        docCategorizeProgress.value = (done: done, total: todo.length);
+        await Future<void>.delayed(const Duration(milliseconds: 60));
       }
     } catch (_) {
-      // transient — retry next idle window
+      // transient — retry next window
     } finally {
+      docCategorizeProgress.value = (done: 0, total: 0);
       _categorizing = false;
+    }
+  }
+
+  /// Stops the categorisation pass and waits for the in-flight document to
+  /// finish, so a chat turn can claim the model cleanly.
+  Future<void> _stopCategorizingForChat() async {
+    if (!_categorizing) return;
+    _categorizeStop = true;
+    for (var i = 0; i < 60 && _categorizing; i++) {
+      await Future<void>.delayed(const Duration(milliseconds: 100));
     }
   }
 

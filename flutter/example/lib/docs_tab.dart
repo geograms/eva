@@ -35,6 +35,14 @@ class _DocsTabState extends State<DocsTab> with TickerProviderStateMixin {
   void initState() {
     super.initState();
     _load();
+    docCategorizeProgress.addListener(_onCatProgress);
+  }
+
+  // As documents get categorised in the background, refresh so they move out of
+  // "To categorize" into their genre live.
+  Future<void> _onCatProgress() async {
+    final meta = await DocMetaStore.all();
+    if (mounted) setState(() => _meta = meta);
   }
 
   Future<void> _load() async {
@@ -52,6 +60,7 @@ class _DocsTabState extends State<DocsTab> with TickerProviderStateMixin {
 
   @override
   void dispose() {
+    docCategorizeProgress.removeListener(_onCatProgress);
     _subTab.dispose();
     super.dispose();
   }
@@ -253,38 +262,39 @@ class _DocsTabState extends State<DocsTab> with TickerProviderStateMixin {
         ),
       );
     }
-    // Group: category → subcategory → docs.
+    // Group: category → subcategory → docs. Not-yet-categorised docs go under a
+    // dedicated "To categorize" group.
+    const toDo = 'To categorize';
     final tree = <String, Map<String, List<DocumentInfo>>>{};
-    var pending = 0;
     for (final d in _documents) {
       final m = _meta[d.id];
-      if (m == null || !m.categorized) pending++;
-      final cat = (m?.category.isNotEmpty ?? false) ? m!.category : 'Uncategorised';
-      final sub = m?.subcategory ?? '';
+      final String cat;
+      final String sub;
+      if (m == null || !m.categorized) {
+        cat = toDo;
+        sub = '';
+      } else {
+        cat = m.category.isNotEmpty ? m.category : 'General';
+        sub = m.subcategory;
+      }
       (tree.putIfAbsent(cat, () => {}).putIfAbsent(sub, () => [])).add(d);
     }
     final cats = tree.keys.toList()
       ..sort((a, b) {
-        if (a == 'Uncategorised') return 1;
-        if (b == 'Uncategorised') return -1;
+        if (a == toDo) return 1; // "To categorize" sinks to the bottom
+        if (b == toDo) return -1;
         return a.toLowerCase().compareTo(b.toLowerCase());
       });
     return ListView(
       children: [
-        if (pending > 0)
-          Padding(
-            padding: const EdgeInsets.fromLTRB(16, 10, 16, 4),
-            child: Text(
-              'Categorising $pending document${pending == 1 ? '' : 's'} in the '
-              'background while charging…',
-              style: const TextStyle(fontSize: 12, color: Colors.grey),
-            ),
-          ),
         for (final cat in cats)
           ExpansionTile(
-            leading: const Icon(Icons.folder_outlined),
+            leading: Icon(cat == toDo ? Icons.hourglass_empty : Icons.folder_outlined),
+            initiallyExpanded: cat == toDo && cats.length == 1,
             title: Text(cat),
-            subtitle: Text('${tree[cat]!.values.fold<int>(0, (s, l) => s + l.length)} documents'),
+            subtitle: cat == toDo
+                ? _toCategorizeSubtitle(tree[cat]!.values.fold<int>(0, (s, l) => s + l.length))
+                : Text('${tree[cat]!.values.fold<int>(0, (s, l) => s + l.length)} documents'),
             childrenPadding: const EdgeInsets.only(left: 8),
             children: [
               for (final sub in (tree[cat]!.keys.toList()..sort()))
@@ -307,6 +317,20 @@ class _DocsTabState extends State<DocsTab> with TickerProviderStateMixin {
       ],
     );
   }
+
+  /// Subtitle for the "To categorize" group: live progress while the LLM pass
+  /// runs, else just the count.
+  Widget _toCategorizeSubtitle(int count) => ValueListenableBuilder<({int done, int total})>(
+        valueListenable: docCategorizeProgress,
+        builder: (context, p, _) {
+          if (p.total > 0) {
+            return Text('Categorising ${p.done} of ${p.total}…',
+                style: TextStyle(color: Theme.of(context).colorScheme.primary));
+          }
+          return Text('$count document${count == 1 ? '' : 's'} · categorising as '
+              'you browse and while charging');
+        },
+      );
 
   String? _tagsOf(DocumentInfo d) {
     final tags = _meta[d.id]?.tags ?? const [];

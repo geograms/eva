@@ -1,6 +1,12 @@
 import 'dart:convert';
 
+import 'package:flutter/foundation.dart';
 import 'package:shared_preferences/shared_preferences.dart';
+
+/// Live progress of the background document-categorisation pass, so the Docs
+/// tab can show "categorising X of N…". total == 0 means idle.
+final ValueNotifier<({int done, int total})> docCategorizeProgress =
+    ValueNotifier<({int done, int total})>((done: 0, total: 0));
 
 /// Per-document metadata for the e-reader: the LLM-assigned category hierarchy
 /// (genre → subcategory + tags), whether it's favourited, and read history
