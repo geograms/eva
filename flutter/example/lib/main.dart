@@ -35,6 +35,7 @@ import 'maps/map_ref.dart';
 import 'maps/map_service.dart';
 import 'model_catalog.dart';
 import 'model_manager.dart';
+import 'music_meta.dart';
 import 'music_player.dart';
 import 'music_service.dart';
 import 'music_store.dart';
@@ -199,6 +200,8 @@ class _ChatScreenState extends State<ChatScreen>
   int _captionsDone = 0;
   bool _categorizing = false; // chat model labelling documents in the background
   bool _categorizeStop = false;
+  bool _categorizingMusic = false; // chat model labelling music folders by genre
+  bool _categorizeMusicStop = false;
   static const String _kCaptionModelId = 'lfm2-vl-450m-int4';
   // Terse prompt + small token cap keep each caption fast (the dominant cost is
   // generation length). Newest photos are captioned first, up to a cap; older
@@ -238,6 +241,7 @@ class _ChatScreenState extends State<ChatScreen>
       // categorisation while the user is away (only runs if charging).
       _maybeStartCaptioning();
       _maybeCategorizeDocs();
+      _maybeCategorizeMusic();
     }
   }
 
@@ -254,8 +258,9 @@ class _ChatScreenState extends State<ChatScreen>
   void _onTabChanged() {
     if (_tab != _tabController.index) {
       setState(() => _tab = _tabController.index);
-      // Categorise documents in the foreground while the user views Docs.
+      // Categorise in the foreground while the user views the relevant tab.
       if (_tab == 3) _maybeCategorizeDocs();
+      if (_tab == 2) _maybeCategorizeMusic();
     }
   }
 
@@ -806,6 +811,7 @@ class _ChatScreenState extends State<ChatScreen>
     }
     await _stopCaptioningForChat();
     await _stopCategorizingForChat();
+    await _stopCategorizingMusicForChat();
     await _tts.stop();
 
     // "remind me … in 15 minutes / at 7pm" schedules an OS notification.
@@ -1616,9 +1622,10 @@ class _ChatScreenState extends State<ChatScreen>
     // can be sparse during a long single embed, so poll the gate periodically.
     _captionTimer = Timer.periodic(const Duration(seconds: 15), (_) {
       if (_charging) _maybeStartCaptioning();
-      // Gates internally: runs while charging+idle, or while viewing the Docs
+      // Gate internally: run while charging+idle, or while viewing the relevant
       // tab in the foreground.
       _maybeCategorizeDocs();
+      _maybeCategorizeMusic();
     });
   }
 
@@ -1753,6 +1760,7 @@ class _ChatScreenState extends State<ChatScreen>
   /// and the already-loaded chat model (no swap).
   void _maybeCategorizeDocs() {
     if (_categorizing ||
+        _categorizingMusic ||
         _captioning ||
         _phase != AppPhase.ready ||
         _generating ||
@@ -1843,6 +1851,120 @@ class _ChatScreenState extends State<ChatScreen>
       return (cat, sub, tags);
     } catch (_) {
       return null;
+    }
+  }
+
+  // ── Background music-folder categorisation (LLM) ─────────────────────────────
+
+  static const String _musicGenrePrompt =
+      'You are a music librarian. Given a music folder (usually an album or an '
+      'artist collection — a folder with under ~20 tracks is typically one '
+      "album), use your knowledge of the artist and tracks to assign a broad "
+      'genre and a specific subgenre. Reply ONLY with compact JSON: '
+      '{"genre":"...","subgenre":"..."}';
+
+  void _maybeCategorizeMusic() {
+    if (_categorizingMusic ||
+        _categorizing ||
+        _captioning ||
+        _phase != AppPhase.ready ||
+        _generating ||
+        _preparingDocs) {
+      return;
+    }
+    // Background while charging+idle, or foreground while viewing the Music tab.
+    final ok = (_charging && !_appActive) || (_appActive && _tab == 2);
+    if (!ok) return;
+    unawaited(_runMusicCategorization());
+  }
+
+  bool get _shouldCategorizeMusic =>
+      (_charging && !_appActive) || (_appActive && _tab == 2);
+
+  Future<void> _runMusicCategorization() async {
+    if (_categorizingMusic) return;
+    _categorizingMusic = true;
+    _categorizeMusicStop = false;
+    final store = await _music.openStore();
+    try {
+      final folders = store.folders(limit: 1000);
+      if (folders.isEmpty) return;
+      final meta = await MusicMetaStore.all();
+      final todo =
+          folders.where((f) => !(meta[f.name]?.categorized ?? false)).toList();
+      if (todo.isEmpty) return;
+      var done = 0;
+      musicCategorizeProgress.value = (done: 0, total: todo.length);
+      for (final f in todo) {
+        if (_categorizeMusicStop || _generating || !_shouldCategorizeMusic) break;
+        final tracks = store.byFolder(f.name, limit: 60);
+        final g = await _categorizeMusicFolder(f.name, tracks);
+        await MusicMetaStore.setGenre(f.name, g?.$1 ?? 'Other', g?.$2 ?? '');
+        done++;
+        musicCategorizeProgress.value = (done: done, total: todo.length);
+        await Future<void>.delayed(const Duration(milliseconds: 60));
+      }
+    } catch (_) {
+      // transient — retry next window
+    } finally {
+      musicCategorizeProgress.value = (done: 0, total: 0);
+      store.close();
+      _categorizingMusic = false;
+    }
+  }
+
+  Future<(String, String)?> _categorizeMusicFolder(
+      String folder, List<TrackInfo> tracks) async {
+    try {
+      // Build a compact summary: dominant artist(s), album(s), some titles.
+      final artists = <String, int>{};
+      final albums = <String>{};
+      for (final t in tracks) {
+        if (t.artist.isNotEmpty) artists[t.artist] = (artists[t.artist] ?? 0) + 1;
+        if (t.album.isNotEmpty) albums.add(t.album);
+      }
+      final topArtists = (artists.entries.toList()
+            ..sort((a, b) => b.value.compareTo(a.value)))
+          .take(3)
+          .map((e) => e.key)
+          .join(', ');
+      final titles = tracks.take(12).map((t) => t.title).where((s) => s.isNotEmpty).join('; ');
+      final summary = [
+        'Folder: $folder',
+        if (topArtists.isNotEmpty) 'Artist(s): $topArtists',
+        if (albums.isNotEmpty) 'Album(s): ${albums.take(3).join(', ')}',
+        'Tracks (${tracks.length}): $titles',
+      ].join('\n');
+      final messages = jsonEncode([
+        {'role': 'system', 'content': _musicGenrePrompt},
+        {'role': 'user', 'content': summary},
+      ]);
+      final run = _engine.complete(messages,
+          optionsJson: '{"max_tokens":60,"temperature":0.1}');
+      final buf = StringBuffer();
+      run.tokens.listen(buf.write, onError: (_) {});
+      final stats = await run.stats;
+      final full = (stats['response'] as String?)?.trim();
+      final text =
+          (full != null && full.isNotEmpty) ? full : buf.toString().trim();
+      final m = RegExp(r'\{.*\}', dotAll: true).firstMatch(text);
+      if (m == null) return null;
+      final j = jsonDecode(m.group(0)!) as Map<String, dynamic>;
+      String s(Object? v) => (v ?? '').toString().trim();
+      final genre = s(j['genre']);
+      final sub = s(j['subgenre']);
+      if (genre.isEmpty) return null;
+      return (genre, sub);
+    } catch (_) {
+      return null;
+    }
+  }
+
+  Future<void> _stopCategorizingMusicForChat() async {
+    if (!_categorizingMusic) return;
+    _categorizeMusicStop = true;
+    for (var i = 0; i < 60 && _categorizingMusic; i++) {
+      await Future<void>.delayed(const Duration(milliseconds: 100));
     }
   }
 

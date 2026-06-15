@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 
+import 'music_meta.dart';
 import 'music_player.dart';
 import 'music_service.dart';
 import 'music_store.dart';
@@ -23,8 +24,8 @@ class _MusicTabState extends State<MusicTab> with TickerProviderStateMixin {
   final TextEditingController _search = TextEditingController();
   List<TrackInfo> _top = const [];
   List<({String name, int count})> _artists = const [];
-  List<({String genre, String label, List<({String folder, int count})> folders})>
-      _tree = const [];
+  List<({String name, int count})> _folders = const [];
+  Map<String, MusicFolderMeta> _folderMeta = {};
   List<TrackInfo> _searchResults = const [];
   bool _loading = true;
 
@@ -32,18 +33,28 @@ class _MusicTabState extends State<MusicTab> with TickerProviderStateMixin {
   void initState() {
     super.initState();
     widget.player.addListener(_onPlayer);
+    musicCategorizeProgress.addListener(_onMusicCat);
     _open();
   }
 
   Future<void> _open() async {
     _store = await widget.music.openStore();
     final store = _store!;
+    final meta = await MusicMetaStore.all();
+    if (!mounted) return;
     setState(() {
       _top = store.topPlayed(limit: 60);
       _artists = store.artists(limit: 200);
-      _tree = store.genreFolderTree();
+      _folders = store.folders(limit: 1000);
+      _folderMeta = meta;
       _loading = false;
     });
+  }
+
+  // Refresh as folders get their genre, so they move out of "To categorize".
+  Future<void> _onMusicCat() async {
+    final meta = await MusicMetaStore.all();
+    if (mounted) setState(() => _folderMeta = meta);
   }
 
   void _onPlayer() {
@@ -53,6 +64,7 @@ class _MusicTabState extends State<MusicTab> with TickerProviderStateMixin {
   @override
   void dispose() {
     widget.player.removeListener(_onPlayer);
+    musicCategorizeProgress.removeListener(_onMusicCat);
     _subTab.dispose();
     _search.dispose();
     _store?.close();
@@ -187,9 +199,10 @@ class _MusicTabState extends State<MusicTab> with TickerProviderStateMixin {
     );
   }
 
-  /// Folders grouped under their genre (genre = root, folders inside).
+  /// Folders grouped by their LLM-assigned genre → subgenre → folder. Folders
+  /// not yet categorised go under "To categorize" with live progress.
   Widget _foldersPage() {
-    if (_tree.isEmpty) {
+    if (_folders.isEmpty) {
       return const Center(
         child: Padding(
           padding: EdgeInsets.all(24),
@@ -198,32 +211,77 @@ class _MusicTabState extends State<MusicTab> with TickerProviderStateMixin {
         ),
       );
     }
-    return ListView.builder(
-      itemCount: _tree.length,
-      itemBuilder: (context, i) {
-        final g = _tree[i];
-        final total = g.folders.fold<int>(0, (s, f) => s + f.count);
-        return ExpansionTile(
-          leading: const Icon(Icons.library_music_outlined),
-          title: Text(g.label),
-          subtitle: Text(
-              '${g.folders.length} folder${g.folders.length == 1 ? '' : 's'} · $total tracks'),
-          childrenPadding: const EdgeInsets.only(left: 16),
-          children: [
-            for (final f in g.folders)
-              ListTile(
-                leading: const Icon(Icons.folder_outlined),
-                title: Text(f.folder),
-                subtitle: Text('${f.count} track${f.count == 1 ? '' : 's'}'),
-                trailing: const Icon(Icons.chevron_right),
-                onTap: () => _openTracks(
-                    f.folder, _store!.byGenreFolder(g.genre, f.folder)),
-              ),
-          ],
-        );
-      },
+    const toDo = 'To categorize';
+    // genre → subgenre → [(folder,count)]
+    final tree = <String, Map<String, List<({String name, int count})>>>{};
+    for (final f in _folders) {
+      final m = _folderMeta[f.name];
+      final String genre;
+      final String sub;
+      if (m == null || !m.categorized) {
+        genre = toDo;
+        sub = '';
+      } else {
+        genre = m.genre.isNotEmpty ? m.genre : 'Other';
+        sub = m.subgenre;
+      }
+      (tree.putIfAbsent(genre, () => {}).putIfAbsent(sub, () => [])).add(f);
+    }
+    final genres = tree.keys.toList()
+      ..sort((a, b) {
+        if (a == toDo) return 1;
+        if (b == toDo) return -1;
+        return a.toLowerCase().compareTo(b.toLowerCase());
+      });
+    return ListView(
+      children: [
+        for (final genre in genres)
+          ExpansionTile(
+            leading: Icon(genre == toDo ? Icons.hourglass_empty : Icons.library_music_outlined),
+            initiallyExpanded: genre == toDo && genres.length == 1,
+            title: Text(genre),
+            subtitle: genre == toDo
+                ? _toCategorizeSubtitle(tree[genre]!.values.fold<int>(0, (s, l) => s + l.length))
+                : Text('${tree[genre]!.values.fold<int>(0, (s, l) => s + l.length)} folders'),
+            childrenPadding: const EdgeInsets.only(left: 8),
+            children: [
+              for (final sub in (tree[genre]!.keys.toList()..sort()))
+                if (sub.isEmpty)
+                  for (final f in tree[genre]![sub]!) _folderTile(f)
+                else
+                  ExpansionTile(
+                    leading: const Icon(Icons.subdirectory_arrow_right),
+                    title: Text(sub),
+                    subtitle: Text('${tree[genre]![sub]!.length} folders'),
+                    childrenPadding: const EdgeInsets.only(left: 8),
+                    children: [for (final f in tree[genre]![sub]!) _folderTile(f)],
+                  ),
+            ],
+          ),
+      ],
     );
   }
+
+  Widget _folderTile(({String name, int count}) f) => ListTile(
+        leading: const Icon(Icons.folder_outlined),
+        title: Text(f.name),
+        subtitle: Text('${f.count} track${f.count == 1 ? '' : 's'}'),
+        trailing: const Icon(Icons.chevron_right),
+        onTap: () => _openTracks(f.name, _store!.byFolder(f.name)),
+      );
+
+  Widget _toCategorizeSubtitle(int count) =>
+      ValueListenableBuilder<({int done, int total})>(
+        valueListenable: musicCategorizeProgress,
+        builder: (context, p, _) {
+          if (p.total > 0) {
+            return Text('Categorising ${p.done} of ${p.total}…',
+                style: TextStyle(color: Theme.of(context).colorScheme.primary));
+          }
+          return Text('$count folder${count == 1 ? '' : 's'} · categorising as '
+              'you browse and while charging');
+        },
+      );
 
   Widget _trackList(List<TrackInfo> tracks) {
     if (tracks.isEmpty) return const Center(child: Text('No matches.'));

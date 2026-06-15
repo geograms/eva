@@ -33,6 +33,10 @@ class _DocsTabState extends State<DocsTab> with TickerProviderStateMixin {
   bool _wikiAvailable = false;
   bool _wikiBusy = false; // resolving a random/main article
   List<({String title, String path})> _recent = const [];
+  final TextEditingController _wikiSearchCtl = TextEditingController();
+  List<ZimHit> _wikiHits = const [];
+  bool _wikiSearching = false;
+  bool _wikiSearched = false;
 
   @override
   void initState() {
@@ -66,6 +70,7 @@ class _DocsTabState extends State<DocsTab> with TickerProviderStateMixin {
   @override
   void dispose() {
     docCategorizeProgress.removeListener(_onCatProgress);
+    _wikiSearchCtl.dispose();
     _subTab.dispose();
     super.dispose();
   }
@@ -190,21 +195,83 @@ class _DocsTabState extends State<DocsTab> with TickerProviderStateMixin {
         ),
       );
     }
+    final hasQuery = _wikiSearchCtl.text.trim().isNotEmpty;
+    return Column(
+      children: [
+        Padding(
+          padding: const EdgeInsets.fromLTRB(12, 10, 12, 4),
+          child: TextField(
+            controller: _wikiSearchCtl,
+            textInputAction: TextInputAction.search,
+            onChanged: (_) => setState(() {}), // reflect clear button
+            onSubmitted: (_) => _runWikiSearch(),
+            decoration: InputDecoration(
+              isDense: true,
+              prefixIcon: const Icon(Icons.search),
+              hintText: 'Search Wikipedia…',
+              border: const OutlineInputBorder(),
+              suffixIcon: !hasQuery
+                  ? null
+                  : IconButton(
+                      icon: const Icon(Icons.clear),
+                      onPressed: () => setState(() {
+                        _wikiSearchCtl.clear();
+                        _wikiHits = const [];
+                        _wikiSearched = false;
+                      }),
+                    ),
+            ),
+          ),
+        ),
+        Expanded(
+          child: _wikiSearching
+              ? const Center(
+                  child: Column(mainAxisSize: MainAxisSize.min, children: [
+                    CircularProgressIndicator(),
+                    SizedBox(height: 10),
+                    Text('Searching…'),
+                  ]),
+                )
+              : hasQuery
+                  ? _wikiResults()
+                  : _wikiBrowse(scheme),
+        ),
+      ],
+    );
+  }
+
+  /// Inline search results.
+  Widget _wikiResults() {
+    if (_wikiSearched && _wikiHits.isEmpty) {
+      return const Center(child: Padding(
+        padding: EdgeInsets.all(24), child: Text('No articles found.')));
+    }
+    if (!_wikiSearched) {
+      return const Center(child: Padding(
+        padding: EdgeInsets.all(24),
+        child: Text('Press search to find articles.', style: TextStyle(color: Colors.grey))));
+    }
+    return ListView(
+      children: [
+        for (final h in _wikiHits)
+          ListTile(
+            leading: const Icon(Icons.article_outlined),
+            title: Text(h.title),
+            subtitle: _cleanSnippet(h.snippet) == null
+                ? null
+                : Text(_cleanSnippet(h.snippet)!,
+                    maxLines: 2, overflow: TextOverflow.ellipsis),
+            onTap: () => _openArticle(h.title, h.path),
+          ),
+      ],
+    );
+  }
+
+  /// Browse view (no query): random + main page + recently viewed.
+  Widget _wikiBrowse(ColorScheme scheme) {
     return ListView(
       padding: const EdgeInsets.all(16),
       children: [
-        Text('Read Wikipedia', style: Theme.of(context).textTheme.titleMedium),
-        const SizedBox(height: 6),
-        Text('Fully offline. Search a topic, open a random article, or start '
-            'from the main page.',
-            style: TextStyle(fontSize: 13, color: scheme.onSurfaceVariant)),
-        const SizedBox(height: 16),
-        FilledButton.icon(
-          icon: const Icon(Icons.search),
-          label: const Text('Search articles'),
-          onPressed: _wikiBusy ? null : _searchWiki,
-        ),
-        const SizedBox(height: 8),
         OutlinedButton.icon(
           icon: _wikiBusy
               ? const SizedBox(
@@ -250,6 +317,25 @@ class _DocsTabState extends State<DocsTab> with TickerProviderStateMixin {
     );
   }
 
+  String? _cleanSnippet(String raw) {
+    final t = htmlToPlainText(raw).trim();
+    return t.isEmpty ? null : t;
+  }
+
+  Future<void> _runWikiSearch() async {
+    final q = _wikiSearchCtl.text.trim();
+    if (q.isEmpty) return;
+    setState(() => _wikiSearching = true);
+    await Future<void>.delayed(const Duration(milliseconds: 50)); // paint spinner
+    final hits = await _wiki.search(q, k: 30);
+    if (!mounted) return;
+    setState(() {
+      _wikiHits = hits;
+      _wikiSearching = false;
+      _wikiSearched = true;
+    });
+  }
+
   /// Opens an article in the reader and records it in "recently viewed".
   Future<void> _openArticle(String title, String path) async {
     await addRecentWiki(title, path);
@@ -284,17 +370,6 @@ class _DocsTabState extends State<DocsTab> with TickerProviderStateMixin {
           const SnackBar(content: Text('Could not pick a random article.')));
       return;
     }
-    await _openArticle(hit.title, hit.path);
-  }
-
-  Future<void> _searchWiki() async {
-    final hit = await showModalBottomSheet<ZimHit>(
-      context: context,
-      isScrollControlled: true,
-      showDragHandle: true,
-      builder: (_) => _WikiSearchSheet(wiki: _wiki),
-    );
-    if (hit == null || !mounted) return;
     await _openArticle(hit.title, hit.path);
   }
 
@@ -461,105 +536,3 @@ class _DocsTabState extends State<DocsTab> with TickerProviderStateMixin {
   }
 }
 
-/// A bottom sheet to search Wikipedia titles and pick an article to read.
-class _WikiSearchSheet extends StatefulWidget {
-  const _WikiSearchSheet({required this.wiki});
-  final WikipediaService wiki;
-
-  @override
-  State<_WikiSearchSheet> createState() => _WikiSearchSheetState();
-}
-
-class _WikiSearchSheetState extends State<_WikiSearchSheet> {
-  final TextEditingController _c = TextEditingController();
-  List<ZimHit> _hits = const [];
-  bool _searching = false;
-  bool _searched = false; // a search has completed at least once
-
-  // Strips the <b>…</b> highlight markup (and entities) Xapian puts in snippets.
-  String? _cleanSnippet(String raw) {
-    final t = htmlToPlainText(raw).trim();
-    return t.isEmpty ? null : t;
-  }
-
-  @override
-  void dispose() {
-    _c.dispose();
-    super.dispose();
-  }
-
-  Future<void> _run() async {
-    final q = _c.text.trim();
-    if (q.isEmpty) return;
-    setState(() => _searching = true);
-    // The FFI search blocks the UI thread; yield a frame so the spinner paints
-    // before it runs (otherwise it looks stuck).
-    await Future<void>.delayed(const Duration(milliseconds: 50));
-    final hits = await widget.wiki.search(q, k: 30);
-    if (!mounted) return;
-    setState(() {
-      _hits = hits;
-      _searching = false;
-      _searched = true;
-    });
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    final bottom = MediaQuery.of(context).viewInsets.bottom;
-    return Padding(
-      padding: EdgeInsets.only(left: 12, right: 12, bottom: bottom + 12, top: 4),
-      child: Column(
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          TextField(
-            controller: _c,
-            autofocus: true,
-            textInputAction: TextInputAction.search,
-            onSubmitted: (_) => _run(),
-            decoration: InputDecoration(
-              hintText: 'Search Wikipedia…',
-              border: const OutlineInputBorder(),
-              suffixIcon: IconButton(icon: const Icon(Icons.search), onPressed: _run),
-            ),
-          ),
-          const SizedBox(height: 8),
-          if (_searching)
-            const Padding(
-              padding: EdgeInsets.all(20),
-              child: Column(mainAxisSize: MainAxisSize.min, children: [
-                CircularProgressIndicator(),
-                SizedBox(height: 10),
-                Text('Searching…'),
-              ]),
-            )
-          else if (_searched && _hits.isEmpty)
-            const Padding(
-              padding: EdgeInsets.all(20),
-              child: Text('No articles found.'),
-            )
-          else
-            ConstrainedBox(
-              constraints:
-                  BoxConstraints(maxHeight: MediaQuery.of(context).size.height * 0.5),
-              child: ListView(
-                shrinkWrap: true,
-                children: [
-                  for (final h in _hits)
-                    ListTile(
-                      leading: const Icon(Icons.article_outlined),
-                      title: Text(h.title),
-                      subtitle: _cleanSnippet(h.snippet) == null
-                          ? null
-                          : Text(_cleanSnippet(h.snippet)!,
-                              maxLines: 2, overflow: TextOverflow.ellipsis),
-                      onTap: () => Navigator.of(context).pop(h),
-                    ),
-                ],
-              ),
-            ),
-        ],
-      ),
-    );
-  }
-}
