@@ -417,6 +417,42 @@ Future<void> saveReminders(List<ReminderItem> reminders) async {
       _kRemindersKey, jsonEncode([for (final r in reminders) r.toJson()]));
 }
 
+// ── Recently viewed Wikipedia articles ───────────────────────────────────────
+
+const String _kRecentWikiKey = 'recent_wiki';
+
+/// Recently opened Wikipedia articles, most recent first (title + ZIM path).
+Future<List<({String title, String path})>> loadRecentWiki() async {
+  final prefs = await SharedPreferences.getInstance();
+  final raw = prefs.getString(_kRecentWikiKey);
+  if (raw == null) return [];
+  try {
+    return [
+      for (final e in (jsonDecode(raw) as List))
+        (title: (e['title'] as String?) ?? '', path: (e['path'] as String?) ?? '')
+    ].where((e) => e.path.isNotEmpty).toList();
+  } catch (_) {
+    return [];
+  }
+}
+
+/// Records an opened article at the top of the recents (deduped by path, capped).
+Future<void> addRecentWiki(String title, String path) async {
+  if (path.isEmpty) return;
+  final prefs = await SharedPreferences.getInstance();
+  final list = await loadRecentWiki();
+  list.removeWhere((e) => e.path == path);
+  list.insert(0, (title: title.isEmpty ? path : title, path: path));
+  final capped = list.take(25).toList();
+  await prefs.setString(_kRecentWikiKey,
+      jsonEncode([for (final e in capped) {'title': e.title, 'path': e.path}]));
+}
+
+Future<void> clearRecentWiki() async {
+  final prefs = await SharedPreferences.getInstance();
+  await prefs.remove(_kRecentWikiKey);
+}
+
 // ── Reading positions (resume where you left off) ────────────────────────────
 
 const String _kDocPagesKey = 'doc_pages'; // {docKey: pageNumber}

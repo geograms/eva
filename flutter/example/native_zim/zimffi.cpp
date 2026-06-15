@@ -143,7 +143,12 @@ char* zimffi_main_path(zimffi_archive* a) {
   std::string p;
   if (a) {
     try {
-      if (a->archive.hasMainEntry()) p = a->archive.getMainEntry().getPath();
+      if (a->archive.hasMainEntry()) {
+        // The main entry is often a redirect whose own getPath() ("mainPage")
+        // does NOT round-trip through getEntryByPath. Resolve it to the real
+        // article item path, which does.
+        p = a->archive.getMainEntry().getItem(true).getPath();
+      }
     } catch (...) {
     }
   }

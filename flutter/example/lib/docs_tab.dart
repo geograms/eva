@@ -2,9 +2,10 @@ import 'dart:io';
 
 import 'package:flutter/material.dart';
 
+import 'app_prefs.dart';
 import 'doc_meta.dart';
 import 'doc_text_viewer_screen.dart';
-import 'document_service.dart';
+import 'document_service.dart' show DocumentService, DocumentInfo, htmlToPlainText;
 import 'pdf_viewer_screen.dart';
 import 'wikipedia_reader_screen.dart';
 import 'wikipedia_service.dart';
@@ -30,6 +31,8 @@ class _DocsTabState extends State<DocsTab> with TickerProviderStateMixin {
   bool _loading = true;
   final WikipediaService _wiki = WikipediaService.instance;
   bool _wikiAvailable = false;
+  bool _wikiBusy = false; // resolving a random/main article
+  List<({String title, String path})> _recent = const [];
 
   @override
   void initState() {
@@ -49,11 +52,13 @@ class _DocsTabState extends State<DocsTab> with TickerProviderStateMixin {
     final docs = await widget.docs.list();
     final meta = await DocMetaStore.all();
     final wiki = await _wiki.ensureOpen();
+    final recent = await loadRecentWiki();
     if (!mounted) return;
     setState(() {
       _documents = docs;
       _meta = meta;
       _wikiAvailable = wiki;
+      _recent = recent;
       _loading = false;
     });
   }
@@ -197,43 +202,89 @@ class _DocsTabState extends State<DocsTab> with TickerProviderStateMixin {
         FilledButton.icon(
           icon: const Icon(Icons.search),
           label: const Text('Search articles'),
-          onPressed: _searchWiki,
+          onPressed: _wikiBusy ? null : _searchWiki,
         ),
         const SizedBox(height: 8),
         OutlinedButton.icon(
-          icon: const Icon(Icons.casino),
-          label: const Text('Surprise me (random article)'),
-          onPressed: _openRandom,
+          icon: _wikiBusy
+              ? const SizedBox(
+                  width: 18, height: 18, child: CircularProgressIndicator(strokeWidth: 2))
+              : const Icon(Icons.casino),
+          label: Text(_wikiBusy ? 'Finding an article…' : 'Surprise me (random article)'),
+          onPressed: _wikiBusy ? null : _openRandom,
         ),
         const SizedBox(height: 8),
         OutlinedButton.icon(
           icon: const Icon(Icons.home),
           label: const Text('Open main page'),
-          onPressed: _openMain,
+          onPressed: _wikiBusy ? null : _openMain,
         ),
+        if (_recent.isNotEmpty) ...[
+          const SizedBox(height: 20),
+          Row(
+            children: [
+              Expanded(
+                child: Text('Recently viewed',
+                    style: Theme.of(context).textTheme.titleSmall),
+              ),
+              TextButton(
+                onPressed: () async {
+                  await clearRecentWiki();
+                  final r = await loadRecentWiki();
+                  if (mounted) setState(() => _recent = r);
+                },
+                child: const Text('Clear'),
+              ),
+            ],
+          ),
+          for (final a in _recent)
+            ListTile(
+              dense: true,
+              contentPadding: EdgeInsets.zero,
+              leading: const Icon(Icons.history),
+              title: Text(a.title, maxLines: 1, overflow: TextOverflow.ellipsis),
+              onTap: () => _openArticle(a.title, a.path),
+            ),
+        ],
       ],
     );
   }
 
-  Future<void> _openMain() async {
-    final path = await _wiki.mainPath();
-    if (!mounted || path.isEmpty) return;
+  /// Opens an article in the reader and records it in "recently viewed".
+  Future<void> _openArticle(String title, String path) async {
+    await addRecentWiki(title, path);
+    if (!mounted) return;
     await Navigator.of(context).push(MaterialPageRoute(
-      builder: (_) => WikipediaReaderScreen(title: 'Wikipedia', articlePath: path),
+      builder: (_) => WikipediaReaderScreen(title: title, articlePath: path),
     ));
+    final r = await loadRecentWiki();
+    if (mounted) setState(() => _recent = r);
+  }
+
+  Future<void> _openMain() async {
+    setState(() => _wikiBusy = true);
+    final path = await _wiki.mainPath();
+    if (!mounted) return;
+    setState(() => _wikiBusy = false);
+    if (path.isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('This edition has no main page.')));
+      return;
+    }
+    await _openArticle('Wikipedia', path);
   }
 
   Future<void> _openRandom() async {
+    setState(() => _wikiBusy = true);
     final hit = await _wiki.randomArticle();
     if (!mounted) return;
+    setState(() => _wikiBusy = false);
     if (hit == null) {
       ScaffoldMessenger.of(context).showSnackBar(
           const SnackBar(content: Text('Could not pick a random article.')));
       return;
     }
-    await Navigator.of(context).push(MaterialPageRoute(
-      builder: (_) => WikipediaReaderScreen(title: hit.title, articlePath: hit.path),
-    ));
+    await _openArticle(hit.title, hit.path);
   }
 
   Future<void> _searchWiki() async {
@@ -244,9 +295,7 @@ class _DocsTabState extends State<DocsTab> with TickerProviderStateMixin {
       builder: (_) => _WikiSearchSheet(wiki: _wiki),
     );
     if (hit == null || !mounted) return;
-    await Navigator.of(context).push(MaterialPageRoute(
-      builder: (_) => WikipediaReaderScreen(title: hit.title, articlePath: hit.path),
-    ));
+    await _openArticle(hit.title, hit.path);
   }
 
   // ── Folders (LLM genre → subcategory) ───────────────────────────────────────
@@ -425,6 +474,13 @@ class _WikiSearchSheetState extends State<_WikiSearchSheet> {
   final TextEditingController _c = TextEditingController();
   List<ZimHit> _hits = const [];
   bool _searching = false;
+  bool _searched = false; // a search has completed at least once
+
+  // Strips the <b>…</b> highlight markup (and entities) Xapian puts in snippets.
+  String? _cleanSnippet(String raw) {
+    final t = htmlToPlainText(raw).trim();
+    return t.isEmpty ? null : t;
+  }
 
   @override
   void dispose() {
@@ -436,11 +492,15 @@ class _WikiSearchSheetState extends State<_WikiSearchSheet> {
     final q = _c.text.trim();
     if (q.isEmpty) return;
     setState(() => _searching = true);
+    // The FFI search blocks the UI thread; yield a frame so the spinner paints
+    // before it runs (otherwise it looks stuck).
+    await Future<void>.delayed(const Duration(milliseconds: 50));
     final hits = await widget.wiki.search(q, k: 30);
     if (!mounted) return;
     setState(() {
       _hits = hits;
       _searching = false;
+      _searched = true;
     });
   }
 
@@ -465,7 +525,19 @@ class _WikiSearchSheetState extends State<_WikiSearchSheet> {
           ),
           const SizedBox(height: 8),
           if (_searching)
-            const Padding(padding: EdgeInsets.all(16), child: CircularProgressIndicator())
+            const Padding(
+              padding: EdgeInsets.all(20),
+              child: Column(mainAxisSize: MainAxisSize.min, children: [
+                CircularProgressIndicator(),
+                SizedBox(height: 10),
+                Text('Searching…'),
+              ]),
+            )
+          else if (_searched && _hits.isEmpty)
+            const Padding(
+              padding: EdgeInsets.all(20),
+              child: Text('No articles found.'),
+            )
           else
             ConstrainedBox(
               constraints:
@@ -477,9 +549,10 @@ class _WikiSearchSheetState extends State<_WikiSearchSheet> {
                     ListTile(
                       leading: const Icon(Icons.article_outlined),
                       title: Text(h.title),
-                      subtitle: h.snippet.isEmpty
+                      subtitle: _cleanSnippet(h.snippet) == null
                           ? null
-                          : Text(h.snippet, maxLines: 2, overflow: TextOverflow.ellipsis),
+                          : Text(_cleanSnippet(h.snippet)!,
+                              maxLines: 2, overflow: TextOverflow.ellipsis),
                       onTap: () => Navigator.of(context).pop(h),
                     ),
                 ],
