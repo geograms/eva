@@ -51,7 +51,10 @@ Future<ReleaseInfo?> fetchLatestRelease({String? apiUrl}) async {
   try {
     final resp = await http.get(
       Uri.parse(url),
-      headers: {'Accept': 'application/vnd.github+json'},
+      headers: {
+        'Accept': 'application/vnd.github+json',
+        'User-Agent': 'Eva-Updater',
+      },
     ).timeout(const Duration(seconds: 12));
     if (resp.statusCode != 200) return null;
     final json = jsonDecode(resp.body) as Map<String, dynamic>;

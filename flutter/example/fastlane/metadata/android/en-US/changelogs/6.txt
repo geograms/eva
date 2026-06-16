@@ -1,0 +1,9 @@
+Indexer no longer gets stuck on a single document. Over-long text lines (e.g. a
+PDF that extracts as one giant line) are now split so the embedder can't stall
+on a huge chunk, very large files are partially indexed instead of monopolising
+the queue, and each document has a time budget — if it takes too long it is
+skipped so indexing keeps moving.
+
+In-app updater: the download is more robust (follows redirects, sends a
+User-Agent, retries a fallback URL, streams large files safely) and now shows
+the real reason if a download fails instead of a generic message.

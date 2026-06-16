@@ -138,16 +138,21 @@ class AppUpdater extends ChangeNotifier {
     _cancel = false;
     try {
       _set(UpdateStatus.downloading, progress: null);
-      final file = await DownloadService.run(
-        'Downloading Eva ${info.tag}',
-        () => _downloadApk(info),
-      );
+      File? file;
+      try {
+        file = await DownloadService.run(
+          'Downloading Eva ${info.tag}',
+          () => _downloadApk(info),
+        );
+      } catch (e) {
+        // Surface the real reason (HTTP status / network error) so a failure
+        // isn't an opaque "Download failed".
+        _set(UpdateStatus.error, error: 'Download failed: ${_reason(e)}');
+        return;
+      }
       if (file == null) {
-        if (_cancel) {
-          _set(UpdateStatus.available);
-        } else {
-          _set(UpdateStatus.error, error: 'Download failed.');
-        }
+        // Only returns null on user cancel.
+        _set(UpdateStatus.available);
         return;
       }
 
@@ -188,7 +193,8 @@ class AppUpdater extends ChangeNotifier {
   }
 
   /// Streams the APK to disk with progress, replacing any previous download.
-  /// Returns the file, or null if cancelled / failed.
+  /// Returns the file on success, or null only if the user cancelled. Throws a
+  /// descriptive error on HTTP/network failure (so the panel can show why).
   Future<File?> _downloadApk(ReleaseInfo info) async {
     final dir = await _updatesDir();
     // Drop any stale APKs so a half-finished one can't be installed by mistake.
@@ -201,13 +207,50 @@ class AppUpdater extends ChangeNotifier {
     final dest = File('${dir.path}/eva-$safeTag.apk');
     final tmp = File('${dest.path}.part');
 
+    // Try the asset's own URL first, then the stable "latest download" URL as a
+    // fallback (covers a custom endpoint that omits browser_download_url).
+    final fallback = '$kReleasesUrl/download/$kApkAssetName';
+    final urls = <String>[
+      info.apkUrl,
+      if (info.apkUrl != fallback) fallback,
+    ];
+    Object? lastError;
+    for (final url in urls) {
+      try {
+        final ok = await _fetchToFile(url, tmp, info.tag);
+        if (!ok) return null; // cancelled
+        if (await dest.exists()) await dest.delete();
+        await tmp.rename(dest.path);
+        return dest;
+      } catch (e) {
+        lastError = e;
+        try {
+          if (await tmp.exists()) await tmp.delete();
+        } catch (_) {}
+      }
+    }
+    throw Exception(lastError ?? 'could not download the update');
+  }
+
+  /// Streams [url] to [tmp] with progress. Returns false if the user cancelled;
+  /// throws on a non-200 status or a network error. Follows redirects (GitHub
+  /// release assets 302 to a CDN) and sends a User-Agent (some hosts reject
+  /// requests without one).
+  Future<bool> _fetchToFile(String url, File tmp, String tag) async {
     final client = http.Client();
     try {
-      final req = http.Request('GET', Uri.parse(info.apkUrl));
-      final resp = await client.send(req).timeout(const Duration(seconds: 30));
-      if (resp.statusCode != 200) return null;
+      final req = http.Request('GET', Uri.parse(url))
+        ..followRedirects = true
+        ..maxRedirects = 5
+        ..headers['User-Agent'] = 'Eva-Updater'
+        ..headers['Accept'] = 'application/octet-stream';
+      final resp = await client.send(req).timeout(const Duration(seconds: 60));
+      if (resp.statusCode != 200) {
+        throw Exception('HTTP ${resp.statusCode}');
+      }
       final total = resp.contentLength ?? 0;
       var received = 0;
+      var lastFlush = 0;
       final sink = tmp.openWrite();
       try {
         await for (final chunk in resp.stream) {
@@ -216,32 +259,43 @@ class AppUpdater extends ChangeNotifier {
             try {
               await tmp.delete();
             } catch (_) {}
-            return null;
+            return false;
           }
           received += chunk.length;
           sink.add(chunk);
+          // Flush periodically: bounds memory and applies backpressure so a fast
+          // connection on a low-RAM device can't outrun the disk write.
+          if (received - lastFlush >= 4 * 1024 * 1024) {
+            lastFlush = received;
+            await sink.flush();
+          }
           if (total > 0) {
             final p = received / total;
             _progress = p;
-            DownloadService.update(
-                'Eva ${info.tag} · ${(p * 100).round()}%');
+            DownloadService.update('Eva $tag · ${(p * 100).round()}%');
             notifyListeners();
           }
         }
         await sink.flush();
         await sink.close();
       } catch (_) {
-        await sink.close();
-        return null;
+        try {
+          await sink.close();
+        } catch (_) {}
+        rethrow;
       }
-      if (await dest.exists()) await dest.delete();
-      await tmp.rename(dest.path);
-      return dest;
-    } catch (_) {
-      return null;
+      return true;
     } finally {
       client.close();
     }
+  }
+
+  /// A short, human-readable reason from a thrown error.
+  static String _reason(Object e) {
+    var s = e.toString();
+    if (s.startsWith('Exception: ')) s = s.substring('Exception: '.length);
+    if (s.length > 140) s = '${s.substring(0, 140)}…';
+    return s;
   }
 
   /// Verifies the APK's SHA-256 against the published checksum. Returns true if
@@ -251,8 +305,9 @@ class AppUpdater extends ChangeNotifier {
     if (sha256Url == null) return true;
     String expected;
     try {
-      final resp =
-          await http.get(Uri.parse(sha256Url)).timeout(const Duration(seconds: 15));
+      final resp = await http.get(Uri.parse(sha256Url),
+          headers: {'User-Agent': 'Eva-Updater'}).timeout(
+          const Duration(seconds: 15));
       if (resp.statusCode != 200) return true; // can't verify — don't block
       // Format: "<hex>  filename" (or just the hex).
       expected = resp.body.trim().split(RegExp(r'\s+')).first.toLowerCase();

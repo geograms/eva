@@ -24,6 +24,15 @@ class IndexingController extends ChangeNotifier {
   final DocumentService _docs;
   final EmbedBatch _embed;
 
+  /// A single batch of chunks should embed in seconds; if one takes this long
+  /// something is wrong (a hung native call, a pathological input), so we abort
+  /// the batch and defer the document rather than block the whole queue.
+  static const Duration _perBatchTimeout = Duration(minutes: 3);
+
+  /// Upper bound on the time spent on one document before it is skipped
+  /// (deferred) so indexing can move on to the rest of the backlog.
+  static const Duration _perDocBudget = Duration(minutes: 20);
+
   RagIndex? _rag;
   bool _running = false;
   bool _paused = false;
@@ -104,18 +113,33 @@ class IndexingController extends ChangeNotifier {
         _current = d.name;
         notifyListeners();
 
-        // A single bad document (bad text, embedder hiccup, FFI error) must not
-        // stop the run — record it and move on.
+        // A single bad document (bad text, embedder hiccup, FFI error, or one
+        // that simply takes too long) must not stop the run. Each document gets
+        // a time budget; each embed batch a hard timeout. If either trips, the
+        // document is deferred (added to _failed) and the worker moves on.
+        final deadline = DateTime.now().add(_perDocBudget);
         try {
           final text = await _docs.readText(d.id);
           await rag.addDocument(
             docId: d.id,
             name: d.name,
             fullText: text,
-            embed: _embed,
-            shouldContinue: () async => !_paused,
+            // Time-bound each batch so a hung/pathological embed can't stall the
+            // whole queue indefinitely.
+            embed: (texts) => _embed(texts).timeout(_perBatchTimeout),
+            shouldContinue: () async =>
+                !_paused && DateTime.now().isBefore(deadline),
           );
+          // addDocument returns without marking the doc indexed when
+          // shouldContinue went false. If that was the budget (not a user
+          // pause), defer the doc so the backlog keeps draining.
+          if (!_paused && !DateTime.now().isBefore(deadline)) {
+            _failed.add(d.id);
+            _lastError = Exception('Skipped "${d.name}": exceeded the '
+                '${_perDocBudget.inMinutes}-minute indexing budget.');
+          }
         } catch (e) {
+          // Includes TimeoutException from a stalled embed batch.
           _failed.add(d.id);
           _lastError = e;
         }

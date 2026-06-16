@@ -354,8 +354,14 @@ class RagIndex {
 
   /// Splits text into overlapping chunks, tracking the current `[Page N]` marker
   /// (inserted during PDF extraction) for citations.
+  ///
+  /// Two hard limits keep one document from stalling the embedder: every chunk
+  /// is at most [maxChars] (a single over-long line — common when a PDF extracts
+  /// as one giant line — is split, so the embedder never gets a multi-megabyte
+  /// "chunk"), and no more than [maxChunks] are produced (a huge book is
+  /// partially indexed rather than monopolising the queue for hours).
   List<({int? page, String text})> _chunk(String text,
-      {int maxChars = 900, int overlapChars = 150}) {
+      {int maxChars = 900, int overlapChars = 150, int maxChunks = 8000}) {
     final out = <({int? page, String text})>[];
     final pageRe = RegExp(r'^\s*\[Page (\d+)\]\s*$');
     int? page;
@@ -367,25 +373,43 @@ class RagIndex {
       buf.clear();
     }
 
-    for (final line in const LineSplitter().convert(text)) {
-      final m = pageRe.firstMatch(line);
+    outer:
+    for (final raw in const LineSplitter().convert(text)) {
+      final m = pageRe.firstMatch(raw);
       if (m != null) {
         page = int.tryParse(m.group(1)!);
         continue;
       }
-      if (buf.length + line.length + 1 > maxChars && buf.isNotEmpty) {
-        final full = buf.toString();
-        flush();
-        // Carry an overlap tail into the next chunk for context continuity.
-        if (overlapChars > 0 && full.length > overlapChars) {
-          buf.write(full.substring(full.length - overlapChars));
-          buf.write('\n');
+      // Break a pathologically long line into <= maxChars segments first, so no
+      // single chunk can ever exceed the cap.
+      for (final line in _splitLong(raw, maxChars)) {
+        if (buf.length + line.length + 1 > maxChars && buf.isNotEmpty) {
+          final full = buf.toString();
+          flush();
+          if (out.length >= maxChunks) break outer;
+          // Carry an overlap tail into the next chunk for context continuity.
+          if (overlapChars > 0 && full.length > overlapChars) {
+            buf.write(full.substring(full.length - overlapChars));
+            buf.write('\n');
+          }
         }
+        buf.write(line);
+        buf.write('\n');
       }
-      buf.write(line);
-      buf.write('\n');
     }
-    flush();
+    if (out.length < maxChunks) flush();
     return out;
+  }
+
+  /// Splits [s] into pieces no longer than [maxChars] (returns [s] unchanged
+  /// when it already fits).
+  static Iterable<String> _splitLong(String s, int maxChars) sync* {
+    if (s.length <= maxChars) {
+      yield s;
+      return;
+    }
+    for (var i = 0; i < s.length; i += maxChars) {
+      yield s.substring(i, math.min(i + maxChars, s.length));
+    }
   }
 }
