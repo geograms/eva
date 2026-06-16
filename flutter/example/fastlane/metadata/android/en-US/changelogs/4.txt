@@ -1,0 +1,9 @@
+In-app updates: a new "App updates" panel (Settings) shows your installed and
+available version and can download and install new releases for you. With
+"Automatic updates" on, Eva downloads the new version in the background and
+opens the installer — you just confirm the final step. You can also point it at
+a different update source if needed.
+
+Documents: image-only / scanned PDFs (no selectable text) are no longer skipped
+— they're now listed in their folder and findable by their title, author and
+filename. Added support for FictionBook (.fb2) and HTML (.htm/.html) files.
