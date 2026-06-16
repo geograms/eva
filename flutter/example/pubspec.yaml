@@ -37,6 +37,8 @@ dependencies:
 
   # Model download + extraction on first launch.
   http: ^1.2.0
+  # SHA-256 verification of the downloaded APK in the in-app updater.
+  crypto: ^3.0.0
   archive: ^3.6.1
   path_provider: ^2.1.4
   # Remembers the selected model across launches.

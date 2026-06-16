@@ -151,8 +151,11 @@ class _DocumentsScreenState extends State<DocumentsScreen> {
       ),
       title: Text(d.name, maxLines: 1, overflow: TextOverflow.ellipsis),
       subtitle: Text(
-        '${(d.chars / 1000).toStringAsFixed(1)}k chars'
-        '${isIndexed ? '' : ' · indexing…'}',
+        d.textless
+            ? 'No selectable text — listed by title/filename'
+                '${isIndexed ? '' : ' · indexing…'}'
+            : '${(d.chars / 1000).toStringAsFixed(1)}k chars'
+                '${isIndexed ? '' : ' · indexing…'}',
       ),
       onTap: isPdf ? () => _open(d) : null,
       trailing: PopupMenuButton<String>(

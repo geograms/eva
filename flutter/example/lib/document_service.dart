@@ -18,6 +18,7 @@ class DocumentInfo {
     required this.name,
     required this.chars,
     this.sourcePath,
+    this.textless = false,
   });
   final String id; // corpus filename stem
   final String name; // original filename shown to the user
@@ -25,6 +26,10 @@ class DocumentInfo {
   // Absolute path of the original file on the device, so citations can open it
   // (null for documents added before this was tracked).
   final String? sourcePath;
+  // True when no body text could be extracted (e.g. an image-only/scanned PDF):
+  // the document is still listed and searchable by its title/author/filename,
+  // but its content isn't indexed.
+  final bool textless;
 
   /// The folder the original file lives in (for grouping in the browser).
   String get folder {
@@ -34,13 +39,19 @@ class DocumentInfo {
     return i <= 0 ? '/' : p.substring(0, i);
   }
 
-  Map<String, dynamic> toJson() =>
-      {'id': id, 'name': name, 'chars': chars, 'sourcePath': sourcePath};
+  Map<String, dynamic> toJson() => {
+        'id': id,
+        'name': name,
+        'chars': chars,
+        'sourcePath': sourcePath,
+        'textless': textless,
+      };
   static DocumentInfo fromJson(Map<String, dynamic> j) => DocumentInfo(
         id: j['id'] as String,
         name: j['name'] as String,
         chars: (j['chars'] as num).toInt(),
         sourcePath: j['sourcePath'] as String?,
+        textless: j['textless'] as bool? ?? false,
       );
 }
 
@@ -62,8 +73,10 @@ class BulkImportResult {
 class DocumentService {
   static const List<String> supportedExtensions = [
     'pdf', 'txt', 'md', 'text',
-    // Office Open XML + e-books: ZIP+XML containers, extracted in pure Dart.
+    // Office Open XML + EPUB e-books: ZIP+XML containers, extracted in pure Dart.
     'docx', 'pptx', 'xlsx', 'epub',
+    // Other e-book / markup formats handled as text: FictionBook (XML) and HTML.
+    'fb2', 'htm', 'html',
   ];
 
   /// Extensions handled by unzipping (Office Open XML + EPUB).
@@ -230,41 +243,83 @@ class DocumentService {
     await _writeManifest(docs.length);
   }
 
-  /// Extracts text from [filePath] (PDF, docx/pptx/xlsx, epub, txt/md), stores
-  /// it in the corpus, and records it. Returns the new document's info. Throws
-  /// if no text could be extracted (e.g. a scanned/image-only PDF).
+  /// Extracts text from [filePath] (PDF, docx/pptx/xlsx, epub, fb2, html,
+  /// txt/md), stores it in the corpus, and records it. Returns the new
+  /// document's info.
+  ///
+  /// When no body text can be extracted (e.g. a scanned/image-only PDF), the
+  /// document is NOT discarded: it is still added and listed, with searchable
+  /// text built from its metadata (title/author/subject) and filename, and
+  /// flagged [DocumentInfo.textless]. Only throws if even that yields nothing.
   Future<DocumentInfo> addFile(String filePath,
       {Duration extractTimeout = const Duration(seconds: 45)}) async {
     final name = filePath.split(Platform.pathSeparator).last;
     final lower = name.toLowerCase();
     final dot = lower.lastIndexOf('.');
     final ext = dot < 0 ? '' : lower.substring(dot + 1);
-    final String text;
+    String text;
+    String metaCard = _metadataCard(name, const {}); // filename-only by default
     if (ext == 'pdf') {
       final bytes = await File(filePath).readAsBytes();
       // Time-bounded + killable: a single pathological/huge PDF must not stall
       // a bulk import. On timeout the worker isolate is terminated.
-      text = await _extractPdfBounded(bytes, extractTimeout);
+      final res = await _extractPdfBounded(bytes, extractTimeout);
+      text = res['text'] ?? '';
+      metaCard = _metadataCard(name, res); // title/author/subject/keywords
     } else if (_zipDocExtensions.contains(ext)) {
       final bytes = await File(filePath).readAsBytes();
       // docx/pptx/xlsx/epub are ZIP+XML — unzip + strip tags in a bounded
       // isolate so a huge/corrupt archive can't stall the import.
       text = await _extractZipDocBounded(bytes, ext, extractTimeout);
+    } else if (ext == 'fb2') {
+      text = _fb2ToText(await File(filePath).readAsString());
+    } else if (ext == 'htm' || ext == 'html') {
+      text = _htmlToText(await File(filePath).readAsString());
     } else {
       text = await File(filePath).readAsString();
     }
+
+    // No body text: keep the document, but index it by its metadata + filename
+    // so it is still listed (grouped in its folder) and findable by title.
+    var textless = false;
     if (text.trim().length < 8) {
-      throw Exception(
-          'No selectable text found (a scanned/image PDF needs OCR, not yet supported).');
+      if (metaCard.trim().length < 8) {
+        throw Exception('No selectable text or metadata found.');
+      }
+      text = metaCard;
+      textless = true;
     }
 
     final id = _uniqueId(name, await list());
     await File('${await corpusPath()}/$id.txt').writeAsString(text);
     final info = DocumentInfo(
-        id: id, name: name, chars: text.length, sourcePath: filePath);
+        id: id,
+        name: name,
+        chars: text.length,
+        sourcePath: filePath,
+        textless: textless);
     final docs = await list()..add(info);
     await _saveList(docs);
     return info;
+  }
+
+  /// Builds the searchable "card" used for documents with no extractable body
+  /// text: the cleaned filename plus any available metadata. This is what gets
+  /// embedded, so an image-only PDF can still be found by its title/author.
+  String _metadataCard(String name, Map<String, String> meta) {
+    final stem = name
+        .replaceAll(RegExp(r'\.[^.]+$'), '')
+        .replaceAll(RegExp(r'[_]+'), ' ')
+        .trim();
+    final lines = <String>['Title: ${meta['title']?.trim().isNotEmpty == true ? meta['title']!.trim() : stem}'];
+    void add(String label, String? v) {
+      if (v != null && v.trim().isNotEmpty) lines.add('$label: ${v.trim()}');
+    }
+    add('Author', meta['author']);
+    add('Subject', meta['subject']);
+    add('Keywords', meta['keywords']);
+    lines.add('File: $name');
+    return lines.join('\n');
   }
 
   /// Records the original [path] for an already-present document (matched by
@@ -439,19 +494,23 @@ class DocumentService {
 
 /// Runs [_extractPdfText] in a dedicated isolate with a hard [limit]; if it
 /// exceeds the limit (a pathological/huge PDF) the isolate is killed and an
-/// empty string is returned, so a bulk import never hangs on one file.
-Future<String> _extractPdfBounded(List<int> bytes, Duration limit) async {
+/// empty result is returned, so a bulk import never hangs on one file. Returns
+/// a map with the body 'text' plus any document metadata
+/// (title/author/subject/keywords) — the latter lets image-only PDFs still be
+/// listed and found by title.
+Future<Map<String, String>> _extractPdfBounded(
+    List<int> bytes, Duration limit) async {
   final port = ReceivePort();
   final iso = await Isolate.spawn(_pdfIsolateEntry, [port.sendPort, bytes]);
   try {
     final result = await port.first.timeout(limit);
-    return result is String ? result : '';
+    return result is Map ? result.cast<String, String>() : <String, String>{};
   } on TimeoutException {
     iso.kill(priority: Isolate.immediate);
-    return '';
+    return <String, String>{};
   } catch (_) {
     iso.kill(priority: Isolate.immediate);
-    return '';
+    return <String, String>{};
   } finally {
     port.close();
   }
@@ -463,17 +522,27 @@ void _pdfIsolateEntry(List<dynamic> args) {
   try {
     send.send(_extractPdfText(bytes));
   } catch (_) {
-    send.send('');
+    send.send(<String, String>{});
   }
 }
 
 /// Extracts text from PDF [bytes], inserting `[Page N]` markers so retrieved
-/// chunks carry page context for citations. Runs in a background isolate.
-String _extractPdfText(List<int> bytes) {
+/// chunks carry page context for citations, plus the document's metadata. Runs
+/// in a background isolate. Returns {text, title, author, subject, keywords}.
+Map<String, String> _extractPdfText(List<int> bytes) {
   final doc = PdfDocument(inputBytes: bytes);
   final extractor = PdfTextExtractor(doc);
   final buf = StringBuffer();
+  final out = <String, String>{};
   try {
+    // Metadata first, so even a zero-text (image-only) PDF returns something.
+    try {
+      final info = doc.documentInformation;
+      if (info.title.trim().isNotEmpty) out['title'] = info.title.trim();
+      if (info.author.trim().isNotEmpty) out['author'] = info.author.trim();
+      if (info.subject.trim().isNotEmpty) out['subject'] = info.subject.trim();
+      if (info.keywords.trim().isNotEmpty) out['keywords'] = info.keywords.trim();
+    } catch (_) {/* some PDFs have no info dictionary */}
     final count = doc.pages.count;
     for (var i = 0; i < count; i++) {
       final pageText =
@@ -486,7 +555,8 @@ String _extractPdfText(List<int> bytes) {
   } finally {
     doc.dispose();
   }
-  return buf.toString();
+  out['text'] = buf.toString();
+  return out;
 }
 
 // ── Office Open XML + EPUB extraction (pure Dart, via `archive`) ──────────────
@@ -689,6 +759,22 @@ String _resolveHref(String base, String href) {
 /// Public wrapper over [_htmlToText] for other modules (e.g. the offline
 /// Wikipedia reader) to convert article HTML to readable text.
 String htmlToPlainText(String html) => _htmlToText(html);
+
+/// Converts a FictionBook (.fb2) document — a single XML file — to readable
+/// text. Drops the embedded base64 `<binary>` images/cover, turns paragraph and
+/// title elements into line breaks, then strips the remaining tags.
+String _fb2ToText(String xml) {
+  // Remove base64-encoded images first (can be megabytes of noise).
+  var s = xml.replaceAll(
+      RegExp(r'<binary\b[^>]*>.*?</binary>', dotAll: true, caseSensitive: false),
+      ' ');
+  s = s.replaceAll(
+      RegExp(r'<\s*/?\s*(p|title|subtitle|empty-line|section|stanza|v|epigraph|cite)\b[^>]*>',
+          caseSensitive: false),
+      '\n');
+  s = s.replaceAll(RegExp(r'<[^>]+>'), '');
+  return _collapseBlankLines(_decodeXmlEntities(s)).trim();
+}
 
 /// Strips HTML/XHTML to readable text (drops script/style, turns block tags
 /// into line breaks). Reused for EPUB chapters.

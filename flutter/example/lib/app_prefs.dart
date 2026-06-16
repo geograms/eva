@@ -244,6 +244,43 @@ Future<void> saveMusicScanDone(bool done) async {
   await prefs.setBool(_kMusicScanDoneKey, done);
 }
 
+// ── App auto-update ──────────────────────────────────────────────────────────
+
+/// Default release-API endpoint the updater polls for the newest version. It
+/// returns GitHub's "latest release" JSON (tag_name + assets[]), from which the
+/// updater picks the arm64 APK asset. Overridable so the source can be pointed
+/// at a fork/mirror in the future without shipping a new build.
+const String kDefaultUpdateApiUrl =
+    'https://api.github.com/repos/geograms/eva/releases/latest';
+
+const String _kUpdateUrlKey = 'update_api_url';
+const String _kAutoUpdateKey = 'auto_update_enabled';
+
+/// The release-API URL to check for updates (falls back to the default if unset
+/// or blanked).
+Future<String> loadUpdateUrl() async {
+  final prefs = await SharedPreferences.getInstance();
+  final v = prefs.getString(_kUpdateUrlKey)?.trim();
+  return (v == null || v.isEmpty) ? kDefaultUpdateApiUrl : v;
+}
+
+Future<void> saveUpdateUrl(String url) async {
+  final prefs = await SharedPreferences.getInstance();
+  await prefs.setString(_kUpdateUrlKey, url.trim());
+}
+
+/// Whether Eva should automatically download a newer version and offer to
+/// install it (the OS still shows one install confirmation). Defaults to on.
+Future<bool> loadAutoUpdate() async {
+  final prefs = await SharedPreferences.getInstance();
+  return prefs.getBool(_kAutoUpdateKey) ?? true;
+}
+
+Future<void> saveAutoUpdate(bool enabled) async {
+  final prefs = await SharedPreferences.getInstance();
+  await prefs.setBool(_kAutoUpdateKey, enabled);
+}
+
 // ── Maps (cache-on-demand) ───────────────────────────────────────────────────
 
 const String _kMapsEnabledKey = 'maps_enabled';

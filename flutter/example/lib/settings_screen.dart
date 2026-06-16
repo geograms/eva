@@ -25,6 +25,7 @@ import 'photo_service.dart';
 import 'photos_screen.dart';
 import 'disk_space.dart';
 import 'system_voice.dart';
+import 'updates_screen.dart';
 import 'wikipedia_download.dart';
 import 'wikipedia_reader_screen.dart';
 import 'wikipedia_service.dart';
@@ -434,6 +435,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
     // Indexer and Storage are kept at the top so the most-used controls (what
     // is being indexed, and where data lives) are visible without scrolling.
     (key: 'indexer', title: 'Indexer', icon: Icons.sync, subtitle: 'documents · music · photos — progress & control'),
+    (key: 'updates', title: 'App updates', icon: Icons.system_update, subtitle: 'Check, auto-download & install new versions'),
     (key: 'storage', title: 'Storage', icon: Icons.sd_storage_outlined, subtitle: 'Where models & data are kept'),
     (key: 'appearance', title: 'Appearance', icon: Icons.palette_outlined, subtitle: 'Light / dark theme'),
     (key: 'persona', title: 'Persona & replies', icon: Icons.face_retouching_natural, subtitle: 'System prompt, reply length'),
@@ -472,6 +474,10 @@ class _SettingsScreenState extends State<SettingsScreen> {
                       Navigator.of(context).push(MaterialPageRoute(
                         builder: (_) =>
                             IndexerScreen(coordinator: widget.indexCoordinator!),
+                      ));
+                    } else if (c.key == 'updates') {
+                      Navigator.of(context).push(MaterialPageRoute(
+                        builder: (_) => const UpdatesScreen(),
                       ));
                     } else {
                       setState(() => _panel = c.key);

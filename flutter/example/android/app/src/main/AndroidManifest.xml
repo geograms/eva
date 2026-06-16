@@ -31,6 +31,9 @@
     <!-- Keep model / Wikipedia downloads running when the app is backgrounded
          or the phone is suspended (flutter_foreground_task data-sync service). -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC"/>
+    <!-- In-app updater: install a downloaded APK (the OS still shows the install
+         confirmation; the user grants "Install unknown apps" for Eva once). -->
+    <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES"/>
     <application
         android:label="Eva"
         android:name="${applicationName}"
@@ -130,6 +133,19 @@
                 <action android:name="com.htc.intent.action.QUICKBOOT_POWERON" />
             </intent-filter>
         </receiver>
+
+        <!-- In-app updater: hands the downloaded APK to the system package
+             installer via a content:// URI. Unique authority so it never clashes
+             with a plugin's FileProvider. -->
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="${applicationId}.updateprovider"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/update_file_paths" />
+        </provider>
 
         <!-- Don't delete the meta-data below.
              This is used by the Flutter tool to generate GeneratedPluginRegistrant.java -->

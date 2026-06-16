@@ -17,7 +17,6 @@ import 'package:file_picker/file_picker.dart';
 import 'package:flutter_tts/flutter_tts.dart';
 
 import 'package:path_provider/path_provider.dart';
-import 'package:url_launcher/url_launcher.dart';
 
 import 'app_prefs.dart';
 import 'assistant_channel.dart';
@@ -55,6 +54,8 @@ import 'setup_screen.dart';
 import 'system_voice.dart';
 import 'text_util.dart';
 import 'update_check.dart';
+import 'app_updater.dart';
+import 'updates_screen.dart';
 import 'voice_service.dart';
 import 'wikipedia_reader_screen.dart';
 import 'wikipedia_service.dart';
@@ -665,6 +666,9 @@ class _ChatScreenState extends State<ChatScreen>
     unawaited(checkForNewerRelease().then((tag) {
       if (tag != null && mounted) setState(() => _updateTag = tag);
     }));
+    // Auto-update: if enabled and permitted, download the new APK in the
+    // background and launch the installer (the user confirms the final step).
+    unawaited(AppUpdater.instance.maybeAutoUpdate());
     await _engine.start();
     await _openChatStore();
     unawaited(_setupCaptioning());
@@ -2697,9 +2701,10 @@ class _ChatScreenState extends State<ChatScreen>
           mainAxisSize: MainAxisSize.min,
           children: [
             TextButton(
-              onPressed: () => launchUrl(Uri.parse(kReleasesUrl),
-                  mode: LaunchMode.externalApplication),
-              child: const Text('Get it'),
+              onPressed: () => Navigator.of(context).push(MaterialPageRoute(
+                builder: (_) => const UpdatesScreen(),
+              )),
+              child: const Text('Update'),
             ),
             IconButton(
               icon: const Icon(Icons.close, size: 18),

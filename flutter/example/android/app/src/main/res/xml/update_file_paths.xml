@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Exposes the app-specific external files dir to the FileProvider so the
+     updater can grant the system installer read access to the downloaded APK.
+     `external-files-path` root maps to Context.getExternalFilesDir(null), which
+     is what path_provider's getExternalStorageDirectory() returns. -->
+<paths>
+    <external-files-path name="updates" path="updates/" />
+    <!-- Fallbacks for OEMs where the APK lands in a different scoped location. -->
+    <external-path name="ext-updates" path="Android/data/radio.geogram.eva/files/updates/" />
+    <files-path name="int-updates" path="updates/" />
+</paths>
