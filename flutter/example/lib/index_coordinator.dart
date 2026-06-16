@@ -4,6 +4,7 @@ import 'package:flutter/foundation.dart';
 
 import 'app_prefs.dart';
 import 'background_indexer.dart';
+import 'document_service.dart';
 import 'foreground_service.dart';
 import 'index_metrics.dart';
 import 'music_service.dart';
@@ -70,16 +71,19 @@ class IndexCoordinator extends ChangeNotifier {
   IndexCoordinator({
     required this.metrics,
     required IndexingController? Function() docIndexer,
+    required DocumentScanController? Function() docScanner,
     required MusicIndexController? Function() musicIndexer,
     required PhotoIndexController? Function() photoIndexer,
     required this.bridge,
   })  : _docIndexerOf = docIndexer,
+        _docScannerOf = docScanner,
         _musicIndexerOf = musicIndexer,
         _photoIndexerOf = photoIndexer;
 
   final IndexMetrics metrics;
   final CaptionBridge bridge;
   final IndexingController? Function() _docIndexerOf;
+  final DocumentScanController? Function() _docScannerOf;
   final MusicIndexController? Function() _musicIndexerOf;
   final PhotoIndexController? Function() _photoIndexerOf;
 
@@ -132,7 +136,11 @@ class IndexCoordinator extends ChangeNotifier {
       done: done,
       total: total,
       pending: pending,
-      currentName: cat == IndexCategory.documents ? _docIndexerOf()?.currentName : null,
+      currentName: cat != IndexCategory.documents
+          ? null
+          : _docScanning
+              ? 'added ${_docScannerOf()?.added ?? 0}'
+              : _docIndexerOf()?.currentName,
       itemsPerSec: _rate[cat] ?? 0,
       eta: _eta(cat, pending),
       elapsedTotal: metrics.elapsed(cat),
@@ -149,6 +157,7 @@ class IndexCoordinator extends ChangeNotifier {
     _paused.add(cat);
     switch (cat) {
       case IndexCategory.documents:
+        _docScannerOf()?.pause();
         _docIndexerOf()?.pause();
       case IndexCategory.music:
         _musicIndexerOf()?.pause();
@@ -164,6 +173,7 @@ class IndexCoordinator extends ChangeNotifier {
     _paused.remove(cat);
     switch (cat) {
       case IndexCategory.documents:
+        _docScannerOf()?.resume();
         _docIndexerOf()?.resume();
       case IndexCategory.music:
         _musicIndexerOf()?.resume();
@@ -197,6 +207,9 @@ class IndexCoordinator extends ChangeNotifier {
     _paused.remove(cat);
     switch (cat) {
       case IndexCategory.documents:
+        // Re-walk the device for new files (background, foreground-service
+        // backed) AND resume the embedding pass to drain anything queued.
+        unawaited(_docScannerOf()?.rescan() ?? Future.value());
         final d = _docIndexerOf();
         d?.resume();
         unawaited(d?.run() ?? Future.value());
@@ -213,7 +226,9 @@ class IndexCoordinator extends ChangeNotifier {
   /// Force everything to (re)scan now, bypassing the captioning charging gate.
   Future<void> indexNow() async {
     _paused.clear();
+    unawaited(_docScannerOf()?.rescan() ?? Future.value());
     _docIndexerOf()?.resume();
+    unawaited(_docIndexerOf()?.run() ?? Future.value());
     unawaited(_musicIndexerOf()?.rescan() ?? Future.value());
     unawaited(_photoIndexerOf()?.rescan() ?? Future.value());
     unawaited(bridge.captionNow());
@@ -223,10 +238,20 @@ class IndexCoordinator extends ChangeNotifier {
   // ── Internals ───────────────────────────────────────────────────────────────
 
   void _attachListeners() {
-    for (final l in [_docIndexerOf(), _musicIndexerOf(), _photoIndexerOf()]) {
+    for (final l in [
+      _docIndexerOf(),
+      _docScannerOf(),
+      _musicIndexerOf(),
+      _photoIndexerOf(),
+    ]) {
       if (l != null && _listening.add(l)) l.addListener(_onChange);
     }
   }
+
+  /// Whether documents are in the discovery (file-walk) phase rather than the
+  /// embedding phase. Discovery has no honest total/ETA (the device is walked
+  /// open-endedly), so it is presented like the music/photo scans.
+  bool get _docScanning => _docScannerOf()?.isScanning ?? false;
 
   void _onChange() {
     if (_disposed) return;
@@ -264,7 +289,11 @@ class IndexCoordinator extends ChangeNotifier {
       // Smooth the per-second rate (EMA); decay toward 0 when idle.
       final instant = deltaMs > 0 ? (deltaItems.clamp(0, 1 << 30)) * 1000 / deltaMs : 0.0;
       _rate[c] = active ? (0.6 * (_rate[c] ?? 0) + 0.4 * instant) : (_rate[c] ?? 0) * 0.5;
-      if (active && deltaMs > 0) {
+      // Don't fold the document discovery walk into the embedding metrics:
+      // files-walked is a different unit from documents-embedded and would skew
+      // the per-item average used for the embedding ETA.
+      final discoveringDocs = c == IndexCategory.documents && _docScanning;
+      if (active && deltaMs > 0 && !discoveringDocs) {
         metrics.record(c, deltaMs, deltaItems > 0 ? deltaItems : 0);
       }
     }
@@ -320,14 +349,16 @@ class IndexCoordinator extends ChangeNotifier {
   }
 
   bool _isActive(IndexCategory cat) => switch (cat) {
-        IndexCategory.documents => _docIndexerOf()?.isIndexing ?? false,
+        IndexCategory.documents =>
+          _docScanning || (_docIndexerOf()?.isIndexing ?? false),
         IndexCategory.music => _musicIndexerOf()?.isIndexing ?? false,
         IndexCategory.photos => _photoIndexerOf()?.isIndexing ?? false,
         IndexCategory.captions => bridge.isCaptioning(),
       };
 
   int _doneOf(IndexCategory cat) => switch (cat) {
-        IndexCategory.documents => _docIndexerOf()?.processed ?? 0,
+        IndexCategory.documents =>
+          _docScanning ? (_docScannerOf()?.scanned ?? 0) : (_docIndexerOf()?.processed ?? 0),
         IndexCategory.music => _musicIndexerOf()?.scanned ?? 0,
         IndexCategory.photos => _photoIndexerOf()?.scanned ?? 0,
         IndexCategory.captions => _captionDone,
@@ -337,6 +368,9 @@ class IndexCoordinator extends ChangeNotifier {
   (int, int?, int) _counts(IndexCategory cat) {
     switch (cat) {
       case IndexCategory.documents:
+        // Discovery phase: open-ended file walk (total unknown), like the
+        // music/photo scans. Embedding phase: finite backlog with an ETA.
+        if (_docScanning) return (_docScannerOf()?.scanned ?? 0, null, 0);
         final d = _docIndexerOf();
         return (d?.processed ?? 0, d?.total ?? 0, d?.pending ?? 0);
       case IndexCategory.captions:
@@ -352,9 +386,12 @@ class IndexCoordinator extends ChangeNotifier {
       {required bool paused, required bool active, required int pending}) {
     if (paused) return IndexStatus.paused;
     if (active) {
-      return (cat == IndexCategory.music || cat == IndexCategory.photos)
-          ? IndexStatus.scanning
-          : IndexStatus.indexing;
+      // Documents show "scanning" while discovering files, "indexing" while
+      // embedding them; music/photos are always file scans.
+      final scanning = cat == IndexCategory.music ||
+          cat == IndexCategory.photos ||
+          (cat == IndexCategory.documents && _docScanning);
+      return scanning ? IndexStatus.scanning : IndexStatus.indexing;
     }
     switch (cat) {
       case IndexCategory.documents:

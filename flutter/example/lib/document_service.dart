@@ -3,6 +3,7 @@ import 'dart:convert';
 import 'dart:io';
 import 'dart:isolate';
 
+import 'package:flutter/foundation.dart';
 import 'package:archive/archive.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:syncfusion_flutter_pdf/pdf.dart';
@@ -728,3 +729,111 @@ String _collapseBlankLines(String s) => s
     .replaceAll('\r\n', '\n')
     .replaceAll(RegExp(r'[ \t]+\n'), '\n')
     .replaceAll(RegExp(r'\n{3,}'), '\n\n');
+
+/// Drives the phone-wide document discovery walk as a continuous background
+/// task: it auto-resumes until the whole device has been scanned, is throttled
+/// inside [DocumentService.importFolder] so the app stays responsive, and is
+/// pausable. Discovery (finding files and extracting their text into the corpus)
+/// is separate from indexing (embedding that text) — this controller does the
+/// former; the embedding pass is driven by `IndexingController`.
+///
+/// Unlike the old in-dialog scan, this keeps running when the app is
+/// backgrounded or the phone is suspended, because `IndexCoordinator` holds an
+/// Android foreground service while it is active. Progress is observable for the
+/// Indexer panel, and [onDocumentsAdded] fires when new files are queued so the
+/// host can start (or continue) the embedding pass.
+class DocumentScanController extends ChangeNotifier {
+  DocumentScanController(this._docs, {this.root = '/storage/emulated/0'});
+
+  final DocumentService _docs;
+  final String root;
+
+  /// Called whenever the running scan has discovered and added new documents,
+  /// so the host can kick off / resume the embedding indexer.
+  VoidCallback? onDocumentsAdded;
+
+  bool _running = false;
+  bool _paused = false;
+  int _scanned = 0; // files walked this pass
+  int _added = 0; // documents added to the corpus this pass
+  Completer<void>? _idle;
+
+  bool get isScanning => _running && !_paused;
+  bool get isPaused => _paused;
+  int get scanned => _scanned;
+  int get added => _added;
+
+  /// Starts/continues the device scan if it hasn't fully completed yet. Safe to
+  /// call repeatedly — coalesces into the running pass.
+  Future<void> ensureRunning() async {
+    if (_running || _paused) return;
+    if (await loadDocumentScanDone()) return; // device already fully walked
+    unawaited(_run());
+  }
+
+  /// Forces a fresh full pass (e.g. to pick up newly-added files). Already-known
+  /// files are skipped cheaply inside [DocumentService.importFolder].
+  Future<void> rescan() async {
+    await saveDocumentScanDone(false);
+    _paused = false;
+    if (!_running) unawaited(_run());
+  }
+
+  void pause() {
+    _paused = true;
+    notifyListeners();
+  }
+
+  void resume() {
+    if (!_paused) return;
+    _paused = false;
+    if (!_running) unawaited(_run());
+  }
+
+  Future<void> stop() async {
+    _paused = true;
+    if (!_running) return;
+    _idle ??= Completer<void>();
+    await _idle!.future;
+  }
+
+  Future<void> _run() async {
+    if (_running || _paused) return;
+    _running = true;
+    _scanned = 0;
+    _added = 0;
+    notifyListeners();
+    try {
+      var lastAdded = 0;
+      final res = await _docs.importFolder(
+        root,
+        onProgress: (n, p) {
+          _scanned = n;
+          _added = p.added;
+          notifyListeners();
+          // Nudge the embedding pass as files accrue (throttled to every batch
+          // of newly-added documents, so we don't spam it per file).
+          if (p.added - lastAdded >= 8) {
+            lastAdded = p.added;
+            onDocumentsAdded?.call();
+          }
+        },
+        shouldContinue: () => !_paused,
+      );
+      _added = res.added;
+      // Completed the whole walk (not paused) — remember so we don't re-walk
+      // the entire device on every launch. Only when we actually saw files: a
+      // zero-file walk almost always means storage access wasn't granted yet, so
+      // we leave the flag clear and retry next launch / after the grant.
+      if (!_paused && _scanned > 0) await saveDocumentScanDone(true);
+      if (res.added > 0) onDocumentsAdded?.call();
+    } catch (_) {
+      // Transient (storage hiccup) — retried next launch / resume.
+    } finally {
+      _running = false;
+      _idle?.complete();
+      _idle = null;
+      notifyListeners();
+    }
+  }
+}

@@ -163,6 +163,11 @@ class _ChatScreenState extends State<ChatScreen>
   String _corpusLocation = '';
   RagIndex? _rag;
   IndexingController? _indexer;
+  // Background phone-wide file discovery (separate from the embedding pass), so
+  // a large library (e.g. thousands of PDFs) is fully found even when the app is
+  // backgrounded or the phone is suspended — held alive by the foreground
+  // service via the Indexer coordinator.
+  DocumentScanController? _docScanner;
   bool _embedderReady = false;
   bool _docBusy = false;
   String _systemPrompt = kDefaultSystemPrompt;
@@ -295,6 +300,8 @@ class _ChatScreenState extends State<ChatScreen>
     _indexCoordinator?.dispose();
     _indexer?.removeListener(_onIndexerProgress);
     _indexer?.dispose();
+    _docScanner?.pause();
+    _docScanner?.dispose();
     _photoIndexer?.removeListener(_onPhotoProgress);
     _photoIndexer?.pause();
     _photoIndexer?.dispose();
@@ -708,6 +715,7 @@ class _ChatScreenState extends State<ChatScreen>
       // Fully automatic: resume/continue indexing any document backlog in the
       // background, no user action required.
       unawaited(_autoIndexPending());
+      _startDocumentScanning();
       _startPhotoIndexing();
       _startMusicIndexing();
       _maybeStartCaptioning();
@@ -752,6 +760,7 @@ class _ChatScreenState extends State<ChatScreen>
       _embedderReady = false;
     }
     // Pick up a requested re-index of new photos / continue the gallery pass.
+    _startDocumentScanning();
     _startPhotoIndexing();
     _startMusicIndexing();
     // Documents added in Settings (e.g. a bulk phone scan) start indexing in
@@ -1221,15 +1230,11 @@ class _ChatScreenState extends State<ChatScreen>
     }
     _lastRescan = now;
 
-    // Documents (PDF/text): pick up newly-added files and index them.
-    try {
-      final res = await _docs.importFolder('/storage/emulated/0');
-      if (res.added > 0) {
-        _documents = await _docs.list();
-        if (mounted) setState(() {});
-        unawaited(_ensureRag().catchError((_) {}));
-      }
-    } catch (_) {}
+    // Documents (PDF/text): re-walk the device for newly-added files in the
+    // background (foreground-service backed, so it survives suspend); the
+    // scanner queues new files and nudges the embedding pass as it goes.
+    _startDocumentScanning();
+    unawaited(_docScanner?.rescan() ?? Future.value());
 
     // Photos: re-walk the gallery for new images (the indexer skips known ones).
     await savePhotoScanDone(false);
@@ -1257,6 +1262,51 @@ class _ChatScreenState extends State<ChatScreen>
     _indexCoordinator?.kick();
   }
 
+  /// Starts (or resumes) the continuous background document discovery walk,
+  /// which keeps finding files across the whole device until the scan is
+  /// complete — running under the foreground service so it survives the app
+  /// being backgrounded or the phone suspended. Newly-discovered files are
+  /// queued for embedding via [_onDocsDiscovered].
+  void _startDocumentScanning() {
+    _docScanner ??= DocumentScanController(_docs)
+      ..addListener(_onDocScanProgress)
+      ..onDocumentsAdded = _onDocsDiscovered;
+    unawaited(_docScanner!.ensureRunning());
+    _indexCoordinator?.kick();
+  }
+
+  void _onDocScanProgress() {
+    if (mounted) setState(() {});
+  }
+
+  // Coalesces the discovery → embedding hand-off so a burst of newly-found files
+  // kicks the embedder at most once per microtask.
+  bool _docsDiscoverPending = false;
+
+  /// Called by the document scanner as it queues newly-found files: refresh the
+  /// list and make sure the embedding pass is running to drain the new backlog.
+  void _onDocsDiscovered() {
+    if (_docsDiscoverPending) return;
+    _docsDiscoverPending = true;
+    Future.microtask(() async {
+      _docsDiscoverPending = false;
+      try {
+        _documents = await _docs.list();
+      } catch (_) {}
+      if (mounted) setState(() {});
+      if (_embedderReady && _rag != null) {
+        // Embedder already loaded: just nudge the indexer; its loop re-lists
+        // documents each pass, so it picks up the new files.
+        _indexer?.resume();
+        unawaited(_indexer?.run() ?? Future.value());
+      } else {
+        // First backlog: load the embedder in the background and start indexing.
+        unawaited(_ensureRag(modal: false).catchError((_) {}));
+      }
+      _indexCoordinator?.kick();
+    });
+  }
+
   void _onMusicProgress() {
     if (mounted) setState(() {});
   }
@@ -1268,6 +1318,7 @@ class _ChatScreenState extends State<ChatScreen>
     _indexCoordinator = IndexCoordinator(
       metrics: _indexMetrics!,
       docIndexer: () => _indexer,
+      docScanner: () => _docScanner,
       musicIndexer: () => _musicIndexer,
       photoIndexer: () => _photoIndexer,
       bridge: CaptionBridge(

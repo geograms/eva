@@ -1,0 +1,12 @@
+Document discovery now runs as a true background service: scanning the phone
+for PDFs and text files keeps going when you switch apps or the screen is off,
+so large libraries (thousands of files) are found completely instead of stopping
+when you leave the screen. Newly found files are queued for indexing as the scan
+proceeds.
+
+The Indexer panel gains a "Rescan for files" button on Documents, Music and
+Photos to pick up newly-added files on demand, and now shows the document
+discovery phase ("Scanning · N files") separately from indexing.
+
+Settings: Indexer and Storage moved to the top of the menu so they're easy to
+reach.

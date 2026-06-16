@@ -123,9 +123,12 @@ class _IndexerScreenState extends State<IndexerScreen> with WidgetsBindingObserv
               style: const TextStyle(fontWeight: FontWeight.bold)),
           const SizedBox(height: 4),
           const Text(
-            'Documents use the AI engine and pause while you chat; music and '
-            'photos are light file scans. All three can run at the same time. '
-            'Photo captions need the vision model, so they run while charging.',
+            'Documents are first discovered (the whole phone is walked for '
+            'PDFs/text), then indexed with the AI engine, which pauses while you '
+            'chat; music and photos are light file scans. Everything runs in the '
+            'background and keeps going if you leave the app or the phone sleeps. '
+            'Use "Rescan for files" to pick up newly-added files. Photo captions '
+            'need the vision model, so they run while charging.',
             style: TextStyle(fontSize: 12, color: Colors.grey),
           ),
         ],
@@ -184,34 +187,59 @@ class _IndexerScreenState extends State<IndexerScreen> with WidgetsBindingObserv
 
   List<Widget> _cardActions(IndexSnapshot s,
       {required bool needsPermission, required bool chargingOnly}) {
-    Widget? button;
     if (needsPermission) {
-      button = FilledButton.tonalIcon(
-        onPressed: () => _grantAndScan(s.category),
-        icon: const Icon(Icons.lock_open, size: 18),
-        label: const Text('Grant access & scan'),
-      );
-    } else if (chargingOnly && s.pending > 0 && !s.isBusy) {
+      return _wrapActions([
+        FilledButton.tonalIcon(
+          onPressed: () => _grantAndScan(s.category),
+          icon: const Icon(Icons.lock_open, size: 18),
+          label: const Text('Grant access & scan'),
+        ),
+      ]);
+    }
+
+    final buttons = <Widget>[];
+
+    if (chargingOnly && s.pending > 0 && !s.isBusy) {
       // Captions waiting on the charging gate: let the user force a pass.
-      button = OutlinedButton.icon(
+      buttons.add(OutlinedButton.icon(
         onPressed: _onIndexNow,
         icon: const Icon(Icons.bolt, size: 18),
         label: const Text('Index now'),
-      );
-    } else if (s.status == IndexStatus.idle &&
-        s.pending == 0 &&
-        (s.category == IndexCategory.music || s.category == IndexCategory.photos)) {
-      // Granted but never scanned yet.
-      button = OutlinedButton.icon(
-        onPressed: () => widget.coordinator.rescanCategory(s.category),
-        icon: const Icon(Icons.search, size: 18),
-        label: const Text('Scan now'),
-      );
+      ));
     }
-    if (button == null) return const [];
+
+    // Documents, music and photos can always be re-walked to discover new files
+    // and add them to the processing queue. The scan runs in the background, so
+    // it keeps going if the user leaves the app or the phone sleeps.
+    if (s.category == IndexCategory.documents ||
+        s.category == IndexCategory.music ||
+        s.category == IndexCategory.photos) {
+      // Never scanned yet → "Scan now"; otherwise "Rescan for files".
+      final firstScan = s.status == IndexStatus.idle && s.done == 0;
+      buttons.add(OutlinedButton.icon(
+        onPressed: s.status == IndexStatus.scanning
+            ? null
+            : () {
+                widget.coordinator.rescanCategory(s.category);
+                _toast('Scanning for files in the background — they will be '
+                    'added to the queue.');
+              },
+        icon: Icon(firstScan ? Icons.search : Icons.refresh, size: 18),
+        label: Text(firstScan ? 'Scan now' : 'Rescan for files'),
+      ));
+    }
+
+    return _wrapActions(buttons);
+  }
+
+  List<Widget> _wrapActions(List<Widget> buttons) {
+    if (buttons.isEmpty) return const [];
     return [
       const SizedBox(height: 8),
-      Align(alignment: Alignment.centerLeft, child: button),
+      Align(
+        alignment: Alignment.centerLeft,
+        child: Wrap(spacing: 8, runSpacing: 8, children: buttons),
+      ),
     ];
   }
 
@@ -259,7 +287,9 @@ class _IndexerScreenState extends State<IndexerScreen> with WidgetsBindingObserv
         return 'Up to date';
       case IndexStatus.scanning:
         final rate = s.itemsPerSec >= 1 ? ' · ${s.itemsPerSec.round()}/s' : '';
-        return 'Scanning · ${s.done} files$rate';
+        // For documents, currentName carries the running "added N" count.
+        final extra = s.currentName != null ? ' · ${s.currentName}' : '';
+        return 'Scanning · ${s.done} files$rate$extra';
       case IndexStatus.indexing:
         final of = (s.total != null && s.total! > 0) ? '${s.done} of ${s.total}' : '${s.done}';
         final name = s.currentName != null ? ' · ${s.currentName}' : '';

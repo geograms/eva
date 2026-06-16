@@ -209,6 +209,24 @@ Future<void> savePhotoScanDone(bool done) async {
   await prefs.setBool(_kPhotoScanDoneKey, done);
 }
 
+// ── Document discovery (phone-wide file scan) ────────────────────────────────
+
+const String _kDocumentScanDoneKey = 'document_scan_done';
+
+/// Whether the phone has been fully walked for documents (PDF/text/…) at least
+/// once. While false, the background document scanner auto-resumes on launch
+/// until every supported file has been discovered and queued for indexing.
+/// Reset to force a fresh pass (e.g. to pick up newly-added files).
+Future<bool> loadDocumentScanDone() async {
+  final prefs = await SharedPreferences.getInstance();
+  return prefs.getBool(_kDocumentScanDoneKey) ?? false;
+}
+
+Future<void> saveDocumentScanDone(bool done) async {
+  final prefs = await SharedPreferences.getInstance();
+  await prefs.setBool(_kDocumentScanDoneKey, done);
+}
+
 // ── Music library indexing ───────────────────────────────────────────────────
 
 const String _kMusicScanDoneKey = 'music_scan_done';

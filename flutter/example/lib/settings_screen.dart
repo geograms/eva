@@ -11,6 +11,7 @@ import 'assistant_channel.dart';
 import 'document_service.dart';
 import 'download_service.dart';
 import 'index_coordinator.dart';
+import 'index_metrics.dart';
 import 'indexer_screen.dart';
 import 'documents_screen.dart';
 import 'maps/map_service.dart';
@@ -430,12 +431,15 @@ class _SettingsScreenState extends State<SettingsScreen> {
   // no single screen feels crowded.
   static const List<({String key, String title, IconData icon, String subtitle})>
       _categories = [
+    // Indexer and Storage are kept at the top so the most-used controls (what
+    // is being indexed, and where data lives) are visible without scrolling.
+    (key: 'indexer', title: 'Indexer', icon: Icons.sync, subtitle: 'documents · music · photos — progress & control'),
+    (key: 'storage', title: 'Storage', icon: Icons.sd_storage_outlined, subtitle: 'Where models & data are kept'),
     (key: 'appearance', title: 'Appearance', icon: Icons.palette_outlined, subtitle: 'Light / dark theme'),
     (key: 'persona', title: 'Persona & replies', icon: Icons.face_retouching_natural, subtitle: 'System prompt, reply length'),
     (key: 'models', title: 'Language model', icon: Icons.memory, subtitle: 'Choose or download the AI model'),
     (key: 'voice', title: 'Voice', icon: Icons.mic_none, subtitle: 'Speech-to-text engine & language'),
     (key: 'assistant', title: 'Phone assistant', icon: Icons.assistant_outlined, subtitle: 'Use Eva as the device assistant'),
-    (key: 'indexer', title: 'Indexer', icon: Icons.sync, subtitle: 'documents · music · photos — progress & control'),
     (key: 'documents', title: 'Documents', icon: Icons.folder_copy_outlined, subtitle: 'Index & search your files'),
     (key: 'photos', title: 'Photos', icon: Icons.photo_library_outlined, subtitle: 'Index & browse your gallery'),
     (key: 'music', title: 'Music', icon: Icons.library_music_outlined, subtitle: 'Index your audio library'),
@@ -443,7 +447,6 @@ class _SettingsScreenState extends State<SettingsScreen> {
     (key: 'wikipedia', title: 'Wikipedia', icon: Icons.public, subtitle: 'Offline knowledge'),
     (key: 'maps', title: 'Maps', icon: Icons.map_outlined, subtitle: 'Offline maps & navigation'),
     (key: 'reminders', title: 'Reminders', icon: Icons.notifications_active_outlined, subtitle: 'Timed alerts'),
-    (key: 'storage', title: 'Storage', icon: Icons.sd_storage_outlined, subtitle: 'Where models & data are kept'),
   ];
 
   @override
@@ -701,8 +704,33 @@ class _SettingsScreenState extends State<SettingsScreen> {
         ListTile(
           leading: const Icon(Icons.travel_explore),
           title: const Text('Scan phone for documents'),
-          subtitle: const Text('Finds every PDF/text file on this phone and adds it.'),
-          onTap: busy ? null : () => _bulkImport('/storage/emulated/0'),
+          subtitle: Text(widget.indexCoordinator == null
+              ? 'Finds every PDF/text file on this phone and adds it.'
+              : 'Finds every PDF/text file on this phone and adds it. Runs in the '
+                  'background — keeps going if you leave the app. Track it in the '
+                  'Indexer.'),
+          onTap: busy
+              ? null
+              : () async {
+                  final co = widget.indexCoordinator;
+                  if (co == null) {
+                    // No coordinator (shouldn't happen in normal use): fall back
+                    // to the in-place dialog scan.
+                    await _bulkImport('/storage/emulated/0');
+                    return;
+                  }
+                  var status = await Permission.manageExternalStorage.status;
+                  if (!status.isGranted) {
+                    status = await Permission.manageExternalStorage.request();
+                  }
+                  if (!status.isGranted) {
+                    await _toast('Storage permission is required to scan the phone.');
+                    return;
+                  }
+                  co.rescanCategory(IndexCategory.documents);
+                  await _toast('Scanning the phone in the background — open the '
+                      'Indexer to watch progress.');
+                },
         ),
         ListTile(
           leading: const Icon(Icons.drive_folder_upload_outlined),
