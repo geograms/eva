@@ -61,6 +61,8 @@ class _SettingsScreenState extends State<SettingsScreen> {
   late final PhotoService _photos = PhotoService(_docs);
   late final MusicService _music = MusicService(_docs);
   List<DocumentInfo> _documents = const [];
+  // User-chosen document folders to scan (empty = whole phone).
+  List<String> _docRoots = const [];
   List<ModelSpec> _catalog = const [];
   final Set<String> _installed = {};
   String? _downloadingId;
@@ -129,6 +131,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
     _storageRoot = await loadStorageRoot();
     _refreshMapCacheSize();
     _documents = await _docs.list();
+    _docRoots = await loadDocumentRoots();
     await _refreshInstalled();
     if (_voiceEngine == VoiceEngine.system) _loadLocales();
   }
@@ -147,6 +150,9 @@ class _SettingsScreenState extends State<SettingsScreen> {
 
   bool _importCancelled = false;
 
+  /// Lets the user pick a folder (e.g. their books folder, or an SD-card path)
+  /// to use as the document source. The chosen folder is saved and scanned in
+  /// the background — progress shows in the Indexer panel, no blocking dialog.
   Future<void> _pickFolderAndImport() async {
     var status = await Permission.manageExternalStorage.status;
     if (!status.isGranted) {
@@ -158,7 +164,23 @@ class _SettingsScreenState extends State<SettingsScreen> {
     }
     final dir = await FilePicker.platform.getDirectoryPath();
     if (dir == null) return;
-    await _bulkImport(dir);
+
+    // Make the picked folder the document source (replacing the whole-phone
+    // default) and scan it in the background.
+    final roots = {...await loadDocumentRoots(), dir}.toList();
+    await saveDocumentRoots(roots);
+    _docRoots = roots;
+    if (mounted) setState(() {});
+
+    final co = widget.indexCoordinator;
+    if (co != null) {
+      co.rescanCategory(IndexCategory.documents);
+      await _toast('Scanning "$dir" in the background — see the Indexer for '
+          'progress.');
+    } else {
+      // No coordinator available — fall back to the in-place dialog scan.
+      await _bulkImport(dir);
+    }
   }
 
   /// Walks [root] adding every supported document, with a cancellable progress
@@ -707,24 +729,49 @@ class _SettingsScreenState extends State<SettingsScreen> {
                   await _refreshDocs();
                 },
         ),
+        // Current document source: the chosen folder(s), or the whole phone.
+        ListTile(
+          leading: const Icon(Icons.source_outlined),
+          title: const Text('Document source'),
+          subtitle: Text(_docRoots.isEmpty
+              ? 'Whole phone (internal storage)'
+              : _docRoots.join('\n')),
+          isThreeLine: _docRoots.length > 1 ||
+              _docRoots.any((r) => r.length > 30),
+          trailing: _docRoots.isEmpty
+              ? null
+              : IconButton(
+                  tooltip: 'Reset to whole phone',
+                  icon: const Icon(Icons.restart_alt),
+                  onPressed: busy
+                      ? null
+                      : () async {
+                          await saveDocumentRoots(const []);
+                          _docRoots = const [];
+                          if (mounted) setState(() {});
+                          await _toast('Document source reset to the whole phone.');
+                        },
+                ),
+        ),
+        ListTile(
+          leading: const Icon(Icons.drive_folder_upload_outlined),
+          title: const Text('Choose a folder to scan'),
+          subtitle: const Text(
+              'Pick your books/documents folder (or an SD-card path). It becomes '
+              'the source and is scanned in the background — progress shows in '
+              'the Indexer.'),
+          onTap: busy ? null : _pickFolderAndImport,
+        ),
         ListTile(
           leading: const Icon(Icons.travel_explore),
-          title: const Text('Scan phone for documents'),
+          title: const Text('Scan whole phone instead'),
           subtitle: Text(widget.indexCoordinator == null
               ? 'Finds every PDF/text file on this phone and adds it.'
-              : 'Finds every PDF/text file on this phone and adds it. Runs in the '
-                  'background — keeps going if you leave the app. Track it in the '
-                  'Indexer.'),
+              : 'Clears the chosen folder and scans all internal storage in the '
+                  'background. Track it in the Indexer.'),
           onTap: busy
               ? null
               : () async {
-                  final co = widget.indexCoordinator;
-                  if (co == null) {
-                    // No coordinator (shouldn't happen in normal use): fall back
-                    // to the in-place dialog scan.
-                    await _bulkImport('/storage/emulated/0');
-                    return;
-                  }
                   var status = await Permission.manageExternalStorage.status;
                   if (!status.isGranted) {
                     status = await Permission.manageExternalStorage.request();
@@ -733,15 +780,19 @@ class _SettingsScreenState extends State<SettingsScreen> {
                     await _toast('Storage permission is required to scan the phone.');
                     return;
                   }
+                  // Reset to whole-phone scanning.
+                  await saveDocumentRoots(const []);
+                  _docRoots = const [];
+                  if (mounted) setState(() {});
+                  final co = widget.indexCoordinator;
+                  if (co == null) {
+                    await _bulkImport('/storage/emulated/0');
+                    return;
+                  }
                   co.rescanCategory(IndexCategory.documents);
-                  await _toast('Scanning the phone in the background — open the '
-                      'Indexer to watch progress.');
+                  await _toast('Scanning the whole phone in the background — open '
+                      'the Indexer to watch progress.');
                 },
-        ),
-        ListTile(
-          leading: const Icon(Icons.drive_folder_upload_outlined),
-          title: const Text('Import documents from a folder'),
-          onTap: busy ? null : _pickFolderAndImport,
         ),
         if (_skippedBad > 0)
           ListTile(

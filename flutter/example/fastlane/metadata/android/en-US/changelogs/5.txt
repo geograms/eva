@@ -1,0 +1,7 @@
+Document scanning now uses the folder you choose. In Settings > Documents, pick
+your books/documents folder (or an SD-card path) and Eva scans exactly that
+location — no more scanning all of internal storage by mistake. The chosen
+folder is shown as the "Document source", with a reset to scan the whole phone.
+
+Picking a folder no longer shows a blocking popup: the scan runs in the
+background and its progress appears in the Indexer panel.

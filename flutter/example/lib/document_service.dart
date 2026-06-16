@@ -829,10 +829,14 @@ String _collapseBlankLines(String s) => s
 /// Indexer panel, and [onDocumentsAdded] fires when new files are queued so the
 /// host can start (or continue) the embedding pass.
 class DocumentScanController extends ChangeNotifier {
-  DocumentScanController(this._docs, {this.root = '/storage/emulated/0'});
+  DocumentScanController(this._docs);
 
   final DocumentService _docs;
-  final String root;
+
+  /// The folders walked by the most recent run (for display). Resolved from
+  /// [effectiveDocumentRoots] each pass.
+  List<String> _roots = const [];
+  List<String> get roots => _roots;
 
   /// Called whenever the running scan has discovered and added new documents,
   /// so the host can kick off / resume the embedding indexer.
@@ -888,31 +892,41 @@ class DocumentScanController extends ChangeNotifier {
     _running = true;
     _scanned = 0;
     _added = 0;
+    _roots = await effectiveDocumentRoots();
     notifyListeners();
     try {
       var lastAdded = 0;
-      final res = await _docs.importFolder(
-        root,
-        onProgress: (n, p) {
-          _scanned = n;
-          _added = p.added;
-          notifyListeners();
-          // Nudge the embedding pass as files accrue (throttled to every batch
-          // of newly-added documents, so we don't spam it per file).
-          if (p.added - lastAdded >= 8) {
-            lastAdded = p.added;
-            onDocumentsAdded?.call();
-          }
-        },
-        shouldContinue: () => !_paused,
-      );
-      _added = res.added;
+      var baseScanned = 0; // cumulative across the roots walked so far
+      var baseAdded = 0;
+      // Walk each configured folder in turn (a books folder, an SD-card path,
+      // or the whole phone when none are chosen), accumulating progress.
+      for (final root in _roots) {
+        if (_paused) break;
+        final res = await _docs.importFolder(
+          root,
+          onProgress: (n, p) {
+            _scanned = baseScanned + n;
+            _added = baseAdded + p.added;
+            notifyListeners();
+            // Nudge the embedding pass as files accrue (throttled to every batch
+            // of newly-added documents, so we don't spam it per file).
+            if ((baseAdded + p.added) - lastAdded >= 8) {
+              lastAdded = baseAdded + p.added;
+              onDocumentsAdded?.call();
+            }
+          },
+          shouldContinue: () => !_paused,
+        );
+        baseScanned = _scanned;
+        baseAdded += res.added;
+        _added = baseAdded;
+      }
       // Completed the whole walk (not paused) — remember so we don't re-walk
-      // the entire device on every launch. Only when we actually saw files: a
-      // zero-file walk almost always means storage access wasn't granted yet, so
-      // we leave the flag clear and retry next launch / after the grant.
+      // on every launch. Only when we actually saw files: a zero-file walk
+      // almost always means storage access wasn't granted yet (or the chosen
+      // folder is unreadable), so we leave the flag clear and retry.
       if (!_paused && _scanned > 0) await saveDocumentScanDone(true);
-      if (res.added > 0) onDocumentsAdded?.call();
+      if (_added > 0) onDocumentsAdded?.call();
     } catch (_) {
       // Transient (storage hiccup) — retried next launch / resume.
     } finally {

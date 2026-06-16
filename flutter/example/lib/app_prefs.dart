@@ -227,6 +227,34 @@ Future<void> saveDocumentScanDone(bool done) async {
   await prefs.setBool(_kDocumentScanDoneKey, done);
 }
 
+const String _kDocumentRootsKey = 'document_roots';
+
+/// The folders the document scanner walks. Empty means "the whole phone"
+/// (`/storage/emulated/0`). Set to one or more user-chosen folders (e.g. a books
+/// folder, or an SD-card path) to scan exactly those instead of everything.
+Future<List<String>> loadDocumentRoots() async {
+  final prefs = await SharedPreferences.getInstance();
+  final raw = prefs.getString(_kDocumentRootsKey);
+  if (raw == null || raw.isEmpty) return const [];
+  try {
+    return (jsonDecode(raw) as List).cast<String>();
+  } catch (_) {
+    return const [];
+  }
+}
+
+Future<void> saveDocumentRoots(List<String> roots) async {
+  final prefs = await SharedPreferences.getInstance();
+  await prefs.setString(_kDocumentRootsKey, jsonEncode(roots));
+}
+
+/// The roots the scanner should actually walk: the user's chosen folders, or
+/// the whole phone when none are set.
+Future<List<String>> effectiveDocumentRoots() async {
+  final roots = await loadDocumentRoots();
+  return roots.isEmpty ? const ['/storage/emulated/0'] : roots;
+}
+
 // ── Music library indexing ───────────────────────────────────────────────────
 
 const String _kMusicScanDoneKey = 'music_scan_done';
